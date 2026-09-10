@@ -21,6 +21,10 @@ Nothing is uploaded anywhere. Everything stays on your machine.
 
 ## Download
 
+After downloading the binary; move it to wherever you want it to live then just
+run it. It will become a background tray task; clicking on the task icon will
+open more settings. You'll be able to start it at boot.
+
 **[Download CombatSession.exe](../../releases/latest/download/CombatSession.exe)**
 (Windows, 64-bit)
 
