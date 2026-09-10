@@ -1,0 +1,1444 @@
+-- CombatSession :: Data
+--
+-- Headless API over the generated session data. No UI dependencies, so any
+-- shell can build its own viewer on top of this.
+--
+-- Sessions arrive as parallel column arrays produced by the application (see
+-- App/Source/StreamWriter.cpp). A Temple of Kotmogu battleground is ~190k
+-- events, so aggregation runs in chunks across frames rather than in one pass:
+-- a single synchronous loop over that many events visibly freezes the client.
+
+local ADDON, ns = ...
+
+local API = {}
+ns.API = API
+
+-- Bump when the shape or meaning of a computed CACHE changes, so caches built by
+-- an older build are recomputed rather than displayed as if current.
+--
+-- 2: unit parenting was attributed to the event source instead of the advanced
+--    block, which parented enemies to the local player.
+-- 3: absorbs are credited to the shield provider rather than the shielded unit.
+-- 4: ten columns with per-counterpart breakdowns; UNITS keyed by name instead
+--    of index, and absorbs folded into Healing Done.
+-- 5: unit identity taken from the unit itself rather than from whichever of it
+--    or its pet was seen first, which mistyped owners as pets.
+-- 6: absorbed damage credited to the attacker, support damage counted, pet
+--    ownership from SPELL_SUMMON, and absorbs split back out of healing.
+-- 7: self-targeted damage, healing and absorbs excluded.
+-- 8: reverted 7 - self-targeted output counts and is listed as its own
+--    counterpart in the breakdown, rather than being silently dropped there.
+-- 9: per-counterpart spell breakdown, with names held once per session.
+-- 10: breakdown detail capped. Uncapped it reached ~750 KB per session, and a
+--     40-session cache could not be written at logout - the client saved a
+--     fraction while the watermark saved intact, so the application collected
+--     chunks for sessions that were never really cached.
+-- 11: the cache became an encoding rather than a rendering - names interned
+--     once, units and breakdowns held as flat numeric runs, and kind, reaction
+--     and spell category derived on read instead of stored. The viewer expands
+--     it. Version 10 had un-interned everything the chunk carefully interned.
+-- 12: absorbs folded into healing, reversing 6 - prevented damage counts as
+--     Healing Done for the shielder and Healing Taken for the shielded, and the
+--     separate Absorb Done column is gone. Crowd control now records the spell
+--     that opened each effect, so a CC counterpart expands to the fears and
+--     stuns behind the time. Column indices shifted, which is why this is a
+--     version bump and not a cosmetic change.
+-- 13: dispels lead with the aura removed rather than the spell that removed it
+--     - "Shadow Word: Pain (Cleanse)" - and offensive dispels moved to a new
+--     Purges column, spell steals included. The pair is keyed by a synthetic
+--     id so relabelling a dispelled aura cannot follow that spell into the
+--     damage breakdowns it also appears in.
+-- 14: Overhealing gained a counterpart breakdown instead of being a bare total,
+--     interrupts now lead with the spell they stopped - "Polymorph (Kick)" -
+--     and every composite records the real spell it leads with, so dispels,
+--     purges and interrupts show an icon and the client tooltip like any other
+--     row rather than being the only ones without.
+-- 15: pet and guardian deaths no longer count as their owner's. Everything a
+--     pet does rolls up to its owner, which is right for output and wrong for
+--     dying, so every felguard and water elemental was inflating a player's
+--     death count. Absorbed damage is also attributed to the attacker's own
+--     spell rather than to the shield that stopped it, which had been putting
+--     healers' shield names into attackers' damage breakdowns.
+-- 16: per-spell smallest and largest recorded alongside the sum, so a value can
+--     be read as a range rather than only an average. The flat spell run went
+--     from four numbers per entry to six. Also: the recording player's side is
+--     derived from the log rather than from GetBattlefieldArenaFaction, which
+--     disagrees with GetBattlefieldWinner in skirmishes and had a won match
+--     reported as a loss, and a winner that names no side is no longer treated
+--     as one.
+local DEFINES_VERSION = 16
+
+--------------------------------------------------------------------------------
+-- Event kinds, mirroring EventKind in StreamWriter.h. Values are persisted in
+-- generated Lua, so these must stay in sync and must never be renumbered.
+--------------------------------------------------------------------------------
+
+local K = {
+    SPELL_DAMAGE = 1, SPELL_PERIODIC_DAMAGE = 2, SWING_DAMAGE = 3, RANGE_DAMAGE = 4,
+    SPELL_HEAL = 5, SPELL_PERIODIC_HEAL = 6,
+    SPELL_ABSORBED = 7, SPELL_HEAL_ABSORBED = 8,
+    AURA_APPLIED = 9, AURA_REMOVED = 10, AURA_REFRESH = 11,
+    AURA_APPLIED_DOSE = 12, AURA_REMOVED_DOSE = 13, AURA_BROKEN_SPELL = 14,
+    CAST_START = 15, CAST_SUCCESS = 16, CAST_FAILED = 17,
+    SPELL_MISSED = 18, PERIODIC_MISSED = 19, SWING_MISSED = 20, RANGE_MISSED = 21,
+    ENERGIZE = 22, PERIODIC_ENERGIZE = 23,
+    DISPEL = 24, SUMMON = 25, INTERRUPT = 26, DAMAGE_SPLIT = 27,
+    UNIT_DIED = 28, UNIT_DESTROYED = 29, PARTY_KILL = 30, COMBATANT_INFO = 31,
+    -- The damage half of SPELL_ABSORBED, credited to the attacker.
+    DAMAGE_ABSORBED = 32,
+    -- Augmentation Evoker support damage.
+    DAMAGE_SUPPORT = 33,
+    -- A BUFF removed from a target, as opposed to DISPEL which is a DEBUFF
+    -- taken off a friend. Spell steals arrive here too: they take a buff.
+    PURGE = 34,
+}
+ns.EventKind = K
+
+-- Damage stopped by a shield still counts as damage dealt, and the scoreboard
+-- counts it: omitting it left attackers 10-30 percent short.
+local IS_DAMAGE = {
+    [K.SPELL_DAMAGE] = true, [K.SPELL_PERIODIC_DAMAGE] = true,
+    [K.SWING_DAMAGE] = true, [K.RANGE_DAMAGE] = true, [K.DAMAGE_SPLIT] = true,
+    [K.DAMAGE_ABSORBED] = true, [K.DAMAGE_SUPPORT] = true,
+}
+local IS_HEAL = {
+    [K.SPELL_HEAL] = true, [K.SPELL_PERIODIC_HEAL] = true,
+}
+
+--------------------------------------------------------------------------------
+-- Unit flags (COMBATLOG_OBJECT_*)
+--------------------------------------------------------------------------------
+
+local FLAG_PLAYER   = 0x00000400
+local FLAG_NPC      = 0x00000800
+local FLAG_PET      = 0x00001000
+local FLAG_GUARDIAN = 0x00002000
+local FLAG_HOSTILE  = 0x00000040
+local FLAG_FRIENDLY = 0x00000010
+
+local band = bit.band
+
+local function HasFlag(flags, mask)
+    return band(flags or 0, mask) ~= 0
+end
+
+local function UnitKind(flags)
+    if HasFlag(flags, FLAG_PLAYER)   then return "player" end
+    if HasFlag(flags, FLAG_PET)      then return "pet" end
+    if HasFlag(flags, FLAG_GUARDIAN) then return "guardian" end
+    if HasFlag(flags, FLAG_NPC)      then return "npc" end
+    return "unknown"
+end
+
+local function UnitReaction(flags)
+    if HasFlag(flags, FLAG_HOSTILE)  then return "hostile" end
+    if HasFlag(flags, FLAG_FRIENDLY) then return "friendly" end
+    return "neutral"
+end
+
+--------------------------------------------------------------------------------
+-- DEFINES
+--
+-- Column parsers ship as addon code rather than as data. A reparse always uses
+-- the current definitions, and older sessions are served by their stored CACHE
+-- plus its version stamp, so storing code alongside the data would buy nothing.
+--
+-- Each column contributes to a single pass over the event columns; running one
+-- pass per column would multiply the cost by the column count.
+--------------------------------------------------------------------------------
+
+local FORMAT_COLUMNS = {
+    "Damage Done", "Damage Taken", "Healing Done", "Healing Taken",
+    "Overhealing", "Interrupts", "Dispels", "Purges", "Deaths",
+    "CC Done", "CC Taken",
+}
+
+local COL = {}
+for i, name in ipairs(FORMAT_COLUMNS) do COL[name] = i end
+
+-- Which side of an event a column's breakdown names. "dest" lists units this
+-- unit acted on; "source" lists units that acted on this unit.
+local COLUMN_SIDE = {
+    [COL["Damage Done"]]   = "dest",   [COL["Damage Taken"]]  = "source",
+    [COL["Healing Done"]]  = "dest",   [COL["Healing Taken"]] = "source",
+    [COL["Overhealing"]]   = "dest",
+    [COL["Interrupts"]]    = "dest",   [COL["Dispels"]]       = "dest",
+    [COL["Purges"]]        = "dest",
+    [COL["Deaths"]]        = "source",  -- who landed the killing blow
+    [COL["CC Done"]]       = "dest",   [COL["CC Taken"]]      = "source",
+}
+
+-- Columns whose value is a duration in milliseconds rather than an amount.
+-- Their counts carry the "quantity" half of quantity-and-time.
+local COLUMN_IS_TIME = {
+    [COL["CC Done"]] = true, [COL["CC Taken"]] = true,
+}
+
+ns.FORMAT_COLUMNS = FORMAT_COLUMNS
+ns.COLUMN_SIDE    = COLUMN_SIDE
+ns.COLUMN_IS_TIME = COLUMN_IS_TIME
+
+function API:GetDefines()
+    return {
+        VERSION = DEFINES_VERSION,
+        FORMAT  = FORMAT_COLUMNS,
+        EVENTS  = { "death" },
+    }
+end
+
+--------------------------------------------------------------------------------
+-- Session discovery
+--------------------------------------------------------------------------------
+
+-- The delivery queue: chunks the application has produced and this addon has
+-- not yet consumed. Empty in steady state. CombatSessionIndex is defined by
+-- CombatSession_Data/Index.lua.
+--
+-- This is NOT the list of sessions to display. A consumed session is deleted
+-- from the queue by the application, so anything already processed is absent
+-- here and lives only in CACHE. Use GetViewable for the user-facing list.
+function API:GetSessions()
+    return CombatSessionIndex or {}
+end
+
+-- Every session the user can look at: everything cached, plus anything still
+-- queued. Entries share one shape regardless of which side they came from.
+function API:GetViewable()
+    local out, seen = {}, {}
+
+    if ns.db and ns.db.cache then
+        for key, cache in pairs(ns.db.cache) do
+            local h = cache.header or {}
+            seen[key] = true
+            out[#out + 1] = {
+                key = key, cached = true,
+                startTime = h.startTime, endTime = h.endTime,
+                type = h.type, mapName = h.mapName, bracket = h.bracket,
+                rated = h.rated, truncated = h.truncated,
+                instanceId = h.instanceId, lobby = h.lobby, round = h.round,
+                combatants = h.combatants,
+                character = h.character, characterGuid = h.characterGuid,
+                events = cache.eventCount or 0,
+                units  = cache.unitCount or 0,
+            }
+        end
+    end
+
+    -- Queued sessions the addon has not built yet are listed so a backlog does
+    -- not look like missing data. Declined ones are not: below the floor the
+    -- cache is full and these have lost their place to newer sessions, so they
+    -- are gone as far as this addon is concerned and the application collects
+    -- their chunks on its next run. Listing them would show rows that hold
+    -- nothing, cannot be opened, and vanish on their own a minute later.
+    local floor = (ns.db and ns.db.oldestWanted) or ""
+    for _, entry in ipairs(self:GetSessions()) do
+        if not seen[entry.key] and (floor == "" or entry.key >= floor) then
+            local copy = {}
+            for k, v in pairs(entry) do copy[k] = v end
+            copy.cached = false
+            out[#out + 1] = copy
+        end
+    end
+
+    table.sort(out, function(a, b) return a.key < b.key end)
+    return out
+end
+
+function API:GetSession(key)
+    for _, entry in ipairs(self:GetSessions()) do
+        if entry.key == key then return entry end
+    end
+end
+
+-- Chunks in CombatSession_Data are loaded eagerly by the client, so a pending
+-- session's stream is already resident. Nothing is loaded on demand: the folder
+-- is a queue that the application empties once these have been consumed.
+function API:LoadStream(key)
+    local stream = CombatSessionStream and CombatSessionStream[key]
+    if not stream then
+        -- Either never delivered, or already consumed and collected. Sessions
+        -- in the latter state are served from CACHE and need no stream.
+        return nil, "no pending chunk for this session"
+    end
+    return stream
+end
+
+--------------------------------------------------------------------------------
+-- Consumption
+--
+-- The application deletes chunks once this addon reports them processed, so
+-- processing has to be proactive rather than waiting for the user to click.
+-- Work runs newest-first in the background, so the session most likely to be
+-- looked at is ready first and the backlog fills in behind it.
+--------------------------------------------------------------------------------
+
+function API:GetMaxSessions()
+    return (ns.db and ns.db.settings.maxSessions) or 40
+end
+
+function API:SetMaxSessions(count)
+    count = tonumber(count)
+    if not count or count < 1 then return false, "count must be a positive number" end
+
+    local previous = ns.db.settings.maxSessions or 0
+    ns.db.settings.maxSessions = math.floor(count)
+
+    -- Raising the cap has to lower the floor with it, or what the old cap
+    -- declined stays declined forever: GetPending filters on the floor, so
+    -- those sessions would never be offered again, and PruneCaches - the only
+    -- thing that recomputes the floor - would never see them. Whatever is still
+    -- queued becomes eligible at the next login. Whatever the application has
+    -- already collected is archive-only either way.
+    if ns.db.settings.maxSessions > previous then
+        ns.db.oldestWanted = ""
+    end
+    return true
+end
+
+-- Queued sessions this addon does not actually hold, newest first.
+--
+-- Pending means "not held", not "newer than a mark". A session missing from the
+-- cache is wanted however old it is, which is what makes a short SavedVariables
+-- write recoverable: whatever failed to save simply reads back as pending, and
+-- its chunk was never collected because the application asks the same question.
+--
+-- The floor is the one exception. Once the cache is full, sessions below it have
+-- been declined for good, and without saying so they would be re-offered every
+-- login, rebuilt, and immediately pruned again - forty caches of work per login,
+-- discarded each time.
+function API:GetPending()
+    local floor = (ns.db and ns.db.oldestWanted) or ""
+    local pending = {}
+    for _, entry in ipairs(self:GetSessions()) do
+        local cache = self:GetCache(entry.key)
+
+        -- A queued chunk holding more events than the cached copy is a session
+        -- that was emitted from a guessed end and has since been completed, so
+        -- it supersedes what is held. Treating "cached" as final meant the
+        -- fuller chunk was passed over and then collected, leaving a truncated
+        -- Deephaul Ravine in place permanently - the application could rebuild
+        -- the chunk, but nothing would ever take it.
+        local supersedes = cache and entry.events
+                       and entry.events > (cache.eventCount or 0)
+
+        if (not cache or supersedes) and (floor == "" or entry.key >= floor) then
+            pending[#pending + 1] = entry
+        end
+    end
+    table.sort(pending, function(a, b) return a.key > b.key end)
+    return pending
+end
+
+-- Trims stored caches to the session cap, oldest first, and republishes the
+-- floor.
+--
+-- The floor is published whenever the cache is FULL, not only when it
+-- overflowed on this pass. Landing exactly on the cap still means older
+-- sessions are being turned away, and saying nothing there was a real defect:
+-- with 65 queued and a cap of 40 the first login built the newest 40, found
+-- #keys == limit, declared no floor, and so re-offered the other 25 on the next
+-- login - building all 25 only for this function to throw them straight back
+-- out. A full cache is a closed door whether or not it slammed on this pass.
+--
+-- Recomputed rather than only ever raised: the cap can be raised, or entries
+-- can fall out for being stale, and a floor left above what is actually held
+-- would decline sessions still wanted - which the application reads as
+-- permission to delete their chunks.
+local function PruneCaches()
+    local db = ns.db
+    if not db or not db.cache then return end
+
+    local keys = {}
+    for key in pairs(db.cache) do keys[#keys + 1] = key end
+    local limit = (db.settings and db.settings.maxSessions) or 40
+
+    if #keys < limit then
+        db.oldestWanted = ""
+        return
+    end
+
+    table.sort(keys)
+    for i = 1, #keys - limit do db.cache[keys[i]] = nil end
+    db.oldestWanted = keys[#keys - limit + 1]
+end
+
+-- Consumes the backlog. With more pending chunks than the cap, only the newest
+-- `maxSessions` are built; PruneCaches then publishes the floor, which declines
+-- the rest for good - the application collects their chunks and they live on in
+-- the raw archive. Raising the cap lowers the floor and reopens whatever is
+-- still queued.
+function API:ProcessPending(onDone)
+    local pending = self:GetPending()
+    if #pending == 0 then
+        if onDone then onDone(0, 0) end
+        return
+    end
+
+    local limit   = self:GetMaxSessions()
+    local take    = math.min(#pending, limit)
+    local skipped = #pending - take
+
+    local index = 1
+    local function Next()
+        if index > take then
+            PruneCaches()
+            if onDone then onDone(take, skipped) end
+            return
+        end
+
+        local key = pending[index].key
+        index = index + 1
+
+        self:BuildCache(key, function(_, err)
+            if err then ns:Debug("skipped", key, err) end
+            Next()
+        end)
+    end
+
+    Next()
+end
+
+--------------------------------------------------------------------------------
+-- Cache
+--------------------------------------------------------------------------------
+
+local function CacheIsCurrent(cache)
+    return cache and cache.FORMAT and cache.FORMAT.version == DEFINES_VERSION
+end
+
+-- Drops cache entries written by an older format.
+--
+-- They are not merely unreadable, they are misleading. The application decides
+-- which chunks to collect by reading the keys of `cache` out of the saved file,
+-- and it has no way to tell a current entry from an obsolete one - so an entry
+-- left behind after a format change would license the deletion of the one chunk
+-- that could rebuild it. Clearing them at load keeps the file an honest
+-- statement of what is held.
+local function DropStaleCaches()
+    local db = ns.db
+    if not db or not db.cache then return end
+
+    local dropped = 0
+    for key, cache in pairs(db.cache) do
+        if not CacheIsCurrent(cache) then
+            db.cache[key] = nil
+            dropped = dropped + 1
+        end
+    end
+    if dropped > 0 then
+        ns:Debug(("dropped %d cache entry(s) from an older format"):format(dropped))
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Event context
+--
+-- For each recorded death, the preceding window of major actions involving the
+-- dying unit. Deaths are rare (230 in the reference battleground) but each scan
+-- walks back over thousands of events, so this runs as its own chunked phase
+-- rather than inside the aggregation loop.
+--------------------------------------------------------------------------------
+
+-- Caps on how much breakdown detail is stored per column.
+--
+-- Everything cached is serialised into SavedVariables at every logout, and the
+-- per-counterpart spell layer multiplies out: players x columns x counterparts
+-- x spells. Uncapped it produced ~750 KB per session, so a 40-session cache was
+-- ~30 MB - which the client failed to write, saving only a couple of sessions
+-- while the watermark saved fine, telling the application those sessions were
+-- consumed and letting it delete their chunks. That second failure is closed
+-- now - the application reads the cache keys themselves, so a short write can
+-- no longer claim sessions it did not save - but a cache small enough to write
+-- in the first place is still the better answer, and losing the long tail of a
+-- drill-down costs nothing that matters.
+--
+-- The totals are always exact; only the itemisation is trimmed, and the number
+-- omitted is recorded so the viewer can say so.
+local MAX_BREAKDOWN_COUNTERPARTS = 25
+local MAX_SPELLS_PER_COUNTERPART = 12
+
+local CONTEXT_WINDOW_MS = 8000
+local CONTEXT_MAX_ENTRIES = 16
+
+-- Damage below this fraction of the victim's maximum health is not interesting
+-- enough to occupy a context slot.
+local CONTEXT_MIN_DAMAGE_FRACTION = 0.05
+
+--------------------------------------------------------------------------------
+-- Compaction
+--
+-- Aggregation builds a convenient shape - units keyed by name, breakdowns keyed
+-- by counterpart name, leaves as {v=,n=} tables. That shape is fine in memory
+-- and ruinous on disk: SavedVariables writes one line per table entry, so every
+-- leaf cost five lines and every counterpart name was repeated once per column
+-- per unit. Two sessions came to 109,021 lines, with "Dakson-Lightning'sBlade-US"
+-- written 126 times.
+--
+-- The stored form is therefore encoded, not rendered:
+--   N   names, interned once
+--   SP  [spellId] = name
+--   U   units, indexed by name index, with flags kept and kind/reaction dropped
+--       because both derive from flags
+--   b   flat numeric runs: nameIdx, value, count, ...
+--   s   flat numeric runs: nameIdx, spellId, value, count, ...
+--
+-- Nothing here is human readable, which is the point - Inspect.lua expands it.
+local function Compact(UNITS, events)
+    local names, nameIndex = {}, {}
+    local function Intern(name)
+        local i = nameIndex[name]
+        if not i then
+            names[#names + 1] = name
+            i = #names
+            nameIndex[name] = i
+        end
+        return i
+    end
+
+    -- Interned in descending damage order so the viewer's default sort is close
+    -- to index order and the common case barely has to sort at all.
+    local ordered = {}
+    for name in pairs(UNITS) do ordered[#ordered + 1] = name end
+    table.sort(ordered, function(a, b)
+        return (UNITS[a].cols[1] or 0) > (UNITS[b].cols[1] or 0)
+    end)
+    for _, name in ipairs(ordered) do Intern(name) end
+
+    local U = {}
+    for _, name in ipairs(ordered) do
+        local entry = UNITS[name]
+        local out = {
+            f = entry.flags,
+            l = entry.level ~= 0 and entry.level or nil,
+            c = entry.cols,
+            n = entry.counts,
+        }
+
+        for col, map in pairs(entry.by) do
+            local flat, spellFlat = {}, {}
+            for other, slot in pairs(map) do
+                local oi = Intern(other)
+                flat[#flat + 1] = oi
+                flat[#flat + 1] = slot.v
+                flat[#flat + 1] = slot.n
+                if slot.s then
+                    for spellId, use in pairs(slot.s) do
+                        spellFlat[#spellFlat + 1] = oi
+                        spellFlat[#spellFlat + 1] = spellId
+                        spellFlat[#spellFlat + 1] = use.v
+                        spellFlat[#spellFlat + 1] = use.n
+                        spellFlat[#spellFlat + 1] = use.mn or 0
+                        spellFlat[#spellFlat + 1] = use.mx or 0
+                    end
+                end
+            end
+            if #flat > 0 then
+                out.b = out.b or {}
+                out.b[col] = flat
+            end
+            if #spellFlat > 0 then
+                out.s = out.s or {}
+                out.s[col] = spellFlat
+            end
+        end
+        out.m = entry.more
+        U[nameIndex[name]] = out
+    end
+
+    -- Death events: unit and context units become indices, context actions
+    -- become flat runs of six numbers.
+    local E = {}
+    for _, event in ipairs(events) do
+        local flat = {}
+        for _, a in ipairs(event.context or {}) do
+            flat[#flat + 1] = a.t
+            flat[#flat + 1] = a.kind
+            flat[#flat + 1] = a.src and Intern(a.src) or 0
+            flat[#flat + 1] = a.dst and Intern(a.dst) or 0
+            flat[#flat + 1] = a.spell or 0
+            flat[#flat + 1] = a.amount or 0
+        end
+        E[#E + 1] = { t = event.t, u = Intern(event.unit), c = flat }
+    end
+
+    return names, U, E
+end
+
+-- Keeps the largest contributors and discards the tail, recording how many were
+-- dropped so the viewer never implies the list is complete.
+local function TrimBreakdowns(UNITS)
+    for _, entry in pairs(UNITS) do
+        for col, map in pairs(entry.by) do
+            local order = {}
+            for name, slot in pairs(map) do
+                order[#order + 1] = { name = name, slot = slot }
+            end
+            table.sort(order, function(a, b) return a.slot.v > b.slot.v end)
+
+            if #order > MAX_BREAKDOWN_COUNTERPARTS then
+                for i = MAX_BREAKDOWN_COUNTERPARTS + 1, #order do
+                    map[order[i].name] = nil
+                end
+                entry.more = entry.more or {}
+                entry.more[col] = #order - MAX_BREAKDOWN_COUNTERPARTS
+            end
+
+            for i = 1, math.min(#order, MAX_BREAKDOWN_COUNTERPARTS) do
+                local spells = order[i].slot.s
+                if spells then
+                    local uses = {}
+                    for id, use in pairs(spells) do
+                        uses[#uses + 1] = { id = id, use = use }
+                    end
+                    if #uses > MAX_SPELLS_PER_COUNTERPART then
+                        table.sort(uses, function(a, b) return a.use.v > b.use.v end)
+                        for j = MAX_SPELLS_PER_COUNTERPART + 1, #uses do
+                            spells[uses[j].id] = nil
+                        end
+                        order[i].slot.m = #uses - MAX_SPELLS_PER_COUNTERPART
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function BuildEventContext(stream, nameOf, UNITS, events, onDone)
+    local t, k, s, d = stream.t, stream.k, stream.s, stream.d
+    local sp, am, hpm = stream.sp, stream.am, stream.hpm
+    local spells = stream.spells
+
+    local categoryOf = ns.SpellCategory
+    local i = 1
+
+    local function Step()
+        local stop = math.min(i + 40 - 1, #events)
+
+        for e = i, stop do
+            local death = events[e]
+            local at, victim = death.at, death.unit   -- victim is a name
+            local cutoff = t[at] - CONTEXT_WINDOW_MS
+
+            -- UNIT_DIED carries no advanced block, so its hpMax column is zero.
+            -- The victim's real maximum comes from a damage event aimed at them,
+            -- where the advanced block describes the destination. Learned during
+            -- the backward scan below; until then every hit qualifies.
+            local threshold = 0
+
+            local context = {}
+            for j = at - 1, 1, -1 do
+                if t[j] < cutoff then break end
+
+                -- Compared by name, matching how units are keyed everywhere
+                -- else, so a pet's action counts as its owner's.
+                local src = s[j] ~= 0 and nameOf[s[j]] or nil
+                local dst = d[j] ~= 0 and nameOf[d[j]] or nil
+
+                if dst == victim and (hpm[j] or 0) > 0 and threshold == 0 then
+                    threshold = hpm[j] * CONTEXT_MIN_DAMAGE_FRACTION
+                end
+
+                if src == victim or dst == victim then
+                    local spellIndex = sp[j]
+                    local spellId = spellIndex ~= 0 and spells[spellIndex]
+                                    and spells[spellIndex][1] or nil
+                    local category = spellId and categoryOf[spellId]
+
+                    -- Categorised actions always qualify; raw damage only when
+                    -- it was a meaningful share of the victim's health pool.
+                    local keep = category ~= nil
+                    if not keep and IS_DAMAGE[k[j]] and dst == victim then
+                        keep = am[j] >= threshold
+                    end
+
+                    if keep then
+                        -- On a dispel or purge the amount column carries the
+                        -- removed aura's spell index, not a quantity, so it
+                        -- would render as a meaningless small number here.
+                        local isDispel = k[j] == K.DISPEL or k[j] == K.PURGE
+                        context[#context + 1] = {
+                            t        = t[j] - t[at],   -- negative: before death
+                            kind     = k[j],
+                            src      = src,
+                            dst      = dst,
+                            spell    = spellId,
+                            name     = spellIndex ~= 0 and spells[spellIndex]
+                                       and spells[spellIndex][2] or nil,
+                            amount   = not isDispel and am[j] or 0,
+                            category = category,
+                        }
+                        if #context >= CONTEXT_MAX_ENTRIES then break end
+                    end
+                end
+            end
+
+            -- Collected backwards; reverse so the timeline reads forwards.
+            for a = 1, math.floor(#context / 2) do
+                context[a], context[#context - a + 1] = context[#context - a + 1], context[a]
+            end
+            death.context = context
+        end
+
+        i = stop + 1
+        if i <= #events then C_Timer.After(0, Step) else onDone() end
+    end
+
+    if #events == 0 then onDone() else Step() end
+end
+
+--------------------------------------------------------------------------------
+-- Match overlay
+--
+-- Rated status, outcome and battleground rosters exist only in what the
+-- recorder captured live. Sessions are joined to a match record by overlapping
+-- time range: a Solo Shuffle lobby produces one record but six sessions, so all
+-- six rounds legitimately map to the same record.
+--------------------------------------------------------------------------------
+
+local MATCH_TOLERANCE = 90   -- seconds of slack at each end of the range
+
+-- The log writes "Name-Realm", the client's UnitName writes "Name".
+local function BaseName(name)
+    return (tostring(name or ""):match("^([^-]+)") or "")
+end
+
+function API:GetMatch(entry)
+    if not (ns.db and ns.db.matches) then return nil end
+    if not entry.startTime then return nil end
+
+    local wanted = BaseName(entry.character)
+
+    local best, bestScore
+    for _, record in ipairs(ns.db.matches) do
+        local recEnd = record.endedAt or (record.startedAt + 3600)
+        local overlaps = record.startedAt <= entry.endTime + MATCH_TOLERANCE
+                     and recEnd >= entry.startTime - MATCH_TOLERANCE
+        if overlaps then
+            -- Weighted so the strongest evidence wins outright. Instance is the
+            -- most specific, then which character played it, and completeness
+            -- only breaks ties between otherwise equal candidates.
+            local score = 0
+            if record.map == entry.instanceId then score = score + 8 end
+            -- Records are account-wide, so time and map alone can tie when
+            -- several characters played overlapping matches.
+            if wanted ~= "" and BaseName(record.character) == wanted then
+                score = score + 4
+            end
+            -- A completed record beats an abandoned one covering the same
+            -- match. A transient zone reading used to file both, and without
+            -- this the phantom won purely by being seen first.
+            if record.complete then score = score + 2 end
+
+            if not bestScore or score > bestScore then
+                best, bestScore = record, score
+            end
+        end
+    end
+    return best
+end
+
+--------------------------------------------------------------------------------
+-- Expansion
+--
+-- The stored cache is an encoding: interned names, flat numeric runs, kind and
+-- reaction left to be derived from flags. These turn it back into something a
+-- viewer can render, so no shell has to understand the storage layout.
+--------------------------------------------------------------------------------
+
+-- Units in stored order, which is descending damage.
+
+--------------------------------------------------------------------------------
+-- Roster
+--------------------------------------------------------------------------------
+
+local function HasActivity(unit)
+    if not unit then return false end
+    for i = 1, #unit.cols do
+        if (unit.cols[i] or 0) ~= 0 then return true end
+    end
+    return false
+end
+
+-- Who played, which side they were on, and what each side totalled.
+--
+-- This lives in the API rather than in a viewer because getting it wrong is not
+-- obvious: a rated Eye of the Storm whose scoreboard listed 20 players produced
+-- 38 player units in the log, and neither raw reaction flags nor an activity
+-- filter reproduced the 10/10. The scoreboard decides who played; log data only
+-- supplies the numbers. Two shells reading this differently would disagree
+-- about something the user can check against their own scoreboard.
+--
+-- Returns players, teams:
+--   players[i] = { name, unit, class, team = 1|2|nil, player = <scoreboard row> }
+--   teams[i]   = { damage, healing, count, side = 0|1|nil, won = bool|nil }
+-- team is nil for units that fought but are absent from the scoreboard - they
+-- left early or were backfilled out. Formatting a side as a faction is left to
+-- the caller: in an arena 0 and 1 are just the two teams, not Horde and
+-- Alliance.
+function API:Roster(entry, cache, match)
+    local units, byName = self:UnitList(cache), {}
+    for _, unit in ipairs(units) do byName[unit.name] = unit end
+
+    -- A scoreboard omits the realm for players on your own realm, so names join
+    -- on the base name. Player-flagged units win any collision.
+    local byBase = {}
+    for _, unit in ipairs(units) do
+        local base = BaseName(unit.name)
+        if not byBase[base] or unit.kind == "player" then
+            byBase[base] = unit.name
+        end
+    end
+
+    local damageCol, healingCol = COL["Damage Done"], COL["Healing Done"]
+    local players, claimed = {}, {}
+    local teams = {
+        { damage = 0, healing = 0, count = 0 },
+        { damage = 0, healing = 0, count = 0 },
+    }
+
+    -- Which faction number belongs to the recording player.
+    --
+    -- Not GetBattlefieldArenaFaction, which the recorder stores as
+    -- playerFaction: in a skirmish it disagrees with GetBattlefieldWinner. A won
+    -- Maldraxxus Coliseum came back winner=0 against playerFaction=1 and was
+    -- reported as a loss, and reading a win as a loss is worse than saying
+    -- nothing at all.
+    --
+    -- The log settles it. Units friendly to the recording player are on the
+    -- recording player's side by definition, so whichever faction number those
+    -- roster entries carry is theirs - and it is expressed in the same numbering
+    -- the winner is, because both come off the same scoreboard.
+    local function OwnFaction()
+        local votes = {}
+        for _, player in ipairs((match and match.roster) or {}) do
+            local unitName = byBase[BaseName(player.name)]
+            local unit = unitName and byName[unitName]
+            if unit and player.faction ~= nil and unit.reaction == "friendly" then
+                votes[player.faction] = (votes[player.faction] or 0) + 1
+            end
+        end
+
+        local best, bestCount
+        for faction, count in pairs(votes) do
+            if not bestCount or count > bestCount then
+                best, bestCount = faction, count
+            end
+        end
+        return best or (match and match.playerFaction)
+    end
+
+    local haveRoster = match and match.roster and #match.roster > 0
+    local ownFaction = OwnFaction()
+
+    if haveRoster then
+        local own = ownFaction
+        for _, player in ipairs(match.roster) do
+            local team = 1
+            if own ~= nil and player.faction ~= nil then
+                team = (player.faction == own) and 1 or 2
+            end
+            local unitName = byBase[BaseName(player.name)]
+            if unitName then claimed[unitName] = true end
+            players[#players + 1] = {
+                name   = player.name,
+                unit   = unitName and byName[unitName] or nil,
+                class  = player.class,
+                team   = team,
+                player = player,
+            }
+        end
+    else
+        -- No recorder data, so fall back to reaction flags. Activity is
+        -- required here, since nothing else keeps the aura burst out.
+        for _, unit in ipairs(units) do
+            if unit.kind == "player" and HasActivity(unit) then
+                local team = (unit.reaction == "friendly") and 1
+                          or (unit.reaction == "hostile") and 2 or nil
+                if team then
+                    players[#players + 1] =
+                        { name = unit.name, unit = unit, team = team }
+                end
+            end
+        end
+    end
+
+    if haveRoster then
+        for _, unit in ipairs(units) do
+            if unit.kind == "player" and not claimed[unit.name] and HasActivity(unit) then
+                -- Fought but absent from the scoreboard: left early, or was
+                -- backfilled out. They are deliberately not counted in a team's
+                -- totals, since the scoreboard defines who played - but which
+                -- side they were on is still knowable from their reaction to the
+                -- recording player, and a row with no side at all is the one
+                -- thing a viewer cannot show honestly.
+                local inferred = (unit.reaction == "friendly") and 1
+                              or (unit.reaction == "hostile") and 2 or nil
+                players[#players + 1] = {
+                    name = unit.name, unit = unit, team = nil, inferredTeam = inferred,
+                }
+            end
+        end
+    end
+
+    for _, row in ipairs(players) do
+        local team = row.team and teams[row.team]
+        if team then
+            team.count   = team.count + 1
+            team.damage  = team.damage  + (row.unit and row.unit.cols[damageCol] or 0)
+            team.healing = team.healing + (row.unit and row.unit.cols[healingCol] or 0)
+        end
+    end
+
+    if ownFaction ~= nil then
+        teams[1].side = ownFaction
+        teams[2].side = (ownFaction == 0) and 1 or 0
+
+        -- Only 0 and 1 name a side. GetBattlefieldWinner reports 0xFFFFFFFF for
+        -- a match that ended without one, which arrives in Lua as a large
+        -- positive number and sailed straight through a ">= 0" test.
+        local winner = match and match.winner
+        if winner == 0 or winner == 1 then
+            teams[1].won = (winner == teams[1].side)
+            teams[2].won = (winner == teams[2].side)
+        end
+
+        -- Rating and MMR come from GetBattlefieldTeamInfo, which the recorder
+        -- stores indexed by arena team id. Only a rated match populates them.
+        for i = 1, 2 do
+            local info = match.teams and teams[i].side ~= nil
+                     and match.teams[teams[i].side + 1]
+            if info then
+                teams[i].teamName = info.name
+                teams[i].rating   = info.newRating
+                teams[i].mmr      = info.mmr
+                if info.newRating and info.oldRating then
+                    teams[i].ratingChange = info.newRating - info.oldRating
+                end
+            end
+        end
+    end
+
+    return players, teams
+end
+
+function API:UnitList(cache)
+    local out = {}
+    for i, u in ipairs(cache.U or {}) do
+        out[i] = {
+            index    = i,
+            name     = cache.N[i],
+            flags    = u.f,
+            level    = u.l,
+            kind     = UnitKind(u.f),
+            reaction = UnitReaction(u.f),
+            cols     = u.c,
+            counts   = u.n,
+        }
+    end
+    return out
+end
+
+function API:UnitIndexByName(cache, name)
+    for i, n in ipairs(cache.N or {}) do
+        if n == name then return i end
+    end
+end
+
+-- Counterparts making up one column for one unit, largest first, each with the
+-- spells that contributed. Second return is how many were dropped when stored.
+function API:Breakdown(cache, index, col)
+    local unit = cache.U and cache.U[index]
+    if not unit then return {} end
+
+    local flat = unit.b and unit.b[col]
+    if not flat then return {}, unit.m and unit.m[col] end
+
+    local out, byIndex = {}, {}
+    for i = 1, #flat, 3 do
+        local entry = { name = cache.N[flat[i]], v = flat[i + 1], n = flat[i + 2] }
+        byIndex[flat[i]] = entry
+        out[#out + 1] = entry
+    end
+
+    local spells = unit.s and unit.s[col]
+    if spells then
+        for i = 1, #spells, 6 do
+            local entry = byIndex[spells[i]]
+            if entry then
+                entry.spells = entry.spells or {}
+                local id = spells[i + 1]
+                entry.spells[#entry.spells + 1] = {
+                    -- `id` keys the entry and picks its label. `spellId` is the
+                    -- real spell behind it, for an icon and the client tooltip:
+                    -- the same thing for an ordinary spell, and for a composite
+                    -- - "Polymorph (Kick)" - the spell it leads with.
+                    id      = id,
+                    spellId = (cache.SX and cache.SX[id]) or id,
+                    name    = (cache.SP and cache.SP[id]) or ("spell " .. id),
+                    v       = spells[i + 2],
+                    n       = spells[i + 3],
+                    mn      = spells[i + 4],
+                    mx      = spells[i + 5],
+                }
+            end
+        end
+    end
+
+    table.sort(out, function(a, b) return a.v > b.v end)
+    for _, entry in ipairs(out) do
+        if entry.spells then
+            table.sort(entry.spells, function(a, b) return a.v > b.v end)
+        end
+    end
+    return out, unit.m and unit.m[col]
+end
+
+-- Death events with their preceding action window, names resolved.
+function API:EventList(cache)
+    local categoryOf = ns.SpellCategory
+    local out = {}
+    for i, e in ipairs(cache.E or {}) do
+        local context = {}
+        for j = 1, #e.c, 6 do
+            local id = e.c[j + 4]
+            context[#context + 1] = {
+                t        = e.c[j],
+                kind     = e.c[j + 1],
+                src      = e.c[j + 2] ~= 0 and cache.N[e.c[j + 2]] or nil,
+                dst      = e.c[j + 3] ~= 0 and cache.N[e.c[j + 3]] or nil,
+                spell    = id ~= 0 and id or nil,
+                name     = id ~= 0 and ((cache.SP and cache.SP[id]) or ("spell " .. id)) or nil,
+                amount   = e.c[j + 5],
+                -- Derived rather than stored: the taxonomy is a lookup the
+                -- reader already has, so keeping it out of the cache costs
+                -- nothing and saves a string per context entry.
+                category = id ~= 0 and categoryOf[id] or nil,
+            }
+        end
+        out[i] = { name = "death", t = e.t, unit = cache.N[e.u], context = context }
+    end
+    return out
+end
+
+function API:GetCache(key)
+    local cache = ns.db and ns.db.cache and ns.db.cache[key]
+    if CacheIsCurrent(cache) then return cache end
+    return nil
+end
+
+-- Aggregates a stream into a CACHE, yielding between chunks so the client stays
+-- responsive. onDone(cache) fires when finished; onProgress(done, total) is
+-- optional. Returns immediately.
+function API:BuildCache(key, onDone, onProgress)
+    local stream, err = self:LoadStream(key)
+    if not stream then
+        if onDone then onDone(nil, err) end
+        return
+    end
+
+    -- Units are keyed by name rather than by index. Names are stable across a
+    -- reparse, readable in the stored cache, and collapse the many transient
+    -- GUIDs a battleground creates for identically named creatures into one
+    -- entry. The stream's numeric indices stay an encoding detail.
+    local nameOf = {}   -- stream unit index -> name it contributes to
+    local rawKind = {}  -- stream unit index -> what THAT unit is, before rollup
+    local UNITS = {}
+
+    local function UnitEntry(name)
+        local entry = UNITS[name]
+        if not entry then
+            entry = { name = name, cols = {}, counts = {}, by = {} }
+            for c = 1, #FORMAT_COLUMNS do
+                entry.cols[c] = 0
+                entry.counts[c] = 0
+            end
+            UNITS[name] = entry
+        end
+        return entry
+    end
+
+    local function SetIdentity(entry, u)
+        entry.guid     = u[1]
+        entry.flags    = u[3]
+        entry.level    = u[5]
+        entry.kind     = UnitKind(u[3])
+        entry.reaction = UnitReaction(u[3])
+    end
+
+    -- Identity is taken from units that own themselves, in a pass of their own.
+    -- Doing this inline while rolling pets up meant a pet appearing before its
+    -- owner stamped the owner's entry with the PET's flags, leaving a real
+    -- player typed as "pet" - excluded from the roster join, so their row read
+    -- zero and would not expand.
+    for _, u in ipairs(stream.units) do
+        if u[4] == 0 then
+            SetIdentity(UnitEntry((u[2] ~= "" and u[2]) or u[1]), u)
+        end
+    end
+
+    for i, u in ipairs(stream.units) do
+        -- Pets and guardians contribute to their owner: a warlock's damage is
+        -- not meaningfully separate from its felguard's, and rolling up here
+        -- means nothing downstream has to walk a parent chain.
+        local name = (u[2] ~= "" and u[2]) or u[1]
+        local ownerIndex = u[4]
+        local guard = 0
+        while ownerIndex ~= 0 and stream.units[ownerIndex] and guard < 16 do
+            local owner = stream.units[ownerIndex]
+            name = (owner[2] ~= "" and owner[2]) or owner[1]
+            ownerIndex = owner[4]
+            guard = guard + 1   -- a cycle in the owner chain must not hang
+        end
+        nameOf[i] = name
+        rawKind[i] = UnitKind(u[3])
+
+        -- An orphan whose owner never appeared standalone still needs an entry.
+        local entry = UnitEntry(name)
+        if not entry.guid then SetIdentity(entry, u) end
+    end
+
+    local t, k   = stream.t,  stream.k
+    local s, d   = stream.s,  stream.d
+    local am, ov = stream.am, stream.ov
+    local sp     = stream.sp
+    local spells = stream.spells
+    local total  = #t
+
+    local events = {}
+    local dmgDone, dmgTaken   = COL["Damage Done"], COL["Damage Taken"]
+    local healDone, healTaken = COL["Healing Done"], COL["Healing Taken"]
+    local overCol             = COL["Overhealing"]
+    local interruptCol, dispelCol = COL["Interrupts"], COL["Dispels"]
+    local purgeCol            = COL["Purges"]
+    local deathCol            = COL["Deaths"]
+    local ccDone, ccTaken     = COL["CC Done"], COL["CC Taken"]
+
+    local categoryOf = ns.SpellCategory
+    local CC = "cc"
+
+    -- Open crowd control, so a duration can be closed out on aura removal.
+    -- Keyed by victim name then spell id.
+    local openCC = {}
+
+    -- Adds to a total and, when the column names a counterpart, to that unit's
+    -- per-counterpart breakdown.
+    -- Spell names are held once per session and referenced by id, rather than
+    -- repeated inside every counterpart's spell table. With a dozen spells
+    -- against twenty counterparts for twenty players, repeating the strings
+    -- would dominate the stored cache.
+    local spellNames = { [0] = "Melee" }
+
+    -- A dispel row reads "<aura removed> (<spell used>)", so the pair needs one
+    -- id to key the breakdown by - the stored format carries a single spell id
+    -- per entry, and widening it for this alone is not worth the bytes.
+    --
+    -- Keying by the aura's own id instead would be wrong: Shadow Word: Pain is
+    -- a damage spell as well as a dispel target, and relabelling its name would
+    -- follow it into every damage breakdown in the session. Synthetic ids sit
+    -- far above anything Blizzard issues, so they cannot collide with a real
+    -- one, and only dispel and purge columns ever refer to them.
+    local COMPOSITE_BASE = 1000000000
+    local compositeIds, nextComposite = {}, COMPOSITE_BASE
+
+    -- Synthetic id back to the real spell it leads with, so a shell can still
+    -- reach an icon and the client tooltip. Without it these rows were the only
+    -- ones in the grid with no icon.
+    local compositeSpell = {}
+
+    local function CompositeSpell(auraIndex, dispelId)
+        local aura = auraIndex ~= 0 and spells[auraIndex]
+        -- No aura recorded: fall back to naming the dispel itself, which is
+        -- what the old format showed and is better than an unnamed row.
+        if not aura then return dispelId end
+
+        local tag = aura[1] .. ":" .. (dispelId or 0)
+        local id = compositeIds[tag]
+        if not id then
+            nextComposite = nextComposite + 1
+            id = nextComposite
+            compositeIds[tag] = id
+            compositeSpell[id] = aura[1]
+
+            local used = dispelId and dispelId ~= 0 and spellNames[dispelId]
+            spellNames[id] = used and (aura[2] .. " (" .. used .. ")") or aura[2]
+        end
+        return id
+    end
+
+    -- Self counts as a counterpart. A unit healing or damaging itself is real
+    -- output and is listed by name like anyone else, so a self-healer's row can
+    -- be opened to see how much of their healing was on themselves.
+    local function AddBreakdown(entry, col, other, value, count, spellId)
+        if not other then return end
+
+        local map = entry.by[col]
+        if not map then map = {}; entry.by[col] = map end
+        local slot = map[other]
+        if not slot then slot = { v = 0, n = 0 }; map[other] = slot end
+        slot.v = slot.v + value
+        slot.n = slot.n + count
+
+        -- Which spells made up this pairing. Keyed by id; the name lives in the
+        -- session's spell table.
+        --
+        -- Smallest and largest are tracked alongside the sum because they cannot
+        -- be recovered from it: an average says a spell hit for 40k, and only the
+        -- range says whether that was every cast or one crit carrying twenty
+        -- glancing ticks. Two numbers per spell is the cheapest way to answer a
+        -- question the totals genuinely cannot.
+        if spellId then
+            local spells = slot.s
+            if not spells then spells = {}; slot.s = spells end
+            local use = spells[spellId]
+            if not use then
+                use = { v = 0, n = 0, mn = value, mx = value }
+                spells[spellId] = use
+            end
+            use.v = use.v + value
+            use.n = use.n + count
+            if value < use.mn then use.mn = value end
+            if value > use.mx then use.mx = value end
+        end
+    end
+
+    local function Add(entry, col, other, value, count, spellId)
+        entry.cols[col]   = entry.cols[col] + value
+        entry.counts[col] = entry.counts[col] + count
+        AddBreakdown(entry, col, other, value, count, spellId)
+    end
+
+    local index = 1
+    local CHUNK = 20000   -- ~4-8ms per slice on the reference battleground
+
+    local function Step()
+        local stop = math.min(index + CHUNK - 1, total)
+
+        for i = index, stop do
+            local kind = k[i]
+            local srcName = s[i] ~= 0 and nameOf[s[i]] or nil
+            local dstName = d[i] ~= 0 and nameOf[d[i]] or nil
+            local amount  = am[i]
+
+            -- Resolved once per event rather than per column. Id 0 means no
+            -- spell was involved, which is a melee swing.
+            local spellIndex = sp[i]
+            local spellRow   = spellIndex ~= 0 and spells[spellIndex] or nil
+            local spellId    = spellRow and spellRow[1] or 0
+            if spellRow and spellNames[spellId] == nil then
+                spellNames[spellId] = spellRow[2]
+            end
+
+            if IS_DAMAGE[kind] then
+                if srcName then Add(UnitEntry(srcName), dmgDone, dstName, amount, 1, spellId) end
+                if dstName then Add(UnitEntry(dstName), dmgTaken, srcName, amount, 1, spellId) end
+
+                -- Overkill above zero marks the killing blow, and is the only
+                -- attribution available: UNIT_DIED carries no source, and
+                -- PARTY_KILL covers party members only. It names the killer but
+                -- does not count the death - UNIT_DIED does that - because a
+                -- death can occur with no overkill damage behind it (a periodic
+                -- tick landing exactly, or environmental damage). Counting here
+                -- as well would miss those; counting only there would lose the
+                -- killer. The total may therefore exceed the breakdown.
+                if ov[i] > 0 and dstName and rawKind[d[i]] == "player" then
+                    AddBreakdown(UnitEntry(dstName), deathCol, srcName, 1, 1, spellId)
+                end
+
+            elseif IS_HEAL[kind] then
+                -- Overhealing is included in amount, so effective healing is
+                -- the remainder.
+                local effective = amount - ov[i]
+                if srcName then
+                    Add(UnitEntry(srcName), healDone, dstName, effective, 1, spellId)
+                    -- Counted only when there was overhealing, so the count is
+                    -- "casts that overhealed" rather than "casts".
+                    if ov[i] > 0 then
+                        Add(UnitEntry(srcName), overCol, dstName, ov[i], 1, spellId)
+                    end
+                end
+                if dstName then
+                    Add(UnitEntry(dstName), healTaken, srcName, effective, 1, spellId)
+                end
+
+            elseif kind == K.SPELL_ABSORBED then
+                -- src is the ABSORBER, rewritten by the application; the
+                -- attacker arrives separately as DAMAGE_ABSORBED.
+                --
+                -- Damage prevented is healing: it is counted in Healing Done for
+                -- the shielder and Healing Taken for the shielded, the same as a
+                -- direct heal, and the shield spell shows up in the breakdown
+                -- alongside them.
+                --
+                -- This does not reproduce the scoreboard, and no rule does. One
+                -- healer matched to the exact gold with absorbs excluded, while
+                -- a DPS with 6.35M of self-shields reads 135% high with them
+                -- included. Blizzard's healing figure is not a function of the
+                -- log; counting prevented damage as healing is at least a rule
+                -- that can be stated.
+                if srcName then Add(UnitEntry(srcName), healDone, dstName, amount, 1, spellId) end
+                if dstName then Add(UnitEntry(dstName), healTaken, srcName, amount, 1, spellId) end
+
+            elseif kind == K.INTERRUPT then
+                -- Named for the spell that was stopped, with the interrupt in
+                -- parentheses: "Polymorph (Kick)". A bare "Kick" says nothing
+                -- about what it was worth.
+                if srcName then
+                    Add(UnitEntry(srcName), interruptCol, dstName, 1, 1,
+                        CompositeSpell(am[i], spellId))
+                end
+
+            elseif kind == K.DISPEL or kind == K.PURGE then
+                -- The application put the removed aura's spell index in the
+                -- amount column, which a dispel otherwise leaves at zero, and
+                -- split the two directions by auraType: a debuff off a friend
+                -- is a dispel, a buff off an enemy is a purge, and a spell
+                -- steal is a purge because it takes a buff.
+                local col = (kind == K.DISPEL) and dispelCol or purgeCol
+                if srcName then
+                    Add(UnitEntry(srcName), col, dstName, 1, 1,
+                        CompositeSpell(am[i], spellId))
+                end
+
+            elseif kind == K.AURA_APPLIED then
+                local spellIndex = sp[i]
+                local spellId = spellIndex ~= 0 and spells[spellIndex]
+                                and spells[spellIndex][1] or nil
+                if spellId and categoryOf[spellId] == CC and dstName then
+                    local perVictim = openCC[dstName]
+                    if not perVictim then perVictim = {}; openCC[dstName] = perVictim end
+                    -- A re-application while still active keeps the original
+                    -- start, so overlapping refreshes do not double count.
+                    if not perVictim[spellId] then
+                        perVictim[spellId] = { t = t[i], src = srcName }
+                    end
+                end
+
+            elseif kind == K.AURA_REMOVED then
+                local spellIndex = sp[i]
+                local spellId = spellIndex ~= 0 and spells[spellIndex]
+                                and spells[spellIndex][1] or nil
+                local perVictim = dstName and openCC[dstName]
+                local opened = perVictim and spellId and perVictim[spellId]
+                if opened then
+                    perVictim[spellId] = nil
+                    local ms = t[i] - opened.t
+                    if ms > 0 then
+                        -- Attributed to the spell that opened the effect, which
+                        -- is the key this was stored under, so a counterpart can
+                        -- be opened to see which fears and stuns made up the
+                        -- time rather than only the total.
+                        if opened.src then
+                            Add(UnitEntry(opened.src), ccDone, dstName, ms, 1, spellId)
+                        end
+                        Add(UnitEntry(dstName), ccTaken, opened.src, ms, 1, spellId)
+                    end
+                end
+
+            elseif kind == K.UNIT_DIED then
+                -- Only units that are themselves players.
+                --
+                -- Everything a pet does rolls up to its owner, which is right
+                -- for damage and healing and wrong for dying: a warlock's
+                -- felguard, a mage's water elemental and a shaman's totems were
+                -- all adding to their owner's death count. The rollup name is
+                -- still used for the entry, so a pet death would land on the
+                -- player - the guard has to be on what the unit IS, before the
+                -- rollup, which is what rawKind carries.
+                if dstName and rawKind[d[i]] == "player" then
+                    Add(UnitEntry(dstName), deathCol, nil, 1, 1)
+                    events[#events + 1] = {
+                        name = "death", t = t[i], unit = dstName, at = i,
+                    }
+                end
+            end
+        end
+
+        index = stop + 1
+        if onProgress then onProgress(stop, total) end
+
+        if index <= total then
+            C_Timer.After(0, Step)
+        else
+            BuildEventContext(stream, nameOf, UNITS, events, function()
+                TrimBreakdowns(UNITS)
+
+                local unitCount = 0
+                for _ in pairs(UNITS) do unitCount = unitCount + 1 end
+
+                local N, U, E = Compact(UNITS, events)
+
+                -- Only spells still referenced are worth keeping, since trimming
+                -- and compaction may have dropped the rest. Composites carry a
+                -- second entry pointing at the real spell they lead with, kept
+                -- on the same "only if still referenced" basis.
+                local usedSpells, usedComposites = {}, {}
+                local function Keep(id)
+                    usedSpells[id] = spellNames[id] or ("spell " .. id)
+                    if compositeSpell[id] then
+                        usedComposites[id] = compositeSpell[id]
+                    end
+                end
+
+                for _, unit in pairs(U) do
+                    for _, flat in pairs(unit.s or {}) do
+                        for i = 2, #flat, 6 do Keep(flat[i]) end
+                    end
+                end
+                for _, event in ipairs(E) do
+                    for i = 5, #event.c, 6 do
+                        if event.c[i] ~= 0 then Keep(event.c[i]) end
+                    end
+                end
+
+                -- Short field names throughout: every one is written to disk
+                -- once per session, and the viewer is the only reader.
+                local cache = {
+                    FORMAT = {
+                        version  = DEFINES_VERSION,
+                        taxonomy = ns.SPELL_TAXONOMY_VERSION,
+                        columns  = FORMAT_COLUMNS,
+                    },
+                    N  = N,           -- interned unit names
+                    U  = U,           -- units, indexed into N
+                    E  = E,           -- death events, flat context runs
+                    SP = usedSpells,      -- [spellId] = name
+                    SX = usedComposites,  -- [syntheticId] = the real spell
+                    -- The chunk is deleted by the application once consumed, so
+                    -- everything the viewer needs has to be copied in here.
+                    header     = stream.header,
+                    key        = key,
+                    eventCount = total,
+                    unitCount  = unitCount,
+                }
+                if ns.db then
+                    ns.db.cache = ns.db.cache or {}
+                    ns.db.cache[key] = cache
+                end
+                if onDone then onDone(cache) end
+            end)
+        end
+    end
+
+    Step()
+end
+
+--------------------------------------------------------------------------------
+
+-- PLAYER_LOGIN rather than ADDON_LOADED: CombatSession_Data depends on this
+-- addon and therefore loads after it, so the index does not exist yet at
+-- ADDON_LOADED time.
+ns:RegisterEvent("PLAYER_LOGIN", function()
+    DropStaleCaches()
+    API:ProcessPending(function(processed, skipped)
+        if processed == 0 then return end
+        if skipped > 0 then
+            ns:Print(("processed %d session(s); skipped %d beyond the %d-session limit")
+                :format(processed, skipped, API:GetMaxSessions()))
+        else
+            ns:Debug(("processed %d session(s)"):format(processed))
+        end
+        if ns.UI then ns.UI:Refresh() end
+    end)
+end)
+
+_G.CombatSessionAPI = API

@@ -1,0 +1,12 @@
+## Interface: 120100
+## Title: CombatSession Viewer
+## Notes: Read-only viewer shell for data captured by CombatSession.
+## Version: 0.10
+## Dependencies: CombatSession
+## SavedVariables: CombatSessionViewerDB
+
+Core.lua
+Model.lua
+Window.lua
+Minimap.lua
+Commands.lua

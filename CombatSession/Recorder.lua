@@ -1,0 +1,449 @@
+-- CombatSession :: Recorder
+--
+-- Captures the match metadata that the combat log does not contain. Rated
+-- status, match outcome, and battleground rosters exist only in the live client
+-- API: battlegrounds emit no start/end event, and rated BG / Blitz run on the
+-- same maps as random BGs, so nothing in the log distinguishes them.
+--
+-- Two snapshots per match:
+--   entry      - taken on entering the instance. Rated status is valid here,
+--                which matters because a player who leaves early never fires
+--                PVP_MATCH_COMPLETE and so never reaches the completion path.
+--   completion - taken on PVP_MATCH_COMPLETE, where the scoreboard is readable.
+--
+-- The rated predicate mirrors REFlex, which solves this correctly.
+
+local ADDON, ns = ...
+
+local Recorder = {}
+ns.Recorder = Recorder
+
+-- The match currently being observed, or nil outside a PvP instance.
+local current = nil
+-- True when we enabled combat logging ourselves, so that leaving does not
+-- switch off logging the user had turned on manually.
+local loggingOwned = false
+
+--------------------------------------------------------------------------------
+-- Client API guards
+--
+-- Every C_PvP entry point is probed rather than called directly: this addon has
+-- to survive an API being renamed or removed in a patch without the recorder
+-- silently dropping an entire match.
+--------------------------------------------------------------------------------
+
+local function PvPFlag(name)
+    local fn = C_PvP and C_PvP[name]
+    if type(fn) ~= "function" then return nil end
+    local ok, result = pcall(fn)
+    if not ok then return nil end
+    return result
+end
+
+local function Global(name, ...)
+    local fn = _G[name]
+    if type(fn) ~= "function" then return nil end
+    local results = { pcall(fn, ...) }
+    if not results[1] then return nil end
+    return unpack(results, 2)
+end
+
+--------------------------------------------------------------------------------
+-- Instance classification
+--------------------------------------------------------------------------------
+
+local function InstanceInfo()
+    local name, instanceType, _, _, _, _, _, instanceID = GetInstanceInfo()
+    return name, instanceType, instanceID
+end
+
+-- The combat log writes uiMapID in MAP_CHANGE lines, while GetInstanceInfo
+-- returns an instance id from a different id space. Both are recorded so the
+-- app can correlate a session's log lines to the match the recorder saw.
+local function CurrentUiMap()
+    if not (C_Map and type(C_Map.GetBestMapForUnit) == "function") then return nil end
+    local ok, id = pcall(C_Map.GetBestMapForUnit, "player")
+    if not ok then return nil end
+    return id
+end
+
+local function IsPvPInstance(instanceType)
+    return instanceType == "arena" or instanceType == "pvp"
+end
+
+-- REFlex's predicate. Skirmishes and unrated Solo Shuffle both report true for
+-- IsRatedArena on some paths, hence the explicit exclusions.
+local function IsRatedMatch()
+    local isSoloShuffle = PvPFlag("IsSoloShuffle")
+    if PvPFlag("IsRatedBattleground") then return true end
+    if PvPFlag("IsSoloRBG") then return true end
+    if PvPFlag("IsRatedSoloShuffle") then return true end
+    if PvPFlag("IsRatedArena") and not Global("IsArenaSkirmish") and not isSoloShuffle then
+        return true
+    end
+    return false
+end
+
+--------------------------------------------------------------------------------
+-- Instrumentation
+--
+-- The event order for multi-round formats (Solo Shuffle, Blitz) is not settled:
+-- it is not documented whether ARENA_MATCH_START/END bracket the lobby or each
+-- round. Every state transition is traced with a timestamp so that a real
+-- capture answers the question instead of the segmenter guessing at it.
+--------------------------------------------------------------------------------
+
+local function Trace(event, detail)
+    local db = ns.db
+    if not db then return end
+    table.insert(db.trace, {
+        t      = ns:Now(),
+        gt     = GetTime(),
+        event  = event,
+        state  = PvPFlag("GetActiveMatchState"),
+        detail = detail,
+    })
+    ns:TrimArray(db.trace, db.settings.maxTrace)
+    ns:Debug("trace", event, detail)
+end
+
+--------------------------------------------------------------------------------
+-- Scoreboard
+--------------------------------------------------------------------------------
+
+-- Prefers C_PvP.GetScoreInfo, which carries talentSpec; falls back to the older
+-- positional API. Returns nil when the scoreboard is not yet populated so the
+-- caller can retry.
+local function ReadRoster()
+    Global("SetBattlefieldScoreFaction", -1)
+
+    local count = Global("GetNumBattlefieldScores") or 0
+    if count == 0 then return nil end
+
+    local roster = {}
+    for i = 1, count do
+        local info
+        if C_PvP and type(C_PvP.GetScoreInfo) == "function" then
+            local ok, result = pcall(C_PvP.GetScoreInfo, i)
+            if ok then info = result end
+        end
+
+        if type(info) == "table" then
+            roster[i] = {
+                name    = info.name,
+                class   = info.classToken,
+                spec    = info.talentSpec,
+                faction = info.faction,
+                race    = info.raceName,
+                kb      = info.killingBlows,
+                deaths  = info.deaths,
+                damage  = info.damageDone,
+                healing = info.healingDone,
+                rating       = info.rating,
+                ratingChange = info.ratingChange,
+                prematchMMR  = info.prematchMMR,
+                mmrChange    = info.mmrChange,
+            }
+        else
+            local name, kb, _, deaths, _, faction, race, _, classToken, damage, healing =
+                Global("GetBattlefieldScore", i)
+            if not name then return nil end
+            roster[i] = {
+                name = name, class = classToken, faction = faction, race = race,
+                kb = kb, deaths = deaths, damage = damage, healing = healing,
+            }
+        end
+    end
+    return roster
+end
+
+local function ReadTeamInfo()
+    local teams = {}
+    for index = 0, 1 do
+        local name, oldRating, newRating, mmr = Global("GetBattlefieldTeamInfo", index)
+        if name or oldRating then
+            teams[index + 1] = {
+                name = name, oldRating = oldRating, newRating = newRating, mmr = mmr,
+            }
+        end
+    end
+    return next(teams) and teams or nil
+end
+
+--------------------------------------------------------------------------------
+-- Match lifecycle
+--------------------------------------------------------------------------------
+
+-- Seconds to keep logging after leaving a PvP instance.
+--
+-- Switching logging off the instant we leave loses the session's terminator.
+-- The client writes the exit ZONE_CHANGE as part of the same transition that
+-- fires our event, and if logging is already off by then the line never reaches
+-- the file - leaving the segmenter with a session that never closes. Observed
+-- exactly that on a Warsong Gulch capture: the log ended mid-combat with no
+-- closing ZONE_CHANGE, and the application withheld the session entirely.
+local LOGGING_TAIL_SECONDS = 8
+
+-- Incremented on every entry and exit so a stale timer cannot switch logging
+-- off after the player has already re-entered a new match.
+local loggingEpoch = 0
+
+local function StopLoggingSoon()
+    if not loggingOwned then return end
+
+    loggingEpoch = loggingEpoch + 1
+    local epoch = loggingEpoch
+
+    C_Timer.After(LOGGING_TAIL_SECONDS, function()
+        if epoch ~= loggingEpoch then return end   -- re-entered; leave it running
+        if loggingOwned and LoggingCombat() then
+            LoggingCombat(false)
+            ns:Debug("combat logging disabled")
+        end
+        loggingOwned = false
+    end)
+end
+
+-- Exposed for the settings toggle, which has to know whether there is a match
+-- under way before it starts logging, and whether the logging that is running
+-- is this addon to stop. A log the player started by hand with /combatlog is
+-- theirs, and turning auto logging off must not switch it off.
+function ns:MatchInProgress()
+    return current ~= nil
+end
+
+function ns:ReleaseLogging()
+    if not loggingOwned then return false end
+    loggingOwned = false
+    if LoggingCombat() then
+        LoggingCombat(false)
+        ns:Debug("combat logging disabled")
+    end
+    return true
+end
+
+local function BeginMatch(instanceName, instanceID, instanceType)
+    local clientVersion, clientBuild = GetBuildInfo()
+    local uiMapID = CurrentUiMap()
+
+    current = {
+        startedAt    = ns:Now(),
+        startedGT    = GetTime(),
+        map          = instanceID,
+        mapName      = instanceName,
+        instanceType = instanceType,
+        uiMapID      = uiMapID,
+        -- Every uiMapID seen during the match. A battleground that spans more
+        -- than one map would make a bare MAP_CHANGE an unsafe session
+        -- terminator, so the segmenter needs the whole set, not just the first.
+        uiMaps       = uiMapID and { [uiMapID] = true } or {},
+        isArena      = Global("IsActiveBattlefieldArena") or false,
+        isRated      = IsRatedMatch(),
+        isBrawl      = PvPFlag("IsInBrawl") or false,
+        isSoloShuffle      = PvPFlag("IsSoloShuffle") or false,
+        isRatedSoloShuffle = PvPFlag("IsRatedSoloShuffle") or false,
+        isSoloRBG    = PvPFlag("IsSoloRBG") or false,
+        isSkirmish   = Global("IsArenaSkirmish") or false,
+        season       = Global("GetCurrentArenaSeason"),
+        playerFaction = Global("GetBattlefieldArenaFaction"),
+        rounds       = {},
+
+        -- SavedVariables are account-wide, so records from every character land
+        -- in one table. Without this there is no way to tell them apart, and no
+        -- way to join a record to the right session when two characters played
+        -- overlapping matches.
+        character     = UnitName("player"),
+        characterGuid = UnitGUID("player"),
+        realm         = GetRealmName(),
+
+        addonVersion = ns.VERSION,
+        clientVersion = clientVersion,
+        clientBuild  = clientBuild,
+        complete     = false,
+    }
+
+    Trace("BEGIN", instanceName)
+
+    -- Cancels any pending stop from the previous match. This must happen even
+    -- when logging is already running, or a timer queued on the way out of the
+    -- last match would switch it off partway through this one.
+    loggingEpoch = loggingEpoch + 1
+
+    -- Advanced logging is forced here rather than only when logging is being
+    -- switched on: a log that is already running without the advanced block is
+    -- exactly the case worth correcting, and it costs nothing when it is
+    -- already set.
+    if ns.db.settings.autoLog then
+        ns:EnsureAdvancedLogging()
+        if not LoggingCombat() then
+            LoggingCombat(true)
+            loggingOwned = true
+            ns:Debug("combat logging enabled")
+        end
+    end
+end
+
+-- Called on PVP_MATCH_COMPLETE. The scoreboard occasionally lags the event, so
+-- an empty roster schedules a bounded retry rather than storing a hollow record.
+local function CompleteMatch(attempt)
+    if not current then return end
+    attempt = attempt or 1
+
+    Global("RequestBattlefieldScoreData")
+    local roster = ReadRoster()
+
+    if not roster and attempt < 5 then
+        C_Timer.After(0.5, function() CompleteMatch(attempt + 1) end)
+        return
+    end
+
+    current.endedAt  = ns:Now()
+    current.duration = PvPFlag("GetActiveMatchDuration")
+    current.winner   = Global("GetBattlefieldWinner")
+    current.roster   = roster
+    current.teams    = ReadTeamInfo()
+    current.complete = true
+
+    Trace("COMPLETE", ("roster=%d winner=%s")
+        :format(roster and #roster or 0, tostring(current.winner)))
+end
+
+-- Called when leaving the instance. A match without a completion snapshot was
+-- abandoned: rated status and start time survive, outcome and roster do not.
+local function FinalizeMatch()
+    if not current then return end
+
+    if not current.complete then
+        current.endedAt   = ns:Now()
+        current.abandoned = true
+        Trace("ABANDONED", current.mapName)
+    end
+
+    current.durationObserved = GetTime() - current.startedGT
+
+    local db = ns.db
+    table.insert(db.matches, current)
+    ns:TrimArray(db.matches, db.settings.maxMatches)
+    ns:Debug("stored match", current.mapName, current.isRated and "rated" or "unrated")
+
+    current = nil
+    StopLoggingSoon()
+end
+
+--------------------------------------------------------------------------------
+-- Round tracking
+--------------------------------------------------------------------------------
+
+local lastState = nil
+
+local function OnMatchStateChanged()
+    local state = PvPFlag("GetActiveMatchState")
+    if state == lastState then return end
+
+    Trace("STATE", ("%s -> %s"):format(tostring(lastState), tostring(state)))
+    lastState = state
+
+    if not current then return end
+
+    -- PostRound marks the end of a Solo Shuffle / Blitz round. Recorded as a
+    -- boundary regardless of format so the app can segment per round.
+    if Enum and Enum.PvPMatchState and state == Enum.PvPMatchState.PostRound then
+        table.insert(current.rounds, {
+            endedAt  = ns:Now(),
+            elapsed  = GetTime() - current.startedGT,
+            duration = PvPFlag("GetActiveMatchDuration"),
+        })
+        Trace("ROUND", ("#%d"):format(#current.rounds))
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Wiring
+--------------------------------------------------------------------------------
+
+-- Fires far more often than ZONE_CHANGED_NEW_AREA and is only interesting when
+-- the map id actually moves, so unchanged ids are dropped rather than traced.
+local lastUiMap = nil
+
+local function OnUiMapMaybeChanged()
+    local id = CurrentUiMap()
+    if id == lastUiMap then return end
+    lastUiMap = id
+
+    if not current then return end
+    current.uiMaps[id or "unknown"] = true
+    Trace("UIMAP", tostring(id))
+end
+
+-- Seconds to wait before believing the match is over.
+--
+-- GetInstanceInfo briefly reports a non-PvP instance type during phase and zone
+-- transitions while still inside a battleground. Acting on a single reading
+-- split one Twin Peaks match into two records - an abandoned one at 02:18:13
+-- and a fresh one six seconds later - so departure is confirmed rather than
+-- assumed.
+local LEAVE_GRACE_SECONDS = 10
+
+local leaveEpoch = 0
+
+local function FinalizeSoon()
+    if not current then return end
+
+    leaveEpoch = leaveEpoch + 1
+    local epoch = leaveEpoch
+
+    C_Timer.After(LEAVE_GRACE_SECONDS, function()
+        if epoch ~= leaveEpoch or not current then return end
+
+        local _, instanceType, instanceID = InstanceInfo()
+        if IsPvPInstance(instanceType) and instanceID == current.map then
+            Trace("STAYED", "transient zone reading ignored")
+            return
+        end
+        FinalizeMatch()
+    end)
+end
+
+local function OnZoneChanged()
+    local name, instanceType, instanceID = InstanceInfo()
+
+    if current and IsPvPInstance(instanceType) and instanceID == current.map then
+        -- Still in the same match. Cancels any departure awaiting confirmation.
+        leaveEpoch = leaveEpoch + 1
+    elseif IsPvPInstance(instanceType) then
+        -- A different PvP instance is a real transition, not a glitch.
+        if current then FinalizeMatch() end
+        BeginMatch(name, instanceID, instanceType)
+    elseif current then
+        FinalizeSoon()
+    end
+
+    -- Deliberately after the transition: on leaving, current is already nil, so
+    -- the map being zoned *to* is not recorded as part of the match just ended.
+    OnUiMapMaybeChanged()
+end
+
+function Recorder:Init()
+    ns:RegisterEvent("PLAYER_ENTERING_WORLD",   OnZoneChanged)
+    ns:RegisterEvent("ZONE_CHANGED_NEW_AREA",   OnZoneChanged)
+    ns:RegisterEvent("PVP_MATCH_COMPLETE",      function() CompleteMatch() end)
+    ns:RegisterEvent("PVP_MATCH_STATE_CHANGED", OnMatchStateChanged)
+    ns:RegisterEvent("PVP_MATCH_ACTIVE",        function() Trace("ACTIVE") end)
+
+    -- Sub-map transitions inside an instance, to establish whether a single
+    -- battleground can span more than one uiMapID.
+    ns:RegisterEvent("ZONE_CHANGED",            OnUiMapMaybeChanged)
+    ns:RegisterEvent("ZONE_CHANGED_INDOORS",    OnUiMapMaybeChanged)
+
+    -- Leaving by logout rather than by zoning still needs the record stored.
+    ns:RegisterEvent("PLAYER_LOGOUT",           FinalizeMatch)
+end
+
+--------------------------------------------------------------------------------
+
+ns:RegisterEvent("ADDON_LOADED", function(_, name)
+    if name ~= ADDON then return end
+    ns:InitDB()
+    Recorder:Init()
+    ns:Debug("initialised", ns.VERSION)
+end)
