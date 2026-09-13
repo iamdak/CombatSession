@@ -145,6 +145,25 @@ if(MSVC)
     # shape of a program that does not want to be seen, and was classified as
     # potentially unwanted for it. There is now no console to hide.
     set_target_properties(CombatSession PROPERTIES WIN32_EXECUTABLE TRUE)
+
+    # Control Flow Guard, on both halves because the guard data is per object
+    # file and miniz is linked in. Every indirect call is checked against a
+    # linker-built table of real function entry points, so a corrupted function
+    # pointer can no longer aim at the middle of something.
+    #
+    # The exploitation risk this addresses is close to nil - the program parses
+    # local text files its user's own game wrote, over thirteen virtual methods
+    # and one std::function. It is here because binary hardening scanners check
+    # for the bit, and an unsigned executable with low prevalence should not
+    # also be the one with a gap in its hardening report.
+    target_compile_options(CombatSession PRIVATE /guard:cf)
+    target_compile_options(miniz PRIVATE /guard:cf)
+    target_link_options(CombatSession PRIVATE /GUARD:CF)
+
+    # Marks the image as compatible with hardware shadow stacks, which is the
+    # backward-edge half CFG does not cover. A flag on the image only: it costs
+    # nothing and does nothing on a machine without CET.
+    target_link_options(CombatSession PRIVATE /CETCOMPAT)
 else()
     target_compile_options(CombatSession PRIVATE -Wall -Wextra)
 endif()
