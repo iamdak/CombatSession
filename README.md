@@ -31,7 +31,7 @@ macOS is supported in the source but there is no prebuilt binary — see
 
 ## Install
 
-1. Install the addon from CurseForge or download and copy the **`CombatSession`**
+1. Install the addon from [CurseForge](https://www.curseforge.com/wow/addons/combatsession) or download and copy the **`CombatSession`**
    and **`CombatSessionViewer`** folders into:
    `World of Warcraft/_retail_/Interface/AddOns/`.
    
