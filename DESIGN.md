@@ -14,7 +14,7 @@ normalized event stream.
 | `advancedCombatLogging` | already `"1"` in `Config.wtf` — required; addon must verify |
 | Install root | `C:\Games\World of Warcraft` (flavors: `_retail_`, `_ptr_`, `_beta_`, `_xptr_`) |
 | Toolchain | CMake 3.21+, C++20, static CRT. Windows: MSVC x64. macOS: AppleClang, 11.0+ |
-| Platform layer | `Platform.h` + `Tray.h`; one implementation pair per system, everything else portable |
+| Platform layer | `Platform.h` + `Shell.h`; one implementation pair per system, everything else portable |
 
 Measured on a 36,801 byte sample log: gzip -9 gives **10.5×**; GUIDs are 19% of bytes with
 353 occurrences of 19 unique values; quoted strings 29%; timestamps 11%.
@@ -29,7 +29,7 @@ an empty queue.
 Logs/WoWCombatLog-*.txt
   │
   ├─ app segments SESSION boundaries
-  ├─ app ARCHIVES the slice ──► App/Binary/Raw/<key>.log.gz     app-only, own limit
+  ├─ app ARCHIVES the slice ──► Binary/Raw/<key>.log.gz         app-only, own limit
   └─ app PARSES the archive ──► CombatSession_Data/<key>.lua    the queue
                                 CombatSession_Data/Index.lua    written LAST
 
@@ -86,9 +86,9 @@ whole file from memory at logout/reload/exit, so any external write during a cli
 destroyed on the next save. Neither side writes what the other owns:
 
 ```
-App   writes ->  CombatSession_Data/             generated .toc, chunks, Index.lua
-App   writes ->  App/Binary/Raw/                 archive, never distributed
-App   writes ->  App/Binary/settings.json        own settings
+App   writes ->  CombatSession_Data/               generated .toc, chunks, Index.lua
+App   writes ->  <app>/Binary/Raw/                 archive, never distributed
+App   writes ->  <app>/Binary/settings.json        own settings
 Addon writes ->  SavedVariables/CombatSession.lua  CACHE, MATCH records, floor, UI state
 ```
 
@@ -281,25 +281,35 @@ repository
   CombatSessionApp/
     CMakeLists.txt                the build; generates VS, Xcode, Ninja or make
     Source/                       C++ written for this project only
-                                  Platform_*/Tray_* are the only per-system files
+                                  Platform_*/Shell_* are the only per-system files
     Lib/miniz/                    third-party C (MIT)
+    Binary/                       build output; not in the repository
+    Build/                        generated project + intermediates, disposable
 
 game install, under Interface/AddOns/
   CombatSession/                  <- repository CombatSession/
-    App/                          <- repository CombatSessionApp/
-      Binary/                     executable + settings.json; never in the repository
-        Raw/<key>.log.gz          archive; explicitly NOT distributed
-      Build/                      generated project + intermediates, disposable
   CombatSessionViewer/            <- repository CombatSessionViewer/
 
   CombatSession_Data/             generated queue; one folder, eagerly loaded
     CombatSession_Data.toc        chunks listed first, Index.lua last
     <key>.lua                     UNCONSUMED chunks only
     Index.lua                     commit point
+
+application folder, wherever the user put it
+  Binary/
+    CombatSession.exe             <- repository CombatSessionApp/Binary/
+    settings.json                 own settings; never in the repository
+    Raw/<key>.log.gz              archive; explicitly NOT distributed
 ```
 
-`Binary/` and `Build/` exist only in the game tree and deploy never touches them, so copying
-the addons across costs neither the compiled executable nor the raw archive.
+The application is a third location, not a subfolder of either of the other two. It was once
+deployed into the AddOns tree as `CombatSession/App/`, which put an executable inside a folder
+the game scans for addons and a second copy of the C++ source somewhere nobody would edit it.
+It now lives wherever the user unpacked it and only the built executable is deployed there.
+
+`Binary/` and `Build/` are build and runtime state, never in the repository. Deploy copies the
+executable into the application folder and touches nothing else there, so it costs neither the
+settings nor the raw archive.
 
 Two independent limits: `rawLimit` (default 200 sessions) governs the archive, and the addon's
 own `maxSessions` (default 40, `API:SetMaxSessions`) governs how much it caches and how much of

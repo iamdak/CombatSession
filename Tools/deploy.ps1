@@ -3,23 +3,36 @@
     Copies this repository into a live World of Warcraft install.
 
 .DESCRIPTION
-    The repository is the source. The game folder is a deployment of it, and
+    The repository is the source. The deployed copies are deployments of it, and
     nothing should ever be edited there - this script is what makes that a
     one-command habit rather than something to remember.
 
-    The two trees are shaped differently, which is the whole reason this exists:
+    Two destinations, because the two halves are installed differently:
 
-        CombatSession/        ->  Interface/AddOns/CombatSession/
-        CombatSessionViewer/  ->  Interface/AddOns/CombatSessionViewer/
-        CombatSessionApp/     ->  Interface/AddOns/CombatSession/App/
+        CombatSession/                    ->  <wow>/Interface/AddOns/CombatSession/
+        CombatSessionViewer/              ->  <wow>/Interface/AddOns/CombatSessionViewer/
+        CombatSessionApp/Binary/*.exe     ->  <app>/Binary/
 
-    Copying is additive. Binary/ and Build/ live only in the game tree - the
-    compiled executable, its settings and the raw archive - and are never
-    touched, so deploying does not cost you your archive or make you rebuild.
+    The application used to be deployed into the AddOns tree as well, under
+    CombatSession/App/. It no longer is: an executable inside a folder the game
+    scans for addons was always odd, and it put a second copy of the C++ source
+    somewhere nobody would edit it. Only the built executable is deployed now,
+    and only to the folder the application actually runs from.
+
+    settings.json and Raw/ live beside the deployed executable and have no
+    counterpart in the repository, so deploying adds the new executable beside
+    them and leaves both alone. Your settings and your archive survive.
 
 .PARAMETER WowPath
     The flavor folder, the one containing Logs and Interface. Detected from the
     usual locations when omitted.
+
+.PARAMETER AppPath
+    The folder the application runs from - the one containing Binary/. Defaults
+    to C:\Games\WowCombatSession.
+
+.PARAMETER SkipApp
+    Deploy the addons only, leaving the executable alone.
 
 .PARAMETER WhatIf
     Report what would be copied without copying it.
@@ -27,11 +40,14 @@
 .EXAMPLE
     .\Tools\deploy.ps1
     .\Tools\deploy.ps1 -WowPath "D:\Games\World of Warcraft\_retail_"
+    .\Tools\deploy.ps1 -SkipApp
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [string] $WowPath
+    [string] $WowPath,
+    [string] $AppPath = 'C:\Games\WowCombatSession',
+    [switch] $SkipApp
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,34 +81,19 @@ if (-not (Test-Flavor $WowPath)) {
 }
 
 $addons = Join-Path $WowPath 'Interface\AddOns'
-Write-Host "Deploying to $addons" -ForegroundColor Cyan
+Write-Host "Deploying addons to $addons" -ForegroundColor Cyan
 
 #-------------------------------------------------------------------------------
-# What goes where
+# The addons
 #-------------------------------------------------------------------------------
 
 $map = @(
     @{ From = 'CombatSession';       To = 'CombatSession' }
     @{ From = 'CombatSessionViewer'; To = 'CombatSessionViewer' }
-    @{ From = 'CombatSessionApp';    To = 'CombatSession\App' }
 )
 
-# Top-level folders that never leave the repository.
-#
-# Build is the CMake tree. The README tells you to produce it right here -
-# `cmake -S . -B Build` from inside CombatSessionApp - so it is the expected
-# state of a repository someone has built, and it is 110 files of object code
-# and MSBuild logs that have no business in an AddOns folder. Left out of the
-# original script only because nothing had been built in-tree yet.
-#
-# Binary is NOT on this list: it holds the freshly built executable, and putting
-# that in the game tree is the point of deploying. The settings file and the raw
-# archive live in the game tree's Binary and have no counterpart here, so a copy
-# adds the new executable beside them and leaves both alone.
-$skip = @('Build', '.git', '.vs', 'out')
-
-$copied = 0
-$same   = 0
+$copied  = 0
+$same    = 0
 $skipped = 0
 
 foreach ($entry in $map) {
@@ -103,11 +104,6 @@ foreach ($entry in $map) {
 
     foreach ($file in Get-ChildItem $source -Recurse -File) {
         $relative = $file.FullName.Substring($source.Length).TrimStart('\')
-
-        # Matched on the leading path segment, so a file called Build.lua is
-        # still copied and everything under Build\ is not.
-        if ($skip -contains $relative.Split('\')[0]) { $skipped++; continue }
-
         $destination = Join-Path $target $relative
 
         # Compared by hash rather than by timestamp: a file copied back and
@@ -131,10 +127,73 @@ foreach ($entry in $map) {
     }
 }
 
+#-------------------------------------------------------------------------------
+# The executable
+#
+# Done last, and reported separately, because it is the one copy that can fail
+# for a reason the user has to do something about: Windows holds a lock on a
+# running executable. Failing here after the addons are already in place is the
+# right order - the Lua is what a /reload picks up, and it should not be held
+# back by the application being open.
+#-------------------------------------------------------------------------------
+
+if (-not $SkipApp) {
+    $built = Join-Path $repo 'CombatSessionApp\Binary\CombatSession.exe'
+
+    if (-not (Test-Path $built)) {
+        Write-Host ""
+        Write-Host "No built executable at $built - build it, or pass -SkipApp." -ForegroundColor Yellow
+    } else {
+        $appBinary = Join-Path $AppPath 'Binary'
+        $destination = Join-Path $appBinary 'CombatSession.exe'
+
+        $current = $null
+        if (Test-Path $destination) {
+            $current = (Get-FileHash $destination -Algorithm SHA256).Hash
+        }
+        $fresh = (Get-FileHash $built -Algorithm SHA256).Hash
+
+        if ($current -eq $fresh) {
+            $same++
+        } else {
+            Write-Host ""
+            Write-Host "Deploying application to $appBinary" -ForegroundColor Cyan
+
+            if ($PSCmdlet.ShouldProcess($destination, 'Copy')) {
+                if (-not (Test-Path $appBinary)) {
+                    New-Item -ItemType Directory -Force $appBinary | Out-Null
+                }
+
+                # Attempted rather than predicted. Asking whether a process
+                # named CombatSession is running answers a different question:
+                # it would refuse a deploy to a folder other than the one that
+                # process is running from, and it would still be guessing about
+                # the lock. Letting the copy fail asks the filesystem.
+                try {
+                    Copy-Item $built $destination -Force
+                    Write-Host "  Binary\CombatSession.exe"
+                    $copied++
+                } catch [System.IO.IOException] {
+                    $running = @(Get-Process -Name CombatSession -ErrorAction SilentlyContinue |
+                                 Where-Object { $_.Path -eq $destination })
+                    Write-Host "  Could not replace CombatSession.exe - it is in use." -ForegroundColor Yellow
+                    if ($running) {
+                        Write-Host "  Running as pid $($running.Id -join ', '). Quit it from its window or tray icon and run this again." -ForegroundColor Yellow
+                    } else {
+                        Write-Host "  Close whatever is holding it and run this again." -ForegroundColor Yellow
+                    }
+                }
+            }
+        }
+    }
+}
+
+#-------------------------------------------------------------------------------
+
 Write-Host ""
 if ($copied -eq 0) {
     Write-Host "Already up to date ($same files)." -ForegroundColor Green
 } else {
-    Write-Host "$copied file(s) copied, $same unchanged, $skipped not deployed." -ForegroundColor Green
+    Write-Host "$copied file(s) copied, $same unchanged." -ForegroundColor Green
     Write-Host "Reload the game to pick up addon changes." -ForegroundColor DarkGray
 }
