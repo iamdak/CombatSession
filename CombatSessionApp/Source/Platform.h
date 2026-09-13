@@ -10,29 +10,19 @@
 // so adding a system means adding one file rather than threading #ifdefs
 // through code that has nothing to do with any of it.
 //
-// The tray itself is a bigger thing than a function call and lives in Tray.h.
+// The windows themselves are bigger things than a function call: the status
+// area is in Tray.h, the main window in MainWindow.h.
 
 #pragma once
 
 #include <filesystem>
 #include <string>
-#include <vector>
 
 namespace cs {
 
 //------------------------------------------------------------------------------
 // Process
 //------------------------------------------------------------------------------
-
-// Hands back a console the system attached to this process.
-//
-// Only Windows has anything to do here: it gives every console-subsystem
-// process a console window whether it wants one or not, and the subsystem is
-// what decides whether a shell waits for us - so the executable asks for a
-// console in order to behave on a command line, then gives it back when it is
-// running as a background app. Elsewhere a process inherits a terminal or does
-// not, and there is nothing to hand back.
-void ReleaseConsole();
 
 // Absolute path of the running executable. Settings, the raw archive and the
 // login item are all resolved from it, so the folder can be moved or copied and
@@ -43,8 +33,8 @@ std::filesystem::path ExecutablePath();
 // process exits - including a crash, so a dead process cannot lock a user out
 // of their own application.
 //
-// Two of these exist: one held for the life of the tray so only one runs, and
-// one held for the duration of a pass so a command line and a tray cannot both
+// Two of these exist: one held for the life of the application so only one
+// runs, and one held for the duration of a pass so two copies cannot both
 // rewrite the read offsets.
 class NamedLock {
 public:
@@ -60,12 +50,9 @@ public:
 
 private:
     // One system's worth of state each, kept opaque so this header stays free of
-    // system headers: Windows uses a mutex handle, POSIX a descriptor on a lock
-    // file. Two unused words on either system is cheaper than a pimpl for a
-    // class whose whole job is to be created on the stack and destroyed.
-    // Exactly one system uses each of the first three, which is what the
-    // attribute says: a build for either one is right to see the others as
-    // dead, and should not have to say so as a warning.
+    // system headers. Exactly one platform uses each of the first three, which
+    // is what the attribute says: a build for either is right to see the others
+    // as dead, and should not have to say so as a warning.
     [[maybe_unused]] void*       handle_ = nullptr;   // Windows: HANDLE
     [[maybe_unused]] int         fd_     = -1;        // POSIX: descriptor
     [[maybe_unused]] std::string path_;               // POSIX: the lock file
@@ -76,16 +63,44 @@ private:
 // Shell
 //------------------------------------------------------------------------------
 
-// Plays a sound file, falling back to the system alert sound if it cannot be
-// played. An empty path is silence, which is a setting rather than a failure.
+// Plays a sound file. An empty path falls through to PlayDefaultAlert, as does
+// a file that cannot be played - a sound the user has since moved should still
+// make the noise it was asked for.
 void PlaySoundFile(const std::string& path);
+
+// The sound this system already uses to tell the user something has happened.
+//
+// Preferred to naming a file. It is whatever the user has already decided
+// notifications should sound like, it is never missing, it follows their theme,
+// and it means the application ships no audio and hunts for none on disk.
+void PlayDefaultAlert();
+
+// The system's error sound, and deliberately not configurable.
+//
+// The reload alert is a convenience and the user owns it - they choose the
+// file, or turn it off. A version mismatch is not a convenience: the addon and
+// the application no longer agree on the format between them, and whatever is
+// produced while that is true is at best wrong. So it speaks in the voice the
+// system reserves for errors, which every user already recognises and nobody
+// has to have configured.
+void PlayErrorAlert();
 
 // Reveals a directory in the system file manager.
 void OpenFolder(const std::filesystem::path& dir);
 
-// A modal notice. Used only where there is something the user must decide -
-// mostly the first run with no World of Warcraft folder to be found.
-void ShowMessage(const std::string& title, const std::string& text, bool warning);
+// Opens an http or https address in the user's default browser. Anything else
+// is refused: this exists to reach two known pages, and a general "run whatever
+// this string says" is not a thing this program needs.
+void OpenUrl(const std::string& url);
+
+// A yes/no question. True means the user agreed; cancelling or closing means
+// no, because the only things asked here are things not worth doing by accident.
+bool Confirm(const std::string& title, const std::string& text);
+
+// The same question put as OK and Cancel rather than Yes and No, for an action
+// the user has already chosen by clicking something - the dialog is explaining
+// what is about to happen, not asking whether they meant it.
+bool ConfirmAction(const std::string& title, const std::string& text);
 
 // Modal pickers. Both return an empty string when the user cancels.
 std::string PickFolder(const std::string& title);
@@ -95,25 +110,24 @@ std::string PickSoundFile(const std::string& current);
 // Login item
 //------------------------------------------------------------------------------
 
-// Registering the application to start when the user logs in. Never requires
-// administrator rights on either system: an HKCU Run value on Windows, a
-// LaunchAgent in the user's own Library on macOS.
+// Registering the application to start when the user logs in.
+//
+// Deliberately a file on both systems - a shortcut in the Startup folder on
+// Windows, a LaunchAgent plist on macOS - and never a registry value. A user
+// can see it, move it and delete it with the tools they already have, where a
+// Run key is invisible without a registry editor. That is the difference
+// between a program that starts with the system and one that installs itself,
+// and it is a difference security software is right to care about.
+//
+// Enabling is idempotent and always rewrites the entry to point at the running
+// executable, replacing any entry left by a copy of this application somewhere
+// else - so there is never more than one, and it never launches a binary the
+// user has since moved or replaced.
 bool SetStartAtLogin(bool enabled);
 bool GetStartAtLogin();
 
 // Menu wording, which is not the same thing on both systems and should not read
 // as a translation of the other one.
 const char* StartAtLoginLabel();
-
-//------------------------------------------------------------------------------
-// Defaults
-//------------------------------------------------------------------------------
-
-// A notification sound that exists on this system, or empty if none does.
-std::string DefaultAlertSound();
-
-// Where World of Warcraft is usually installed here, most likely first. Probed
-// in order when the flavor folder has not been set.
-std::vector<std::filesystem::path> DefaultWowRoots();
 
 } // namespace cs

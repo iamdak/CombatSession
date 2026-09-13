@@ -40,24 +40,67 @@ std::wstring WidenText(const std::string& text) {
     return out;
 }
 
-constexpr const wchar_t* kRunKey =
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-constexpr const wchar_t* kRunValue = L"CombatSession";
+// COM is needed for the folder picker and for writing the startup shortcut.
+// Initialised per call, on the calling thread, because both are used from the
+// UI thread and neither is hot.
+struct ComScope {
+    bool owned = false;
+
+    ComScope() {
+        const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        // S_FALSE means this thread had already initialised COM, and
+        // uninitialising it here would take away something somebody else is
+        // still using.
+        owned = SUCCEEDED(hr) && hr != S_FALSE;
+    }
+    ~ComScope() { if (owned) CoUninitialize(); }
+
+    ComScope(const ComScope&) = delete;
+    ComScope& operator=(const ComScope&) = delete;
+};
+
+fs::path StartupShortcut() {
+    PWSTR folder = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Startup, 0, nullptr, &folder))) {
+        return {};
+    }
+    fs::path path = fs::path(folder) / L"CombatSession.lnk";
+    CoTaskMemFree(folder);
+    return path;
+}
+
+bool WriteShortcut(const fs::path& target, const fs::path& link) {
+    ComScope com;
+
+    IShellLinkW* shell = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_IShellLinkW,
+                                reinterpret_cast<void**>(&shell)))) {
+        return false;
+    }
+
+    shell->SetPath(target.wstring().c_str());
+    shell->SetWorkingDirectory(target.parent_path().wstring().c_str());
+    shell->SetDescription(L"CombatSession - combat log processor for "
+                          L"World of Warcraft");
+
+    IPersistFile* file = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(shell->QueryInterface(IID_IPersistFile,
+                                        reinterpret_cast<void**>(&file)))) {
+        ok = SUCCEEDED(file->Save(link.wstring().c_str(), TRUE));
+        file->Release();
+    }
+
+    shell->Release();
+    return ok;
+}
 
 } // namespace
 
 //------------------------------------------------------------------------------
 // Process
 //------------------------------------------------------------------------------
-
-// Hidden first, then freed. The window exists from process creation until this
-// runs - microseconds - and hiding before freeing keeps it from being painted
-// in between, which is the difference between no console and a flicker at every
-// login for a program set to start with Windows.
-void ReleaseConsole() {
-    if (HWND console = GetConsoleWindow()) ShowWindow(console, SW_HIDE);
-    FreeConsole();
-}
 
 fs::path ExecutablePath() {
     wchar_t buffer[MAX_PATH]{};
@@ -104,15 +147,40 @@ NamedLock::~NamedLock() {
 // Shell
 //------------------------------------------------------------------------------
 
+// The registered notification sound, which is what the user already hears when
+// anything else on the system tells them something. SND_ALIAS resolves it
+// through their current sound scheme, so it follows their theme and cannot be
+// missing.
+void PlayDefaultAlert() {
+    if (PlaySoundW(L"Notification.Default", nullptr,
+                   SND_ALIAS | SND_ASYNC | SND_NODEFAULT)) {
+        return;
+    }
+    MessageBeep(MB_ICONASTERISK);
+}
+
 void PlaySoundFile(const std::string& path) {
-    if (path.empty()) return;
+    if (path.empty()) {
+        PlayDefaultAlert();
+        return;
+    }
 
     const std::wstring wide = Widen(path);
     if (PlaySoundW(wide.c_str(), nullptr,
                    SND_FILENAME | SND_ASYNC | SND_NODEFAULT)) {
         return;
     }
-    MessageBeep(MB_ICONASTERISK);
+    // A chosen file that has since been moved or deleted should still make the
+    // noise it was asked for rather than silently doing nothing.
+    PlayDefaultAlert();
+}
+
+// MessageBeep rather than PlaySound: this one is the system's error sound by
+// definition, it needs no alias name that a future Windows might rename, and it
+// is the same sound a user hears from every other program that has hit
+// something it cannot work around.
+void PlayErrorAlert() {
+    MessageBeep(MB_ICONERROR);
 }
 
 void OpenFolder(const fs::path& dir) {
@@ -120,15 +188,33 @@ void OpenFolder(const fs::path& dir) {
                   nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-void ShowMessage(const std::string& title, const std::string& text,
-                 bool warning) {
-    MessageBoxW(nullptr, WidenText(text).c_str(), WidenText(title).c_str(),
-                warning ? MB_ICONWARNING : MB_ICONINFORMATION);
+// ShellExecute runs whatever the string names, so the scheme is checked first.
+// The two addresses this program opens are compiled into it and cannot be
+// configured, but a launcher that will start anything is worth not having at
+// all - the check costs one comparison and removes the whole question.
+void OpenUrl(const std::string& url) {
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return;
+    ShellExecuteW(nullptr, L"open", WidenText(url).c_str(),
+                  nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-// SHBrowseForFolder rather than IFileDialog: this is asked once, and the modern
-// dialog would pull COM initialisation into a process that otherwise needs none.
+bool Confirm(const std::string& title, const std::string& text) {
+    return MessageBoxW(GetActiveWindow(), WidenText(text).c_str(),
+                       WidenText(title).c_str(),
+                       MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+}
+
+bool ConfirmAction(const std::string& title, const std::string& text) {
+    return MessageBoxW(GetActiveWindow(), WidenText(text).c_str(),
+                       WidenText(title).c_str(),
+                       MB_OKCANCEL | MB_ICONINFORMATION) == IDOK;
+}
+
+// SHBrowseForFolder rather than IFileDialog: this is asked rarely, and the
+// modern dialog is a good deal more machinery for the same answer.
 std::string PickFolder(const std::string& title) {
+    ComScope com;
+
     wchar_t display[MAX_PATH]{};
     const std::wstring caption = WidenText(title);
 
@@ -157,7 +243,7 @@ std::string PickSoundFile(const std::string& current) {
 
     OPENFILENAMEW open{};
     open.lStructSize = sizeof open;
-    open.lpstrFilter = L"Wave files\0*.wav\0All files\0*.*\0";
+    open.lpstrFilter = L"Sound files\0*.wav\0All files\0*.*\0";
     open.lpstrFile   = buffer.data();
     open.nMaxFile    = MAX_PATH;
     open.lpstrTitle  = L"Sound to play when a reload is needed";
@@ -171,71 +257,33 @@ std::string PickSoundFile(const std::string& current) {
 // Login item
 //------------------------------------------------------------------------------
 
+// A shortcut in the user's own Startup folder. No registry, no elevation, and
+// it lands where people already look - Task Manager lists it under Startup apps
+// exactly as a Run value would, and File Explorer can delete it.
+//
+// Enabling always removes first and writes fresh. Somebody who has run this
+// application from two places would otherwise keep a shortcut pointing at
+// whichever copy happened to be enabled first, which is how a program ends up
+// launching a binary its user has forgotten they had.
 bool SetStartAtLogin(bool enabled) {
-    HKEY key{};
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key)
-        != ERROR_SUCCESS) {
-        return false;
-    }
+    const fs::path link = StartupShortcut();
+    if (link.empty()) return false;
 
-    bool ok;
-    if (enabled) {
-        const std::wstring quoted = L"\"" + ExecutablePath().wstring() + L"\"";
-        ok = RegSetValueExW(key, kRunValue, 0, REG_SZ,
-                            reinterpret_cast<const BYTE*>(quoted.c_str()),
-                            static_cast<DWORD>((quoted.size() + 1) * sizeof(wchar_t)))
-             == ERROR_SUCCESS;
-    } else {
-        const LSTATUS status = RegDeleteValueW(key, kRunValue);
-        ok = (status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND);
-    }
+    std::error_code ec;
+    fs::remove(link, ec);
+    if (!enabled) return true;
 
-    RegCloseKey(key);
-    return ok;
+    return WriteShortcut(ExecutablePath(), link);
 }
 
 bool GetStartAtLogin() {
-    HKEY key{};
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &key)
-        != ERROR_SUCCESS) {
-        return false;
-    }
-    const bool present = RegQueryValueExW(key, kRunValue, nullptr, nullptr,
-                                          nullptr, nullptr) == ERROR_SUCCESS;
-    RegCloseKey(key);
-    return present;
+    const fs::path link = StartupShortcut();
+    if (link.empty()) return false;
+
+    std::error_code ec;
+    return fs::exists(link, ec);
 }
 
 const char* StartAtLoginLabel() { return "Start with Windows"; }
-
-//------------------------------------------------------------------------------
-// Defaults
-//------------------------------------------------------------------------------
-
-std::string DefaultAlertSound() {
-    wchar_t root[MAX_PATH]{};
-    if (GetWindowsDirectoryW(root, MAX_PATH) == 0) return {};
-
-    const fs::path media = fs::path(root) / "Media";
-    std::error_code ec;
-
-    const fs::path candidate = media / "Windows Notify System Generic.wav";
-    if (fs::exists(candidate, ec)) return candidate.string();
-
-    // Older or trimmed installations may not have that one; ding.wav has been
-    // present since XP. Failing that, an empty string means "use the beep".
-    const fs::path fallback = media / "ding.wav";
-    if (fs::exists(fallback, ec)) return fallback.string();
-    return {};
-}
-
-std::vector<fs::path> DefaultWowRoots() {
-    return {
-        "C:\\Program Files (x86)\\World of Warcraft",
-        "C:\\Program Files\\World of Warcraft",
-        "C:\\Games\\World of Warcraft",
-        "D:\\Games\\World of Warcraft",
-    };
-}
 
 } // namespace cs

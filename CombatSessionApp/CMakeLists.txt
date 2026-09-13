@@ -7,18 +7,22 @@
 # happened to the old one: it was still linking three libraries while the build
 # script had grown to seven, and the mismatch only surfaced as a link error.
 #
-#   Windows:  cmake -S App -B App/Build -G "Visual Studio 17 2022" -A x64
-#             cmake --build App/Build --config Release
+# Run from this folder. Paths are relative to it rather than to a named parent,
+# because this folder is "App" inside a live addon install and "CombatSessionApp"
+# in the repository, and the commands should not need editing between the two.
 #
-#   macOS:    cmake -S App -B App/Build -G Xcode
-#             cmake --build App/Build --config Release
+#   Windows:  cmake -S . -B Build -G "Visual Studio 17 2022" -A x64
+#             cmake --build Build --config Release
 #
-#   Anywhere: cmake -S App -B App/Build -DCMAKE_BUILD_TYPE=Release
-#             cmake --build App/Build
+#   macOS:    cmake -S . -B Build -G Xcode
+#             cmake --build Build --config Release
 #
-# The build tree is disposable. Everything needed to run ends up in App/Binary,
-# so App/Build can be deleted without affecting distribution - the same promise
-# App/VS used to make.
+#   Anywhere: cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release
+#             cmake --build Build
+#
+# The build tree is disposable. Everything needed to run ends up in Binary/, so
+# Build/ can be deleted without affecting distribution - the same promise the
+# old VS/ folder used to make.
 
 cmake_minimum_required(VERSION 3.21)
 
@@ -29,7 +33,7 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0"
     CACHE STRING "Minimum macOS version")
 
 project(CombatSession
-        VERSION 0.10
+        VERSION 0.11
         DESCRIPTION "Turns World of Warcraft combat logs into per-session data"
         LANGUAGES C CXX)
 
@@ -82,23 +86,29 @@ set(CS_HEADERS
     Source/SavedVars.h
     Source/Segmenter.h
     Source/StreamWriter.h
-    Source/Tray.h
+    Source/Shell.h
+    Source/Version.h
 )
 
 # The only per-system part of the build. Everything above parses logs and writes
 # chunks and does not know which system it is on.
 if(WIN32)
-    list(APPEND CS_SOURCES Source/Platform_Win32.cpp Source/Tray_Win32.cpp)
+    list(APPEND CS_SOURCES Source/Platform_Win32.cpp Source/Shell_Win32.cpp)
+
+    # Version resource. Enabled explicitly rather than relied on: the Visual
+    # Studio generator picks .rc files up on its own, Ninja and makefiles do not.
+    enable_language(RC)
+    list(APPEND CS_SOURCES Source/CombatSession.rc)
 elseif(APPLE)
-    list(APPEND CS_SOURCES Source/Platform_Mac.mm Source/Tray_Mac.mm)
+    list(APPEND CS_SOURCES Source/Platform_Mac.mm Source/Shell_Mac.mm)
 else()
     # Said plainly rather than left to fail at link time with undefined symbols
     # that do not name the problem.
     message(FATAL_ERROR
         "CombatSession has no platform layer for ${CMAKE_SYSTEM_NAME}.\n"
         "Everything but the status-area shell is portable: add "
-        "Platform_${CMAKE_SYSTEM_NAME}.cpp and Tray_${CMAKE_SYSTEM_NAME}.cpp "
-        "implementing Source/Platform.h and Source/Tray.h, then add them here.")
+        "Platform_${CMAKE_SYSTEM_NAME}.cpp and Shell_${CMAKE_SYSTEM_NAME}.cpp "
+        "implementing Source/Platform.h and Source/Shell.h, then add them here.")
 endif()
 
 add_executable(CombatSession ${CS_SOURCES} ${CS_HEADERS})
@@ -130,21 +140,31 @@ if(MSVC)
     set_property(TARGET CombatSession miniz PROPERTY
                  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-    # Console, deliberately. The subsystem in the executable header is the only
-    # thing that decides whether a shell waits for the process, so a windowed
-    # binary could never block on a command line. Background mode hands the
-    # console back at startup instead - see the note at the top of main.cpp.
-    set_target_properties(CombatSession PROPERTIES WIN32_EXECUTABLE FALSE)
+    # Windowed. An earlier version was a console application that hid its own
+    # console at startup so it could sit in the notification area - which is the
+    # shape of a program that does not want to be seen, and was classified as
+    # potentially unwanted for it. There is now no console to hide.
+    set_target_properties(CombatSession PROPERTIES WIN32_EXECUTABLE TRUE)
 else()
     target_compile_options(CombatSession PRIVATE -Wall -Wextra)
 endif()
 
 if(WIN32)
-    # gdi32 draws the status icon, winmm plays the reload sound, comdlg32 and
-    # ole32 are the file and folder pickers. Named in full rather than left to a
-    # default library set that happens to include most of them.
+    # gdi32 draws the icon, winmm plays the alert, comdlg32 and ole32 are the
+    # file picker, the folder picker and the startup shortcut.
+    #
+    # advapi32 is deliberately absent. It was here for the HKCU Run value, and
+    # with that replaced by a Startup shortcut the binary imports no registry
+    # API at all - which is checkable with dumpbin /IMPORTS, and is the kind of
+    # claim worth being able to demonstrate rather than assert.
     target_link_libraries(CombatSession PRIVATE
-        user32 shell32 advapi32 gdi32 winmm comdlg32 ole32)
+        user32 shell32 gdi32 winmm comdlg32 ole32)
+
+    # The old .vcxproj set CharacterSet=Unicode, which is where these came from;
+    # CMake does not define them for you. Without them the IDC_* and IDI_*
+    # resource macros expand to narrow strings and will not pass to the wide
+    # functions this code calls throughout.
+    target_compile_definitions(CombatSession PRIVATE UNICODE _UNICODE)
 endif()
 
 if(APPLE)
@@ -152,7 +172,7 @@ if(APPLE)
     # and the .mm files are written assuming ARC - without it they leak every
     # panel and alert they open.
     set_source_files_properties(
-        Source/Platform_Mac.mm Source/Tray_Mac.mm
+        Source/Platform_Mac.mm Source/Shell_Mac.mm
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
     # UniformTypeIdentifiers is the sound picker's file filter. AppKit does not

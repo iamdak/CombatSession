@@ -27,7 +27,7 @@ ns.UI = UI
 
 local ROW_H         = 22
 local SEP_H         = 3     -- rule between root units
-local ICON_W        = 16    -- role, spec and hero talent slots
+local ICON_W        = 16    -- honor, role and spec slots
 local IDENT_W       = 3 * (ICON_W + 3)   -- fixed identity strip on a unit row
 local BLOCK_GAP     = 5     -- black band bracketing an open block
 local MARKER_W      = 2     -- yellow marker line thickness
@@ -36,11 +36,112 @@ local NAME_W        = 300
 local COL_W         = 76
 local HEADER_H      = 26
 local SESSION_W     = 232
-local BAR_W         = 12
+local BAR_W         = 16    -- scrollbar gutter; the knob fills it
+local KNOB_L        = 44    -- knob length along the bar
 local SUMMARY_H     = 38
 local PAD           = 8
 
+-- The team-coloured band behind each summary line: how tall, how far short of
+-- the outcome column it stops, and how solid it starts.
+local SUMMARY_BAND_H     = 15
+local SUMMARY_BAND_GAP   = 8
+local SUMMARY_BAND_ALPHA = 0.90
+
+-- The summary field that belongs to the match rather than to either team: how
+-- long it ran on the top line, and the dampening it ended on beneath.
+local SUMMARY_RIGHT = 7
+
+local SCHOOL_W      = 5     -- school stripe down the left edge of a spell icon
+local SPELL_W       = ROW_H - 6
+
+-- How far a row's bar starts in from the left of the name cell. Root units fill
+-- it; each level below steps in, so nesting reads from the bars and not only
+-- from the labels.
+local BAR_INDENT    = { unit = 0, source = 14, spell = 28 }
+
 local frame, grid, sessions
+
+-- The version mismatch line on the title bar. Held here rather than hung off
+-- the frame because Refresh has to reach it on every layout pass.
+local warning
+
+--------------------------------------------------------------------------------
+-- Cross-hair highlight
+--
+-- Hovering a cell lights its whole row and its whole column, name cell and
+-- column header included. With eleven columns of six-digit numbers, finding
+-- which row a cell belongs to means tracking back across the grid, and lighting
+-- one cell did nothing to help with that - the crossing pair is what actually
+-- answers "whose number is this, and of what".
+--
+-- Kept as module state rather than on the frames, because the highlight is not
+-- a property of the thing under the pointer: one cell being hovered has to be
+-- told to every row in the pool.
+--------------------------------------------------------------------------------
+
+local hover = { row = nil, col = nil }
+
+local function ApplyHover()
+    if not grid then return end
+
+    for _, row in ipairs(grid.rows) do
+        local lit = (hover.row ~= nil) and (row == hover.row)
+        row.nameHi:SetShown(lit)
+        for _, cell in ipairs(row.cells) do
+            cell.hi:SetShown(lit or (hover.col ~= nil and cell.col == hover.col))
+        end
+    end
+
+    for _, button in ipairs(grid.headers) do
+        button.hi:SetShown(hover.col ~= nil and button.col == hover.col)
+    end
+end
+
+local function SetHover(row, col)
+    if hover.row == row and hover.col == col then return end
+    hover.row, hover.col = row, col
+    ApplyHover()
+end
+
+--------------------------------------------------------------------------------
+-- The school line on a spell tooltip
+--
+-- Appending to the game's own spell tooltip cannot be done by calling AddLine
+-- after SetSpellByID. Spell data is fetched asynchronously when it is not
+-- already cached, and when it arrives the tooltip is rebuilt from scratch -
+-- discarding anything added in between. That is why the line showed up on a
+-- second hover but not the first, and why the blank spacer went with it: both
+-- had been added to a tooltip that was then thrown away and rebuilt.
+--
+-- A post-call is the supported answer. It runs every time a spell tooltip is
+-- built, first pass and refresh alike, so there is no race to lose. It is
+-- global, which is why it is gated on a row of ours actually being hovered.
+--
+-- Declared here rather than beside the row that uses it because the row's
+-- OnEnter closes over these: declared after that handler is written, the
+-- handler would capture a global of the same name instead.
+--------------------------------------------------------------------------------
+
+local hoveredSchool = nil
+local schoolHooked  = false
+
+local function AppendSchool(tooltip)
+    if not hoveredSchool then return end
+    -- A blank line first: the game's tooltip ends with the spell's own
+    -- description, and a line butted onto it reads as the last sentence of it.
+    tooltip:AddLine(" ")
+    tooltip:AddLine(("|cff888888School|r  %s")
+        :format(ns.ColorizeRGB(hoveredSchool.name, hoveredSchool.color)))
+end
+
+if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall
+   and Enum and Enum.TooltipDataType then
+    TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Spell,
+        function(tooltip)
+            if tooltip == GameTooltip then AppendSchool(tooltip) end
+        end)
+    schoolHooked = true
+end
 
 --------------------------------------------------------------------------------
 -- Small helpers
@@ -121,6 +222,14 @@ local function NewScroller()
     }
 end
 
+-- The stock slider thumb is a small round bead that sits in the middle of the
+-- gutter, which at this size reads as a dot rather than as something to grab.
+-- Replaced with a plain block filling the gutter's full width: the knob is then
+-- the same shape as the track it runs in, and its length says how much of the
+-- list is on screen the way a scrollbar is supposed to.
+--
+-- Colouring the thumb texture rather than supplying art of its own, because a
+-- solid fill is exactly what is wanted and the game has no flat knob to borrow.
 local function StyleSlider(slider, horizontal)
     slider:SetOrientation(horizontal and "HORIZONTAL" or "VERTICAL")
     slider:SetThumbTexture(horizontal
@@ -128,9 +237,19 @@ local function StyleSlider(slider, horizontal)
         or  "Interface\\Buttons\\UI-SliderBar-Button-Vertical")
     slider:SetObeyStepOnDrag(true)
     slider:SetValueStep(1)
-    local thumb = slider:GetThumbTexture()
-    if thumb then thumb:SetSize(horizontal and 24 or 12, horizontal and 12 or 24) end
+
     Fill(slider, { 0.10, 0.10, 0.12 })
+
+    local thumb = slider:GetThumbTexture()
+    if not thumb then return end
+    thumb:SetColorTexture(0.44, 0.44, 0.50)
+    thumb:SetSize(horizontal and KNOB_L or BAR_W,
+                  horizontal and BAR_W  or KNOB_L)
+
+    -- Lit while the pointer is on the bar, so the knob answers the mouse the
+    -- way every other control in the window does.
+    slider:HookScript("OnEnter", function() thumb:SetColorTexture(0.62, 0.62, 0.70) end)
+    slider:HookScript("OnLeave", function() thumb:SetColorTexture(0.44, 0.44, 0.50) end)
 end
 
 --------------------------------------------------------------------------------
@@ -146,15 +265,48 @@ local function SessionRow(index)
     row.bg = Fill(row, ns.COLOR.header)
     Border(row, ns.COLOR.line)
 
-    row.map = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    -- Faction crest, drawn larger than the row and cropped by it, so the row
+    -- carries a mark that is caught while reading down the list rather than a
+    -- badge that has to be looked at.
+    --
+    -- Its own clipping frame, because the list pane clips the LIST and not each
+    -- entry: an oversized texture parented straight to the row would spill into
+    -- the rows above and below it.
+    row.crestClip = CreateFrame("Frame", nil, row)
+    row.crestClip:SetFrameLevel(row:GetFrameLevel() + 1)
+    row.crestClip:SetPoint("TOPRIGHT", -1, -1)
+    row.crestClip:SetPoint("BOTTOMRIGHT", -1, 1)
+    row.crestClip:SetWidth(SESSION_ROW_H)
+    row.crestClip:SetClipsChildren(true)
+    row.crestClip:EnableMouse(false)
+
+    row.crest = row.crestClip:CreateTexture(nil, "ARTWORK")
+    row.crest:SetSize(SESSION_ROW_H + 18, SESSION_ROW_H + 18)
+    row.crest:SetPoint("CENTER", row.crestClip, "CENTER", 3, 0)
+    -- Rotation is counter-clockwise for a positive angle, so the slight
+    -- clockwise tilt is a small negative one. Held dim: the text is what is
+    -- being read, and the crest sits behind it.
+    row.crest:SetRotation(-0.13)
+    row.crest:SetAlpha(0.30)
+    row.crest:Hide()
+
+    -- The labels live above the crest, for the same reason the grid rows have a
+    -- content frame: a child frame draws over every texture its parent owns, so
+    -- text on the row itself would go under the crest rather than over it.
+    row.content = CreateFrame("Frame", nil, row)
+    row.content:SetAllPoints(row)
+    row.content:SetFrameLevel(row.crestClip:GetFrameLevel() + 1)
+    row.content:EnableMouse(false)
+
+    row.map = row.content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     row.map:SetPoint("TOPLEFT", 6, -5)
     row.map:SetPoint("RIGHT", -6, 0)
     row.map:SetJustifyH("LEFT")
 
-    row.when = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    row.when = row.content:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     row.when:SetPoint("TOPLEFT", row.map, "BOTTOMLEFT", 0, -2)
 
-    row.who = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    row.who = row.content:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     row.who:SetPoint("TOPLEFT", row.when, "BOTTOMLEFT", 0, -2)
 
     row:SetScript("OnClick", function(self)
@@ -187,6 +339,17 @@ local function LayoutSessions()
             row.map:SetText(map)
             row.when:SetText(when)
             row.who:SetText(who)
+
+            -- Absent for a match recorded before the faction was stored, which
+            -- leaves the row plain rather than guessing at a side.
+            local _, faction = Model:SessionCharacter(entry)
+            local crest = faction and ns.FACTION_EMBLEM[faction]
+            if crest then
+                row.crest:SetTexture(crest)
+                row.crest:Show()
+            else
+                row.crest:Hide()
+            end
 
             local selected = (Model:Selected() == entry.key)
             local c = selected and ns.COLOR.selected or ns.COLOR.header
@@ -293,11 +456,11 @@ local function GridCell(row, index)
 
     cell.col = index
     cell:SetScript("OnEnter", function(self)
-        self.hi:Show()
+        SetHover(row, self.col)
         CellTooltip(self)
     end)
-    cell:SetScript("OnLeave", function(self)
-        self.hi:Hide()
+    cell:SetScript("OnLeave", function()
+        SetHover(nil, nil)
         GameTooltip:Hide()
     end)
     cell:SetScript("OnClick", function(self)
@@ -349,24 +512,26 @@ local function GridRow(index)
     row.nameBar:SetPoint("BOTTOMLEFT")
     row.nameBar:SetWidth(1)
 
-    -- Identity strip: role, spec (or class), hero talent. Fixed positions so a
+    -- Identity strip: honor level, role, spec (or class). Fixed positions so a
     -- name never moves because one of them failed to resolve.
+    --
+    -- The honor badge is untrimmed: it is already a badge rather than a square
+    -- icon, so cropping its outer edge takes off part of the art.
+    row.honorIcon = row.content:CreateTexture(nil, "ARTWORK")
+    row.honorIcon:SetSize(ICON_W, ICON_W)
+    row.honorIcon:SetPoint("LEFT", row.content, "LEFT", 8, 0)
+    row.honorIcon:Hide()
+
     row.roleIcon = row.content:CreateTexture(nil, "ARTWORK")
     row.roleIcon:SetSize(ICON_W, ICON_W)
-    row.roleIcon:SetPoint("LEFT", row.content, "LEFT", 8, 0)
+    row.roleIcon:SetPoint("LEFT", row.content, "LEFT", 8 + (ICON_W + 3), 0)
     row.roleIcon:Hide()
 
     row.specIcon = row.content:CreateTexture(nil, "ARTWORK")
     row.specIcon:SetSize(ICON_W, ICON_W)
-    row.specIcon:SetPoint("LEFT", row.content, "LEFT", 8 + (ICON_W + 3), 0)
+    row.specIcon:SetPoint("LEFT", row.content, "LEFT", 8 + 2 * (ICON_W + 3), 0)
     row.specIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     row.specIcon:Hide()
-
-    row.heroIcon = row.content:CreateTexture(nil, "ARTWORK")
-    row.heroIcon:SetSize(ICON_W, ICON_W)
-    row.heroIcon:SetPoint("LEFT", row.content, "LEFT", 8 + 2 * (ICON_W + 3), 0)
-    row.heroIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    row.heroIcon:Hide()
 
     row.nameHi = row.content:CreateTexture(nil, "ARTWORK")
     row.nameHi:SetAllPoints(row.content)
@@ -381,11 +546,36 @@ local function GridRow(index)
     row.nameSep:SetPoint("TOPRIGHT")
     row.nameSep:SetHeight(SEP_H)
 
-    -- Spell rows only. Sized to the row so the icon column is the row height
-    -- and the label starts clear of it; trimmed because WoW icon art carries a
-    -- border in the outer few percent of the texture.
+    -- Spell rows only, and the school leads. The spell icon says which button
+    -- was pressed; the school says what kind of damage arrived, which is a
+    -- different question and the one that decides what you do about it - a
+    -- warlock's Shadow Bolt and their Incinerate are the same picture at this
+    -- size and are not the same thing to anyone trying to survive them.
+    --
+    -- The school as a stripe down the left edge of the spell icon, the icon's
+    -- own height and flush against it: spell art beside spell art read as two
+    -- spells, and a stripe attached to the icon reads as a property OF that
+    -- spell rather than as a second thing in the row.
+    --
+    -- Two solid fills, because the art that would have suited it does not
+    -- resolve on this client - see the note in Core.lua. The dark rectangle
+    -- underneath is one pixel proud on three sides, which frames the stripe and
+    -- leaves a hairline rule between it and the icon.
+    row.schoolEdge = row.content:CreateTexture(nil, "ARTWORK", nil, 1)
+    row.schoolEdge:SetSize(SCHOOL_W + 2, SPELL_W + 2)
+    row.schoolEdge:SetColorTexture(0, 0, 0, 0.85)
+    row.schoolEdge:Hide()
+
+    row.schoolIcon = row.content:CreateTexture(nil, "ARTWORK", nil, 2)
+    row.schoolIcon:SetSize(SCHOOL_W, SPELL_W)
+    row.schoolIcon:SetPoint("LEFT", row.schoolEdge, "LEFT", 1, 0)
+    row.schoolIcon:Hide()
+
+    -- Sized to the row so the icon column is the row height and the label starts
+    -- clear of it; trimmed because WoW icon art carries a border in the outer
+    -- few percent of the texture.
     row.icon = row.content:CreateTexture(nil, "ARTWORK")
-    row.icon:SetSize(ROW_H - 6, ROW_H - 6)
+    row.icon:SetSize(SPELL_W, SPELL_W)
     row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     row.icon:Hide()
 
@@ -412,24 +602,49 @@ local function GridRow(index)
     row.valueSep:SetPoint("TOPRIGHT")
     row.valueSep:SetHeight(SEP_H)
 
+    -- A name row is the whole row for highlight purposes, so hovering it lights
+    -- the value cells beside it - but no column, because a name belongs to none.
     row.name:SetScript("OnEnter", function(self)
-        if self.clickable then row.nameHi:Show() end
+        SetHover(row, nil)
+
+        if self.data and self.data.kind == "unit" then
+            UI:UnitTooltip(self, self.data)
+            return
+        end
+
         -- Only real spell ids get the game's tooltip. Dispel and purge entries
         -- carry a synthetic id standing for an aura-and-dispeller pair, which
         -- no client lookup resolves, so those fall back to the row's own text.
         if self.spellId then
+            -- Read by the post-call, which is what actually writes the line.
+            hoveredSchool = self.school
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:SetSpellByID(self.spellId)
+            -- Only where there is no post-call to do it. On such a client the
+            -- line is written directly and an uncached spell may still lose it,
+            -- which is the old behaviour rather than a new failure.
+            if not schoolHooked then AppendSchool(GameTooltip) end
             GameTooltip:Show()
         end
     end)
     row.name:SetScript("OnLeave", function()
-        row.nameHi:Hide()
+        SetHover(nil, nil)
+        -- Cleared here and nowhere else: the post-call is global, so this is
+        -- what keeps the line off every other spell tooltip in the interface.
+        hoveredSchool = nil
         GameTooltip:Hide()
     end)
-    row.name:SetScript("OnClick", function(self)
+
+    row.name:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    row.name:SetScript("OnClick", function(self, button)
         local data = self.data
         if not data then return end
+
+        if button == "RightButton" then
+            UI:NameMenu(self, data)
+            return
+        end
+
         if data.kind == "unit" then
             -- Inert while collapsed: there is no column chosen yet, so there is
             -- nothing this click could open without guessing.
@@ -472,22 +687,236 @@ function UI:TeamName(index)
     return ("Team %d"):format(index)
 end
 
--- Role, specialisation and hero talent, in a strip of fixed width.
+--------------------------------------------------------------------------------
+-- Player row: tooltip and menu
+--------------------------------------------------------------------------------
+
+local ROLE_NAME = { TANK = "Tank", HEALER = "Healer", DAMAGER = "Damage" }
+
+-- Everything known about the player on a root row, in one box.
 --
--- Each slot is drawn or left empty, never collapsed, because a name that shifts
--- depending on what happened to resolve is worse than a gap. The hero talent
--- slot is reserved and currently always empty: the scoreboard does not carry it
--- and there is no API for another player's talents, so the space is held rather
--- than the row pretending to be complete.
-function UI:SetIdentity(row, data)
-    if data.kind ~= "unit" then
-        row.roleIcon:Hide()
-        row.specIcon:Hide()
-        row.heroIcon:Hide()
+-- The grid trims the realm off a name and shows the spec as a 16-pixel icon,
+-- both of which are the right call for a table and neither of which answers
+-- "who is this". The scoreboard figures are included where there are any: they
+-- are what the player can check this addon against, and having them beside the
+-- log-derived numbers is the whole of that comparison.
+function UI:UnitTooltip(owner, data)
+    GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+
+    local color = ns.ClassColor(data.class)
+    GameTooltip:AddLine(ns.ShortName(data.name) or "", color[1], color[2], color[3])
+
+    local realm = tostring(data.name or ""):match("^[^-]+%-(.+)$")
+    if realm then GameTooltip:AddLine(realm, 0.55, 0.55, 0.55) end
+
+    local spec = ns.SpecById(data.specId) or ns.SpecInfo(data.class, data.spec)
+    local className = data.class
+        and ((LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[data.class])
+             or data.class)
+
+    -- Spec and class on one line, because "Frost" alone is ambiguous across
+    -- three classes and "Mage" alone throws away what the scoreboard told us.
+    if data.spec and data.spec ~= "" and className then
+        GameTooltip:AddDoubleLine("Spec", ("%s %s"):format(data.spec, className),
+                                  0.6, 0.6, 0.6, 1, 1, 1)
+    elseif className then
+        GameTooltip:AddDoubleLine("Class", className, 0.6, 0.6, 0.6, 1, 1, 1)
+    end
+
+    if spec and ROLE_NAME[spec.role] then
+        GameTooltip:AddDoubleLine("Role", ROLE_NAME[spec.role], 0.6, 0.6, 0.6, 1, 1, 1)
+    end
+
+    local scoreboard = data.player and data.player.player
+    if scoreboard and scoreboard.race then
+        GameTooltip:AddDoubleLine("Race", scoreboard.race, 0.6, 0.6, 0.6, 1, 1, 1)
+    end
+
+    -- Spelled out as well as badged, because the badge only says which tier the
+    -- level falls in and the number is the thing people compare.
+    if data.honor then
+        GameTooltip:AddDoubleLine("Honor level", tostring(data.honor),
+                                  0.6, 0.6, 0.6, 1, 1, 1)
+    end
+
+    local side = data.team or data.departed
+    if side then
+        GameTooltip:AddDoubleLine("Side", UI:TeamName(side), 0.6, 0.6, 0.6, 1, 1, 1)
+    end
+
+    -- Item level for a player, which is what the advanced log block carries in
+    -- the slot creatures use for their level.
+    if data.unit and data.unit.level and data.unit.level > 0 then
+        GameTooltip:AddDoubleLine("Item level", tostring(data.unit.level),
+                                  0.6, 0.6, 0.6, 1, 1, 1)
+    end
+
+    if scoreboard then
+        GameTooltip:AddLine(" ")
+        GameTooltip:AddLine("Scoreboard", 1, 0.82, 0.2)
+        if scoreboard.damage then
+            GameTooltip:AddDoubleLine("Damage", ns.Short(scoreboard.damage),
+                                      0.6, 0.6, 0.6, 1, 1, 1)
+        end
+        if scoreboard.healing then
+            GameTooltip:AddDoubleLine("Healing", ns.Short(scoreboard.healing),
+                                      0.6, 0.6, 0.6, 1, 1, 1)
+        end
+        if scoreboard.kb then
+            GameTooltip:AddDoubleLine("Killing blows", tostring(scoreboard.kb),
+                                      0.6, 0.6, 0.6, 1, 1, 1)
+        end
+        if scoreboard.deaths then
+            GameTooltip:AddDoubleLine("Deaths", tostring(scoreboard.deaths),
+                                      0.6, 0.6, 0.6, 1, 1, 1)
+        end
+    end
+
+    if data.departed then
+        GameTooltip:AddLine(" ")
+        GameTooltip:AddLine("Fought here but is not on the scoreboard, so nothing\n"
+                         .. "of theirs is counted in a team total.",
+                            0.85, 0.65, 0.4, true)
+    end
+
+    GameTooltip:AddLine(" ")
+    GameTooltip:AddLine("Right-click to copy the name.", 0.5, 0.7, 1)
+    GameTooltip:Show()
+end
+
+-- Copying a name out of the game.
+--
+-- An addon cannot write to the clipboard - there is no API for it - so the only
+-- way to hand a name over is to put it in an edit box, select it, and let the
+-- player press Ctrl+C. That is why this is a dialog and not a one-click action.
+local copyFrame
+
+function UI:CopyName(name)
+    if not copyFrame then
+        copyFrame = CreateFrame("Frame", "CombatSessionViewerCopyFrame", UIParent)
+        copyFrame:SetSize(330, 84)
+        copyFrame:SetPoint("CENTER")
+        copyFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+        copyFrame:EnableMouse(true)
+        Fill(copyFrame, { 0.05, 0.05, 0.06, 0.98 })
+        Border(copyFrame, ns.COLOR.line)
+
+        local label = copyFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        label:SetPoint("TOPLEFT", PAD, -PAD)
+        label:SetText("|cff999999Ctrl+C to copy, Escape to close.|r")
+
+        copyFrame.edit = CreateFrame("EditBox", nil, copyFrame, "InputBoxTemplate")
+        copyFrame.edit:SetPoint("TOPLEFT", PAD + 6, -(PAD + 24))
+        copyFrame.edit:SetPoint("TOPRIGHT", -PAD, -(PAD + 24))
+        copyFrame.edit:SetHeight(22)
+        copyFrame.edit:SetAutoFocus(false)
+        copyFrame.edit:SetScript("OnEscapePressed", function() copyFrame:Hide() end)
+        copyFrame.edit:SetScript("OnEnterPressed", function() copyFrame:Hide() end)
+
+        -- Read-only in effect. The box has to be a real edit box for Ctrl+C to
+        -- work at all, so a typed character is put straight back rather than
+        -- left to be copied instead of the name.
+        copyFrame.edit:SetScript("OnTextChanged", function(self, byUser)
+            if not byUser then return end
+            self:SetText(copyFrame.value or "")
+            self:HighlightText()
+        end)
+
+        local close = CreateFrame("Button", nil, copyFrame, "UIPanelCloseButton")
+        close:SetPoint("TOPRIGHT", -2, -2)
+
+        tinsert(UISpecialFrames, "CombatSessionViewerCopyFrame")
+        copyFrame:Hide()
+    end
+
+    copyFrame.value = tostring(name or "")
+    copyFrame:Show()
+    copyFrame.edit:SetText(copyFrame.value)
+    copyFrame.edit:HighlightText()
+    copyFrame.edit:SetFocus()
+end
+
+-- MenuUtil has been the only menu system since 11.0. Where it is missing there
+-- is nothing to fall back to, so the one entry the menu would have offered is
+-- performed directly rather than the click doing nothing.
+function UI:NameMenu(owner, data)
+    local name = data.name
+    if not name or name == "" then return end
+
+    if not (MenuUtil and MenuUtil.CreateContextMenu) then
+        self:CopyName(name)
         return
     end
 
-    local spec = ns.SpecInfo(data.class, data.spec)
+    MenuUtil.CreateContextMenu(owner, function(_, root)
+        root:CreateTitle(ns.ShortName(name))
+        root:CreateButton("Copy Name-Realm", function() UI:CopyName(name) end)
+    end)
+end
+
+--------------------------------------------------------------------------------
+
+-- The coloured band behind a summary line. Nil clears it.
+--
+-- A gradient rather than a flat block, and it stops well short of the outcome:
+-- a solid bar across the strip would read as a header row and fight the figures
+-- sitting on it, where a band that fades out behind the name says which side
+-- this line belongs to and then gets out of the way.
+--
+-- SetGradient modulates the texture's own colour, so the base is set to white
+-- and the two stops carry the colour. A client without it falls back to a flat
+-- wash, which is the same statement made less prettily.
+function UI:SetSummaryBand(index, color)
+    local band = grid.summaryBands and grid.summaryBands[index]
+    if not band then return end
+
+    if not color then
+        band:Hide()
+        return
+    end
+
+    if band.SetGradient and CreateColor then
+        band:SetColorTexture(1, 1, 1, 1)
+        band:SetGradient("HORIZONTAL",
+            CreateColor(color[1], color[2], color[3], SUMMARY_BAND_ALPHA),
+            CreateColor(color[1], color[2], color[3], 0))
+    else
+        band:SetColorTexture(color[1], color[2], color[3], 0.35)
+    end
+    band:Show()
+end
+
+-- Honor level, role and specialisation, in a strip of fixed width.
+--
+-- Each slot is drawn or left empty, never collapsed, because a name that shifts
+-- depending on what happened to resolve is worse than a gap.
+--
+-- The third slot used to be reserved for a hero talent and was always empty:
+-- there is no API for another player's talents and the scoreboard does not
+-- carry them, so nothing was ever going to fill it. Honor level took the space,
+-- and leads the strip because it is the one thing here that says something
+-- about the player rather than about the character sheet.
+function UI:SetIdentity(row, data)
+    if data.kind ~= "unit" then
+        row.honorIcon:Hide()
+        row.roleIcon:Hide()
+        row.specIcon:Hide()
+        return
+    end
+
+    -- Empty for anyone the recorder never got a unit token for, and for every
+    -- session recorded before honor was captured at all.
+    local badge = ns.HonorBadge(data.honor)
+    if badge then
+        row.honorIcon:SetTexture(badge)
+        row.honorIcon:Show()
+    else
+        row.honorIcon:Hide()
+    end
+
+    -- The log's spec id where there is one, since it carries the icon and role
+    -- directly; the scoreboard's localised name only otherwise.
+    local spec = ns.SpecById(data.specId) or ns.SpecInfo(data.class, data.spec)
 
     local roleAtlas = spec and ns.ROLE_ATLAS[spec.role]
     if roleAtlas then
@@ -504,8 +933,6 @@ function UI:SetIdentity(row, data)
     else
         row.specIcon:Hide()
     end
-
-    row.heroIcon:Hide()
 end
 
 -- Diagonal hatching over a row shown on a side but not counted in it.
@@ -626,32 +1053,36 @@ local function Populate(row, data)
     row.nameSep:SetShown(rule)
     row.valueSep:SetShown(rule)
 
+    -- A nested row steps its bar in as well as its label, so the depth is
+    -- legible from the bars alone. Root units keep the full width: they are the
+    -- level everything else is measured against, and indenting them would give
+    -- away name-cell width for nothing.
+    local barIndent = BAR_INDENT[data.kind] or 0
+
     local frac = data.frac or 0
     row.nameBar:ClearAllPoints()
-    row.nameBar:SetPoint("TOPLEFT", 0, rule and -SEP_H or 0)
-    row.nameBar:SetPoint("BOTTOMLEFT")
+    row.nameBar:SetPoint("TOPLEFT", barIndent, rule and -SEP_H or 0)
+    row.nameBar:SetPoint("BOTTOMLEFT", barIndent, 0)
     if bar and frac > 0 then
         row.nameBar:SetColorTexture(bar[1], bar[2], bar[3])
         -- A floor of two pixels so a small but non-zero contribution still
-        -- registers as present rather than reading as nothing at all.
-        row.nameBar:SetWidth(math.max(2, frac * NAME_W))
+        -- registers as present rather than reading as nothing at all. Scaled to
+        -- what is left of the cell after the indent, so a full bar still ends
+        -- where a root unit's full bar ends.
+        row.nameBar:SetWidth(math.max(2, frac * (NAME_W - barIndent)))
         row.nameBar:Show()
     else
         row.nameBar:Hide()
     end
 
-    local indent, text, icon = 0, ns.ShortName(data.name) or "", nil
+    local indent, text, icon, school = 0, ns.ShortName(data.name) or "", nil, nil
     if data.kind == "unit" then
         -- Icons occupy a fixed strip whether or not each one resolves, so names
-        -- start at the same x on every row. A missing spec or hero talent leaves
+        -- start at the same x on every row. A missing honor badge or spec leaves
         -- a gap rather than shunting the name left and breaking the column.
         indent = IDENT_W
 
-        local color = data.class and RAID_CLASS_COLORS and RAID_CLASS_COLORS[data.class]
-        if color then
-            text = ("|cff%02x%02x%02x%s|r")
-                :format(color.r * 255, color.g * 255, color.b * 255, text)
-        end
+        text = ns.Colorize(text, data.class)
         if data.departed then
             -- Not on the scoreboard, so not in any team total - but the side
             -- they fought on is still known, and saying so is the whole point.
@@ -675,6 +1106,7 @@ local function Populate(row, data)
         indent = 36
         text = "|cffaaaaaa" .. text .. "|r"
         icon = SpellIcon(data.id)
+        school = ns.SchoolInfo(data.use and data.use.school)
     else
         indent = 18
         text = "|cff777777" .. text .. "|r"
@@ -683,11 +1115,36 @@ local function Populate(row, data)
     UI:SetIdentity(row, data)
     UI:SetDeparted(row, (data.kind == "unit") and data.team == nil and data.departed or nil)
 
+    -- Walked left to right and advanced past each thing that was actually
+    -- drawn, so a spell with no school icon closes the gap rather than leaving
+    -- a hole where one would have been.
+    local x = 8 + indent
+
+    if icon and school then
+        -- Only the backing is placed; the stripe is anchored inside it once, at
+        -- construction, and rides along with it. Set one pixel left of x so the
+        -- stripe itself starts where the run does.
+        row.schoolEdge:ClearAllPoints()
+        row.schoolEdge:SetPoint("LEFT", row.name, "LEFT", x - 1, 0)
+        row.schoolIcon:SetColorTexture(school.color[1], school.color[2],
+                                       school.color[3])
+        row.schoolEdge:Show()
+        row.schoolIcon:Show()
+
+        -- The stripe plus the hairline beside it. No gap: the icon butts
+        -- straight up against the rule, so the two read as one object.
+        x = x + SCHOOL_W + 1
+    else
+        row.schoolEdge:Hide()
+        row.schoolIcon:Hide()
+    end
+
     if icon then
         row.icon:ClearAllPoints()
-        row.icon:SetPoint("LEFT", row.name, "LEFT", 8 + indent, 0)
+        row.icon:SetPoint("LEFT", row.name, "LEFT", x, 0)
         row.icon:SetTexture(icon)
         row.icon:Show()
+        x = x + SPELL_W + 4
     else
         row.icon:Hide()
     end
@@ -695,16 +1152,20 @@ local function Populate(row, data)
     -- Re-anchored rather than offset, because the pool reuses a row at one
     -- depth for a row at another and a stale LEFT would leave it indented wrong.
     row.label:ClearAllPoints()
-    row.label:SetPoint("LEFT", row.name, "LEFT",
-                       8 + indent + (icon and (ROW_H - 2) or 0), 0)
+    row.label:SetPoint("LEFT", row.name, "LEFT", x, 0)
     row.label:SetPoint("RIGHT", row.name, "RIGHT", -8, 0)
     row.label:SetText(text)
     row.name.data = data
     -- Only set when the lookup succeeded, so the OnEnter handler has a single
     -- unambiguous test for "this row has a real spell behind it".
     row.name.spellId = icon and data.id or nil
+    row.name.school  = school
     row.name.clickable = (data.kind == "source")
                       or (data.kind == "unit" and expanded)
+
+    -- The cross-hair lights every row it passes over, so clickability can no
+    -- longer be "this row highlights". It is carried by how brightly it does.
+    row.nameHi:SetColorTexture(1, 1, 1, row.name.clickable and 0.11 or 0.05)
 
     row.values:SetWidth(math.max(1, #columns * COL_W))
 
@@ -761,9 +1222,25 @@ end
 -- Grid layout
 --------------------------------------------------------------------------------
 
+-- The arrow on whichever header is sorting. Ascending is up.
+local function SortMark(asc)
+    return asc and "|cffffcc00^|r " or "|cffffcc00v|r "
+end
+
 local function LayoutHeader()
     local columns = Model:Columns()
     local sortCol, asc = Model:Sort()
+    local barCol = Model:BarColumn()
+
+    -- The name column sorts but does not measure, so it takes the arrow and
+    -- leaves the box on whichever column the bars are still drawn against.
+    local nameLabel = "Player Name"
+    if sortCol == ns.NAME_COL then
+        nameLabel = SortMark(asc) .. "|cffffd94c" .. nameLabel .. "|r"
+    else
+        nameLabel = "|cff999999" .. nameLabel .. "|r"
+    end
+    grid.nameHeader.text:SetText(nameLabel)
 
     for i = 1, #columns do
         local button = grid.headers[i]
@@ -772,6 +1249,15 @@ local function LayoutHeader()
             button:SetSize(COL_W, HEADER_H)
             button:SetPoint("TOPLEFT", (i - 1) * COL_W, 0)
             button.bg = Fill(button, ns.COLOR.header)
+
+            -- Lit by the cross-hair when the pointer is anywhere in this
+            -- column, so the header names what is being read without the eye
+            -- having to travel up to find it.
+            button.hi = button:CreateTexture(nil, "ARTWORK")
+            button.hi:SetAllPoints(button)
+            button.hi:SetColorTexture(1, 1, 1, 0.07)
+            button.hi:Hide()
+
             button.text = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
             button.text:SetPoint("RIGHT", -8, 0)
             button.col = i
@@ -780,28 +1266,37 @@ local function LayoutHeader()
                 UI:Refresh()
             end)
             button:SetScript("OnEnter", function(self)
+                SetHover(nil, self.col)
                 GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
                 GameTooltip:AddLine(Model:Columns()[self.col] or "", 1, 1, 1)
                 GameTooltip:AddLine("Click to sort by this column.", 0.5, 0.7, 1)
                 GameTooltip:Show()
             end)
-            button:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            button:SetScript("OnLeave", function()
+                SetHover(nil, nil)
+                GameTooltip:Hide()
+            end)
             button.outline = Outline(button, ns.COLOR.active, MARKER_W)
             grid.headers[i] = button
         end
 
         local label = ns.ColumnLabel(columns[i])
-        local isActive = (i == sortCol)
-        if isActive then
-            label = (asc and "|cffffcc00^|r " or "|cffffcc00v|r ") .. label
+        local isSort = (i == sortCol)
+        local isBar  = (i == barCol)
+        if isSort then
+            label = SortMark(asc) .. label
             button.text:SetTextColor(1, 0.85, 0.3)
+        elseif isBar then
+            -- Sorting by name leaves this column carrying the bars without
+            -- being the sort, which is a state worth showing as its own.
+            button.text:SetTextColor(0.90, 0.80, 0.55)
         else
             button.text:SetTextColor(0.75, 0.75, 0.75)
         end
 
-        -- The sort column is the active column: it is what the bars are drawn
-        -- against, so which one it is has to be visible without reading labels.
-        for _, edge in ipairs(button.outline) do edge:SetShown(isActive) end
+        -- The box marks what the bars are drawn against, which is the sort
+        -- column unless the sort is alphabetical.
+        for _, edge in ipairs(button.outline) do edge:SetShown(isBar) end
 
         button.text:SetText(label)
         button:Show()
@@ -915,6 +1410,11 @@ local function LayoutGrid()
     grid.hbar:SetValue(grid.hscroll.cur)
     grid.hbar:SetShown(grid.hscroll.max > 0)
     grid.vbar.syncing, grid.hbar.syncing = false, false
+
+    -- Re-applied last, because a row frame that was just repopulated - or newly
+    -- created by the pool - would otherwise keep whatever highlight it had at
+    -- the top of this pass.
+    ApplyHover()
 end
 
 local function LayoutSummary()
@@ -925,6 +1425,7 @@ local function LayoutSummary()
         for _, row in ipairs(grid.summaryRows) do
             for _, text in ipairs(row) do text:SetText("") end
         end
+        for i = 1, #grid.summaryBands do UI:SetSummaryBand(i, nil) end
     end
 
     if not teams then
@@ -973,12 +1474,37 @@ local function LayoutSummary()
             mmr = ("|cff888888MMR|r %d"):format(team.mmr)
         end
 
+        -- The right-hand slot carries what belongs to the match rather than to
+        -- either side: when it was played on the top line, and the dampening it
+        -- ended on beneath. Neither is a team figure, which is why they sit
+        -- clear of the columns that are.
+        --
+        -- Dampening is arenas only. A battleground reading "0%" would be
+        -- stating a fact about a mechanic it does not have.
+        local extra = ""
+        if i == 1 then
+            local span = ns.FormatDuration(Model:Duration())
+            if span then extra = ("|cff888888Time|r %s"):format(span) end
+        elseif entry and entry.type == "arena" then
+            local value = Model:Dampening()
+            if value and value > 0 then
+                extra = ("|cff888888Dampening|r %d%%"):format(value)
+            end
+        end
+
+        -- The side's own colour behind its line, solid under the name and gone
+        -- before the outcome. The two team colours are otherwise only visible
+        -- once you are reading rows, so the summary said nothing about which
+        -- side was which until you looked away from it.
+        UI:SetSummaryBand(i, (i == 1) and ns.COLOR.team1Bar or ns.COLOR.team2Bar)
+
         fields[1]:SetText(("%s |cff888888(%d)|r"):format(label, team.count))
         fields[2]:SetText(outcome)
         fields[3]:SetText(("|cff888888Damage|r %s"):format(ns.Short(team.damage)))
         fields[4]:SetText(("|cff888888Healing|r %s"):format(ns.Short(team.healing)))
         fields[5]:SetText(rating)
         fields[6]:SetText(mmr)
+        fields[SUMMARY_RIGHT]:SetText(extra)
     end
 end
 
@@ -1013,12 +1539,36 @@ local function ClampWidth()
     end
 end
 
+-- The title-bar warning, sized to whatever room the title and the byline have
+-- left. Kept out of Refresh's own body only because it has to run from Show as
+-- well, where there is not yet anything to lay out.
+local function LayoutWarning()
+    if not warning then return end
+
+    local text, detail = ns:VersionWarning()
+    if not text then
+        warning:Hide()
+        return
+    end
+
+    -- 230 for the name and version on the left, 190 for the byline and the
+    -- close button on the right. Below the floor the line would be unreadable
+    -- anyway, and a warning that overlaps the title is worse than one that
+    -- runs to the edge.
+    local room = math.max((frame:GetWidth() or 0) - 420, 240)
+    warning:SetWidth(room)
+    warning.text:SetText(text)
+    warning.detail = detail
+    warning:Show()
+end
+
 function UI:Refresh()
     if not frame or not frame:IsShown() then return end
 
     sessions.list = Model:Sessions()
     grid.data     = Model:Rows()
 
+    LayoutWarning()
     ClampWidth()
     LayoutHeader()
     LayoutSummary()
@@ -1044,7 +1594,16 @@ local function BuildSessionPane(parent)
     reload:SetSize(SESSION_W - 2 * PAD, 22)
     reload:SetPoint("TOPLEFT", PAD, -PAD)
     reload:SetText("Reload UI")
-    reload:SetScript("OnClick", function() ReloadUI() end)
+    reload:SetScript("OnClick", function()
+        -- Reopened on the way back. A reload asked for from inside the viewer
+        -- is a round trip to pick up new sessions, not a way out of it, and
+        -- coming back to a closed window loses the place the user was in.
+        --
+        -- Safe to set here: saved variables are written at the START of a
+        -- reload, so this lands in the file that the next login reads.
+        if ns.db then ns.db.reopen = true end
+        ReloadUI()
+    end)
     reload:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:AddLine("Reload the interface", 1, 1, 1)
@@ -1094,7 +1653,25 @@ local function BuildGridPane(parent, sessionPane)
     -- up - "Alliance" and "Horde" are different widths at the same character
     -- count, and colour codes count toward a %-16s while occupying no space at
     -- all. Fixed anchors are the only thing that actually produces columns.
-    grid.summaryFields = { 0, 118, 172, 272, 372, 452 }
+    -- Six columns of team figures, then a seventh for facts about the match
+    -- itself, sitting past the MMR.
+    grid.summaryFields = { 0, 118, 172, 272, 372, 452, 548 }
+
+    -- One per summary line, behind the text. BORDER puts them over the pane's
+    -- own fill and under the OVERLAY font strings, so no layering by hand.
+    --
+    -- Width is read off the field table rather than written down twice: the
+    -- band has to stop short of whatever x the outcome sits at, and a second
+    -- constant would be a second thing to remember to move.
+    grid.summaryBands = {}
+    for line = 1, 2 do
+        local band = pane:CreateTexture(nil, "BORDER")
+        band:SetPoint("TOPLEFT", PAD, -(PAD + (line - 1) * 15) + 1)
+        band:SetSize(grid.summaryFields[2] - SUMMARY_BAND_GAP, SUMMARY_BAND_H)
+        band:Hide()
+        grid.summaryBands[line] = band
+    end
+
     grid.summaryRows = {}
     for line = 1, 2 do
         local row = {}
@@ -1126,9 +1703,33 @@ local function BuildGridPane(parent, sessionPane)
     grid.headerTrack:SetPoint("TOPLEFT")
     grid.headerTrack:SetHeight(HEADER_H)
 
-    local nameHeader = pane:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    nameHeader:SetPoint("BOTTOMLEFT", grid.headerClip, "BOTTOMLEFT", -NAME_W + 8, 6)
-    nameHeader:SetText("|cff999999Player Name|r")
+    -- A button rather than a label, because the name column sorts like any
+    -- other. It sits outside the header's clipping frame: the name column is
+    -- frozen, so its header must not scroll with the value columns.
+    grid.nameHeader = CreateFrame("Button", nil, pane)
+    grid.nameHeader:SetPoint("TOPLEFT", grid.headerClip, "TOPLEFT", -NAME_W, 0)
+    grid.nameHeader:SetSize(NAME_W, HEADER_H)
+    Fill(grid.nameHeader, ns.COLOR.header)
+
+    grid.nameHeader.text =
+        grid.nameHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    grid.nameHeader.text:SetPoint("LEFT", 8, 0)
+    grid.nameHeader.text:SetJustifyH("LEFT")
+
+    grid.nameHeader:SetScript("OnClick", function()
+        Model:SetSort(ns.NAME_COL)
+        UI:Refresh()
+    end)
+    grid.nameHeader:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:AddLine("Player Name", 1, 1, 1)
+        GameTooltip:AddLine("Click to sort by name.", 0.5, 0.7, 1)
+        GameTooltip:AddLine("The bars keep the last column you sorted by, since\n"
+                         .. "a name is not a quantity to scale them against.",
+                            0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    grid.nameHeader:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     grid.nameClip = CreateFrame("Frame", nil, pane)
     grid.nameClip:SetPoint("TOPLEFT", grid.headerClip, "BOTTOMLEFT", -NAME_W, -2)
@@ -1237,12 +1838,19 @@ function UI:Create()
     frame = CreateFrame("Frame", "CombatSessionViewerFrame", UIParent)
     frame:SetSize(ns.db.width, ns.db.height)
     frame:SetPoint(ns.db.point, UIParent, ns.db.point, ns.db.x, ns.db.y)
-    frame:SetFrameStrata("HIGH")
+    -- MEDIUM rather than HIGH, which is where the game's own panels and most
+    -- addon windows sit. On HIGH this window was above all of them whatever the
+    -- user did, which is only ever right for the window you happen to be using -
+    -- so it shares the layer instead, and SetToplevel raises it within that
+    -- layer when it is clicked. Clicking another window then puts that one on
+    -- top, which is what everything else in the interface does.
+    frame:SetFrameStrata("MEDIUM")
     frame:SetToplevel(true)
     frame:EnableMouse(true)
     frame:SetMovable(true)
     frame:SetResizable(true)
     if frame.SetResizeBounds then frame:SetResizeBounds(760, 380) end
+    frame:SetScript("OnMouseDown", function(self) self:Raise() end)
     Fill(frame, { 0.03, 0.03, 0.04, 0.96 })
     Border(frame, ns.COLOR.line)
 
@@ -1255,12 +1863,25 @@ function UI:Create()
     drag:SetPoint("TOPRIGHT")
     drag:SetHeight(28)
     drag:EnableMouse(true)
-    drag:SetScript("OnMouseDown", function() frame:StartMoving() end)
-    drag:SetScript("OnMouseUp", function()
+    -- Raised by hand as well as by SetToplevel: a click that lands on a child
+    -- frame - a row, a cell, the session list - is consumed there and never
+    -- reaches the window, so dragging the title bar is otherwise the only thing
+    -- that brings it forward.
+    --
+    -- Named rather than written inline because the warning line sits on top of
+    -- this strip and has to go on doing its job; see below.
+    local function GrabTitleBar()
+        frame:Raise()
+        frame:StartMoving()
+    end
+    local function ReleaseTitleBar()
         frame:StopMovingOrSizing()
         local point, _, _, x, y = frame:GetPoint()
         ns.db.point, ns.db.x, ns.db.y = point, x, y
-    end)
+    end
+
+    drag:SetScript("OnMouseDown", GrabTitleBar)
+    drag:SetScript("OnMouseUp", ReleaseTitleBar)
 
     local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", -2, -2)
@@ -1272,6 +1893,52 @@ function UI:Create()
     local credit = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     credit:SetPoint("TOPRIGHT", close, "TOPLEFT", -2, -6)
     credit:SetText("|cff808080Created by McDakson|r")
+
+    -- The version mismatch notice, centred on the title bar between the name
+    -- and the byline.
+    --
+    -- Up here rather than over the grid, because it is not about the session
+    -- being looked at: while the two halves disagree every figure below it is
+    -- suspect, so the warning has to outrank whatever row the user clicked.
+    -- Width is set from the window's actual size in Refresh, so it cannot grow
+    -- into the title on a narrow window.
+    --
+    -- A frame rather than a bare FontString, because one line is room for the
+    -- instruction but not for the steps, and the steps are the part that gets
+    -- somebody unstuck. They live in a tooltip, which needs something hoverable.
+    warning = CreateFrame("Frame", nil, frame)
+    warning:SetPoint("TOP", frame, "TOP", 0, -5)
+    warning:SetHeight(18)
+    warning:EnableMouse(true)
+    warning:Hide()
+
+    -- Explicitly above the drag strip, which covers the whole top bar and so
+    -- covers this. Both are children of the window and neither outranks the
+    -- other by default, so which one the cursor lands on comes down to
+    -- undefined ordering - and it landed on the drag strip, leaving a warning
+    -- whose instructions nobody could reach.
+    warning:SetFrameLevel(drag:GetFrameLevel() + 1)
+
+    -- And therefore has to carry the dragging itself, or the middle of the
+    -- title bar would stop moving the window for exactly as long as there is
+    -- something wrong to report.
+    warning:SetScript("OnMouseDown", GrabTitleBar)
+    warning:SetScript("OnMouseUp", ReleaseTitleBar)
+
+    warning.text = warning:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    warning.text:SetAllPoints()
+    warning.text:SetJustifyH("CENTER")
+    warning.text:SetWordWrap(false)
+    warning.text:SetTextColor(1, 0.33, 0.33)
+
+    warning:SetScript("OnEnter", function(self)
+        if not self.detail then return end
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:AddLine("CombatSession", 1, 0.82, 0)
+        GameTooltip:AddLine(self.detail, 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    warning:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     local sessionPane = BuildSessionPane(frame)
     BuildGridPane(frame, sessionPane)

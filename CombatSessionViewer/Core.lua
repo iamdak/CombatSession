@@ -52,9 +52,18 @@ local DEFAULTS = {
     y         = 0,
     width     = 1040,
     height    = 620,
-    sortCol   = 1,        -- Damage Done
+    sortCol   = 1,        -- Damage Done; 0 sorts by name
     sortAsc   = false,
+    -- The column the bars are drawn against. Tracks sortCol except while the
+    -- sort is alphabetical, which has no quantity behind it to scale bars to.
+    barCol    = 1,
     lastKey   = nil,      -- session selected when the window was last closed
+
+    -- Set by the Reload UI button and cleared the moment it is honoured. The
+    -- window is not otherwise reopened on login: a reload asked for from inside
+    -- the viewer is a round trip, and coming back to a closed window loses the
+    -- place the user was in the middle of.
+    reopen    = false,
 
     -- Minimap button placement, kept as an angle on the ring rather than a
     -- point: a remembered x,y detaches from the minimap the moment anything
@@ -90,6 +99,42 @@ end
 function ns:Defines()
     local api = self:API()
     return api and api:GetDefines() or nil
+end
+
+-- The application version warning as one line, or nil when nothing is wrong.
+--
+-- The comparison belongs to CombatSession: this addon never talks to the
+-- application and has no business deciding what its version numbers mean. All
+-- that happens here is the wording, which names the older half first, because
+-- that is the one the user has to go and do something about.
+function ns:VersionWarning()
+    local api = self:API()
+    if not (api and api.AppVersions) then return nil end
+
+    local v = api:AppVersions()
+    if v.state == "addon" then
+        return ("Update the CombatSession addon from CurseForge - the app is already %s")
+            :format(v.currentText),
+               ("The CombatSession addon is older than the application.\n\n"
+             .. "|cffffffffYou have:|r  addon built for app %s\n"
+             .. "|cffffffffYou need:|r  addon built for app %s\n\n"
+             .. "1.  Open your addon manager, or go to\n"
+             .. "     |cff66bbffcurseforge.com/wow/addons/combatsession|r\n"
+             .. "2.  Update CombatSession to the latest version.\n"
+             .. "3.  Type |cffffffff/reload|r, or log out and back in.")
+            :format(v.expectedText, v.currentText)
+    elseif v.state == "app" then
+        return ("Update the CombatSession app to %s - you are running %s")
+            :format(v.expectedText, v.currentText),
+               ("The CombatSession application is older than this addon.\n\n"
+             .. "|cffffffffYou have:|r  application %s\n"
+             .. "|cffffffffYou need:|r  application %s or later\n\n"
+             .. "1.  Open the CombatSession application window.\n"
+             .. "2.  Click |cffffffffGet the App (GitHub)|r at the bottom and\n"
+             .. "     follow the steps it gives you.")
+            :format(v.currentText, v.expectedText)
+    end
+    return nil
 end
 
 function ns:Print(...)
@@ -146,7 +191,22 @@ end
 
 function ns.FormatTime(stamp)
     if not stamp then return "" end
-    return date("%d/%m/%Y %H:%M", stamp)
+    return date("%m/%d/%Y %H:%M", stamp)
+end
+
+-- How long something took, as m:ss - or h:mm:ss once past the hour, which a
+-- long battleground can reach. Nil rather than "0:00" when there is nothing to
+-- report, so the caller can leave the field empty instead of stating a zero.
+function ns.FormatDuration(seconds)
+    seconds = math.floor(tonumber(seconds) or 0)
+    if seconds <= 0 then return nil end
+
+    local hours = math.floor(seconds / 3600)
+    local mins  = math.floor((seconds % 3600) / 60)
+    local secs  = seconds % 60
+
+    if hours > 0 then return ("%d:%02d:%02d"):format(hours, mins, secs) end
+    return ("%d:%02d"):format(mins, secs)
 end
 
 -- Header labels only. The library's names stay as they are: they are stored in
@@ -162,6 +222,7 @@ local SHORT_COLUMN = {
     ["Healing Done"]  = "Heal Done",
     ["Healing Taken"] = "Heal Taken",
     ["Overhealing"]   = "Overheal",
+    ["Killing Blows"] = "Kills",
 }
 
 function ns.ColumnLabel(name)
@@ -221,6 +282,53 @@ function ns.SpecInfo(classToken, specName)
     return found or nil
 end
 
+-- A colour escape around a string, for the places a string is all there is to
+-- work with. Takes the palette's own {r, g, b} form.
+function ns.ColorizeRGB(text, color)
+    if not color then return text end
+    return ("|cff%02x%02x%02x%s|r")
+        :format(color[1] * 255, color[2] * 255, color[3] * 255, text)
+end
+
+-- The same, for a class. Formatted from the components rather than taken from
+-- the table's colorStr, which is not present on every path that hands one of
+-- these out.
+function ns.Colorize(text, classToken)
+    local c = classToken and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classToken]
+    if not c then return text end
+    return ns.ColorizeRGB(text, { c.r, c.g, c.b })
+end
+
+-- Spec from the id the combat log carries in COMBATANT_INFO.
+--
+-- Better than SpecInfo above in every way that matters: it is the game's own
+-- identifier rather than a localised display name, it needs no class token to
+-- disambiguate, and it hands back the class as well - so an arena with no
+-- scoreboard behind it still knows what everyone was playing. It is only
+-- available where the log carries combatants at all, which means arenas.
+local specByIdCache = {}
+
+function ns.SpecById(specId)
+    specId = tonumber(specId)
+    if not specId or specId <= 0 then return nil end
+
+    local hit = specByIdCache[specId]
+    if hit ~= nil then return hit or nil end
+
+    local found = false
+    if GetSpecializationInfoByID then
+        local ok, id, name, _, icon, role, classFile =
+            pcall(GetSpecializationInfoByID, specId)
+        if ok and id then
+            found = { id = id, name = name, icon = icon,
+                      role = role, class = classFile }
+        end
+    end
+
+    specByIdCache[specId] = found
+    return found or nil
+end
+
 -- Fallback when the spec is unknown: every class has an icon in one atlas.
 function ns.ClassIcon(classToken)
     if not classToken then return nil end
@@ -232,6 +340,157 @@ ns.ROLE_ATLAS = {
     HEALER  = "roleicon-tiny-healer",
     DAMAGER = "roleicon-tiny-dps",
 }
+
+-- The badge art for an honor level.
+--
+-- There is no icon per level. The honor system issues a reward every few levels
+-- and the badge belongs to the reward, so a level sitting between two of them
+-- has none of its own - which is most levels. Walked downward to the last level
+-- that did issue one, which is the badge that player is currently wearing.
+--
+-- Cached both ways round: a miss is stored as false so a level with no badge
+-- anywhere below it is not re-walked on every row that is drawn.
+local honorBadge = {}
+
+function ns.HonorBadge(level)
+    level = tonumber(level)
+    if not level or level < 1 then return nil end
+
+    local hit = honorBadge[level]
+    if hit ~= nil then return hit or nil end
+
+    local found = false
+    local get = C_PvP and C_PvP.GetHonorRewardInfo
+    if type(get) == "function" then
+        -- Sixty levels is well past the widest gap between rewards, and the
+        -- walk stops at the first hit, so the long form is only ever paid by a
+        -- level that has no badge at all.
+        for probe = level, math.max(1, level - 60), -1 do
+            local ok, info = pcall(get, probe)
+            if ok and type(info) == "table" and info.badgeFileDataID then
+                found = info.badgeFileDataID
+                break
+            end
+        end
+    end
+
+    honorBadge[level] = found
+    return found or nil
+end
+
+-- Faction crest for a session row. The big Timer art rather than a small badge:
+-- it is drawn oversized and cropped by the row, so it wants a shape that still
+-- reads when most of it is outside the frame.
+ns.FACTION_EMBLEM = {
+    Alliance = "Interface\\Timer\\Alliance-Logo",
+    Horde    = "Interface\\Timer\\Horde-Logo",
+}
+
+--------------------------------------------------------------------------------
+-- Spell schools
+--------------------------------------------------------------------------------
+
+-- The combat log masks a spell's school into a byte, one bit per school, and
+-- a spell may be more than one of them: Frostfire Bolt is frost and fire, and
+-- the log says so rather than picking a side.
+--
+-- The badge beside a spell row is the school's, not the spell's - the spell
+-- already has its own icon next to it, and the point of this one is the kind of
+-- damage rather than which button was pressed.
+--
+-- Colour, not art, and the window draws it from plain fills.
+--
+-- The badge exists because spell art beside spell art reads as two spells, so
+-- the school had to stop looking like an icon. Copying what a raid frame does
+-- for a dispellable debuff was the obvious answer and is not available: those
+-- are dispel TYPES - Magic, Curse, Disease, Poison, Bleed - five of them
+-- against seven damage schools, with Magic alone covering six of the seven.
+--
+-- Tinting the overlay those frames tint was the next answer, and the texture
+-- behind it does not resolve in 12.1. A texture that fails to load draws
+-- nothing at all and reports nothing, so the badge simply vanished. Two solid
+-- rectangles cannot fail that way, and what was ever doing the work here was
+-- the colour rather than the shape.
+--
+-- The colours are the game's own, from the combat text defaults, so a player
+-- who has read a frost hit in floating text already knows what pale blue means.
+-- Melee carries no school field at all and is physical by definition.
+--
+-- Muted before use. Those values are chosen to carry over a lit 3D scene at
+-- speed, and against a dark grid they were the loudest thing on the row - which
+-- is backwards, since the stripe is a qualifier on the spell and not the point
+-- of the line. Each is pulled part of the way toward its own grey and then
+-- taken down in brightness, so the hues stay recognisably the game's and only
+-- the shouting goes. Two constants tune the whole set.
+local SCHOOL_MUTE  = 0.35   -- how far toward grey
+local SCHOOL_LEVEL = 0.82   -- and then how bright
+
+local function Mute(color)
+    local grey = (color[1] + color[2] + color[3]) / 3
+    local out = {}
+    for i = 1, 3 do
+        out[i] = (color[i] + (grey - color[i]) * SCHOOL_MUTE) * SCHOOL_LEVEL
+    end
+    return out
+end
+
+local SCHOOL_BIT = {
+    [0x01] = { name = "Physical", color = Mute({ 1.00, 1.00, 0.00 }) },
+    [0x02] = { name = "Holy",     color = Mute({ 1.00, 0.90, 0.50 }) },
+    [0x04] = { name = "Fire",     color = Mute({ 1.00, 0.50, 0.00 }) },
+    [0x08] = { name = "Nature",   color = Mute({ 0.30, 1.00, 0.30 }) },
+    [0x10] = { name = "Frost",    color = Mute({ 0.50, 1.00, 1.00 }) },
+    [0x20] = { name = "Shadow",   color = Mute({ 0.50, 0.50, 1.00 }) },
+    [0x40] = { name = "Arcane",   color = Mute({ 1.00, 0.50, 1.00 }) },
+}
+
+-- Anything with more than one bit set. Named by joining the schools it actually
+-- holds rather than from a table of Blizzard's compound names: the joined name
+-- is always right, where a table would go quietly wrong the first time a new
+-- combination appeared.
+local schoolCache = {}
+
+function ns.SchoolInfo(mask)
+    mask = tonumber(mask)
+    if not mask or mask <= 0 then return nil end
+
+    local pure = SCHOOL_BIT[mask]
+    if pure then return pure end
+
+    local hit = schoolCache[mask]
+    if hit then return hit end
+
+    -- Tested arithmetically rather than with the bit library, because the loop
+    -- variable would otherwise have to be named around it.
+    local parts = {}
+    for index = 0, 6 do
+        local flag = 2 ^ index
+        if math.floor(mask / flag) % 2 == 1 then
+            parts[#parts + 1] = SCHOOL_BIT[flag].name
+        end
+    end
+
+    -- Averaged across the schools it holds rather than given a colour of its
+    -- own, so Frostfire lands between frost and fire instead of being a third
+    -- thing to learn. Two schools that happen to average to something close to
+    -- a pure school is a cost worth paying for a rule with nothing to remember.
+    local r, g, b = 0, 0, 0
+    for index = 0, 6 do
+        local flag = 2 ^ index
+        if math.floor(mask / flag) % 2 == 1 then
+            local c = SCHOOL_BIT[flag].color
+            r, g, b = r + c[1], g + c[2], b + c[3]
+        end
+    end
+    local n = math.max(1, #parts)
+
+    local entry = {
+        name  = (#parts > 0) and table.concat(parts, "/") or "Unknown",
+        color = { r / n, g / n, b / n },
+    }
+    schoolCache[mask] = entry
+    return entry
+end
 
 --------------------------------------------------------------------------------
 -- Palette
@@ -308,5 +567,19 @@ loader:SetScript("OnEvent", function()
     if ns.CreateMinimapButton then ns:CreateMinimapButton() end
     if not ns:API() then
         ns:Print("CombatSession is not loaded - there is nothing to view.")
+    end
+
+    -- Set by the viewer's own Reload UI button. Cleared before it is acted on,
+    -- so a login that goes wrong cannot leave the flag set and reopen the
+    -- window on every login thereafter.
+    if ns.db.reopen then
+        ns.db.reopen = false
+        -- Deferred by a frame: the library consumes pending chunks on its own
+        -- PLAYER_LOGIN, and opening ahead of that shows the session list as it
+        -- was rather than as it now is - which is the whole point of the
+        -- reload that got us here.
+        C_Timer.After(0, function()
+            if ns.UI then ns.UI:Show() end
+        end)
     end
 end)

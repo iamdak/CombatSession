@@ -98,10 +98,39 @@ struct MapChange {
     std::string name;
 };
 
+// COMBATANT_INFO,<guid>,<faction>,<22 stats>,<specId>,[talents],[pvpTalents],
+//                [equipment],[interestingAuras],<honorLevel>,<season>,
+//                <rating>,<tier>
+//
+// Emitted once per combatant at the start of an arena, and NEVER in a
+// battleground - which is the whole reason the recorder addon exists. Verified
+// against a 12.1.0 capture: 95 rows across 24 arena matches, none across three
+// battleground logs.
+//
+// What it carries is the combatant's CHARACTER, not their scoreboard line:
+// there are no killing blows, deaths, damage or healing columns anywhere in the
+// combat log. But spec, faction, honor level and rating are all here, and every
+// one of them was previously only obtainable from the live client.
+//
+// Not split on commas. The payload embeds bracketed arrays of parenthesised
+// tuples, so a comma split shreds them; the three fields worth having sit
+// either side of those arrays and are found by position relative to the
+// brackets instead.
+struct CombatantInfo {
+    std::string guid;
+    int32_t     faction    = 0;   // 0 or 1 - the arena team, not Horde/Alliance
+    int32_t     specId     = 0;   // 65 = Holy Paladin, 62 = Arcane Mage, ...
+    int32_t     honorLevel = 0;
+    int32_t     season     = 0;
+    int32_t     rating     = 0;   // as it stood BEFORE the match
+    int32_t     tier       = 0;
+};
+
 bool ParseArenaMatchStart(std::string_view payload, ArenaMatchStart& out);
 bool ParseArenaMatchEnd(std::string_view payload, ArenaMatchEnd& out);
 bool ParseZoneChange(std::string_view payload, ZoneChange& out);
 bool ParseMapChange(std::string_view payload, MapChange& out);
+bool ParseCombatantInfo(std::string_view payload, CombatantInfo& out);
 
 // True when the bracket string denotes rated play. "Skirmish" is unrated; the
 // rated Solo Shuffle bracket names itself. Unknown brackets are treated as

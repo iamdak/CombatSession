@@ -1,10 +1,10 @@
 // CombatSession :: App
 //
-// The status-area application: watches the Logs folder, runs the generator when
-// a log settles, and reports what it found through the icon and its menu.
+// Watches the Logs folder, runs the generator when a log settles, and reports
+// what it found through the window and the notification icon.
 //
 // Portable. Everything that used to make this file Windows-only - the window,
-// the icon, the menu, the pickers, the noise - now sits behind TrayHost and
+// the icon, the menu, the pickers, the noise - sits behind Shell.h and
 // Platform.h. What is left is the part that was never about an operating
 // system: when to run a pass, what the result means, and what to say about it.
 
@@ -12,10 +12,15 @@
 
 #include "Generator.h"
 #include "Platform.h"
-#include "Tray.h"
+#include "SavedVars.h"
+#include "Shell.h"
+#include "Version.h"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,59 +32,135 @@ namespace fs = std::filesystem;
 namespace cs {
 namespace {
 
-enum Command {
-    kStatus     = 1000,
-    kProcessNow = 1001,
-    kOpenData   = 1002,
-    kOpenLogs   = 1003,
-    kAutostart  = 1004,
-    kArchive    = 1006,
-    kQuit       = 1007,
-    kSetWow     = 1008,
-    kSetSound   = 1009,
-};
+using Clock = std::chrono::steady_clock;
 
-class TrayApp : public TrayController {
+// Where each half is published. Compiled in rather than configurable: they are
+// the addresses of this project, and a setting that lets something else point
+// the update prompt somewhere is a setting worth not having.
+constexpr const char* kAddonUrl = "https://www.curseforge.com/wow/addons/combatsession";
+constexpr const char* kAppUrl   = "https://github.com/iamdak/CombatSession";
+
+// The addon's requirement, read out of its .toc.
+//
+// This is the authoritative side of the handshake and the only one that is
+// current. The addon also writes the number into its saved variables, but the
+// client writes that file at the START of a reload, from the state as it was
+// BEFORE the new files loaded - so a freshly installed addon's requirement does
+// not reach disk until the reload after the one that installed it. For one
+// whole session the addon warns the user and this application, reading the
+// stale file, sees nothing to warn about.
+//
+// The .toc has no such lag. It is what is installed, it says so the moment it
+// is installed, and it does not need the addon to have loaded even once - which
+// also means a disabled addon still states what it would need.
+//
+// Returns empty when the file is not there, which is not a mismatch: it means
+// the addon is not installed in the folder being watched.
+std::string ReadAddonRequirement(const fs::path& addonsRoot) {
+    std::ifstream in(addonsRoot / "CombatSession" / "CombatSession.toc");
+    if (!in) return {};
+
+    constexpr const char* kKey = "## X-CombatSession-App:";
+    const size_t keyLength = std::strlen(kKey);
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.compare(0, keyLength, kKey) != 0) continue;
+
+        std::string value = line.substr(keyLength);
+        // The client is relaxed about spacing here and so is this. A .toc saved
+        // on Windows also carries the carriage return that getline leaves.
+        const size_t first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return {};
+        const size_t last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    }
+    return {};
+}
+
+class App : public AppController {
 public:
-    explicit TrayApp(Config config) : config_(std::move(config)) {}
-
     int Run();
 
-    std::vector<TrayMenuItem> BuildMenu() override;
+    // AppController
+    std::vector<MenuItem> BuildMenu(bool compact) override;
     void OnCommand(int id) override;
+    Config& Settings() override { return config_; }
+    void SettingsChanged() override;
+    std::string StatusText() const override;
+    bool Busy() const override { return busy_.load(); }
+    VersionStatus Versions() const override;
 
 private:
     void SetStatus(std::string text);
     void SetState(TrayState state);
     void Publish();
 
-    void WatchLoop();          // runs on its own thread
+    void RefreshVersions();
+    void OfferAppUpdate();
+
+    void WatchLoop();
     uint64_t WatchFingerprint() const;
     bool     AddonHasSeenQueue() const;
-    void RunGenerator();       // may block for many seconds on a large session
+    void RunGenerator();
+    void RunGeneratorAsync();
+    void RebuildAll();
+    void Alert(bool firstTime);
+    void Wake();
 
-    Config    config_;
-    TrayHost* host_ = nullptr;
+    Config     config_;
+    ShellHost* shell_ = nullptr;
 
     std::atomic<TrayState> state_{ TrayState::Idle };
 
     std::thread       watcher_;
     std::atomic<bool> quitting_{ false };
     std::atomic<bool> busy_{ false };
-    // Set by the watcher when a change is seen; cleared once processed.
     std::atomic<bool> dirty_{ false };
-    // The last pass left a session open at end-of-data, so a later pass has to
-    // decide whether the log is simply finished.
     std::atomic<bool> openSession_{ false };
+    // Set when the folder changes, so the watcher starts over rather than
+    // comparing a fingerprint taken from a different installation.
+    std::atomic<bool> restart_{ false };
+
+    // Waking the watcher out of its poll. Without this a quit, or a settings
+    // change, would sit there until the next tick - which at a five second
+    // poll is a visible pause and at the maximum is most of a coffee break.
+    std::mutex              wakeMutex_;
+    std::condition_variable wake_;
+
+    // When the reload alert last sounded, for the repeating mode.
+    Clock::time_point lastAlert_{};
+
+    // The only two settings the watcher's own state depends on, as they were
+    // when it last started over. Compared on a settings change so that ticking
+    // a checkbox does not restart a watcher that is watching the same folder on
+    // the same interval it was a moment ago.
+    std::string watchedPath_;
+    int         watchedPoll_ = 0;
 
     mutable std::mutex statusMutex_;
     std::string        status_ = "starting";
-    size_t             sessionCount_ = 0;
+
+    // What the addon asks for against what this is, recomputed whenever the
+    // addon might have saved. Guarded because the watcher recomputes it and the
+    // interface reads it.
+    mutable std::mutex versionMutex_;
+    VersionStatus      versions_;
+
+    // So the error sound marks the arrival of a mismatch rather than every
+    // pass that finds one still there. A flashing icon is a state and can go on
+    // saying so indefinitely; a noise is an event and has to be one.
+    VersionState       announced_ = VersionState::Unknown;
 };
 
 //------------------------------------------------------------------------------
 
-void TrayApp::SetStatus(std::string text) {
+std::string App::StatusText() const {
+    std::lock_guard<std::mutex> lock(statusMutex_);
+    return status_;
+}
+
+void App::SetStatus(std::string text) {
     {
         std::lock_guard<std::mutex> lock(statusMutex_);
         status_ = std::move(text);
@@ -87,28 +168,170 @@ void TrayApp::SetStatus(std::string text) {
     Publish();
 }
 
-void TrayApp::SetState(TrayState state) {
+void App::SetState(TrayState state) {
     // Compared before publishing so an unchanged state costs nothing: the
-    // watcher wakes twice a second and would otherwise repaint every tick.
+    // watcher would otherwise repaint the interface on every tick.
     if (state_.exchange(state) == state) return;
     Publish();
 }
 
-void TrayApp::Publish() {
-    if (!host_) return;
+// Cuts the watcher's poll short, for anything that should not wait for the next
+// tick: quitting, and a settings change that makes what it is watching wrong.
+void App::Wake() {
+    std::lock_guard<std::mutex> lock(wakeMutex_);
+    wake_.notify_all();
+}
 
-    std::string tip;
-    {
-        std::lock_guard<std::mutex> lock(statusMutex_);
-        tip = status_;
+void App::Publish() {
+    if (shell_) shell_->Update(state_.load(), StatusText());
+}
+
+// The one noise this application makes, and only when asked to.
+//
+// It exists because a reload is the single state the program cannot resolve on
+// its own: the data is written and safe, and only the user can make the client
+// pick it up. Everything else resolves itself and stays silent.
+void App::Alert(bool firstTime) {
+    if (!config_.soundEnabled) return;
+    if (!firstTime && config_.alertRepeat != AlertRepeat::Every) return;
+
+    lastAlert_ = Clock::now();
+    if (config_.reloadSound.empty()) PlayDefaultAlert();
+    else                             PlaySoundFile(config_.reloadSound);
+}
+
+//------------------------------------------------------------------------------
+// Versions
+//------------------------------------------------------------------------------
+
+VersionStatus App::Versions() const {
+    std::lock_guard<std::mutex> lock(versionMutex_);
+    return versions_;
+}
+
+// Compares what the installed addon says it needs against what this is.
+//
+// The addon's answer arrives through its saved variables, which the client
+// rewrites at logout, reload and exit - so this is only ever as current as the
+// last of those. That is the right latency: an addon updated while the game is
+// running has not been loaded yet either, and announcing a mismatch against
+// files the client has not read would be announcing something that is not true
+// until the next reload.
+void App::RefreshVersions() {
+    VersionStatus next;
+    next.running = VersionText(kAppVersion);
+
+    const VersionCode running = kAppVersion;
+    VersionCode expected = 0;
+    if (config_.IsValid()) {
+        expected = ParseVersion(ReadAddonRequirement(config_.AddOnsDir()));
+
+        // The saved variables carry the same number, and are the fallback for
+        // an addon whose .toc could not be read - installed under a renamed
+        // folder, or a future layout this does not know about. Stale by up to
+        // one reload, which is why it is second and not first.
+        if (expected == 0) {
+            expected = ParseVersion(ReadAddonState(config_.WtfRoot()).appExpected);
+        }
     }
-    host_->Update(state_.load(), tip);
+    next.expected = VersionText(expected);
+
+    if (expected == 0) {
+        // No addon has saved yet. Says nothing either way, and must not: a
+        // fresh install spends its first session here and being shouted at
+        // before anything has gone wrong is how a warning stops being read.
+        next.state     = VersionState::Unknown;
+        next.addonLine = "Addon version not known yet.";
+        next.appLine   = "Application up to date.";
+    } else if (expected == running) {
+        next.state     = VersionState::Match;
+        next.addonLine = "Addon up to date.";
+        next.appLine   = "Application up to date.";
+    } else if (expected < running) {
+        next.state     = VersionState::AddonOutdated;
+        next.addonLine = "Addon requires update.";
+        next.appLine   = "Application up to date.";
+        next.banner    = "The addon is out of date. It was written for "
+                         "CombatSession " + next.expected + ", and this is "
+                         + next.running + ".";
+    } else {
+        next.state     = VersionState::AppOutdated;
+        next.addonLine = "Addon up to date.";
+        next.appLine   = "Application requires update.";
+        next.banner    = "This application is out of date. The addon needs "
+                         "CombatSession " + next.expected + ", and this is "
+                         + next.running + ".";
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(versionMutex_);
+        versions_ = next;
+    }
+
+    // Sounded on the way in, once. announced_ is only touched here, and this
+    // runs on the watcher thread or before it starts, never both at once.
+    if (IsMismatch(next.state) && next.state != announced_) PlayErrorAlert();
+    announced_ = next.state;
+
+    Publish();
+}
+
+// The one update that cannot be done while the thing being updated is running.
+//
+// An addon is files in a folder the game reads at load, so replacing it needs
+// nothing from this program. The application is this program: the file is
+// locked while it runs, so the only honest offer is to get out of the way -
+// which is what the third step does, and why it is spelled out before it
+// happens rather than after.
+void App::OfferAppUpdate() {
+    const fs::path exe    = ExecutablePath();
+    const std::string name = exe.filename().string();
+
+    const std::string text =
+        "The addon needs a newer version of CombatSession than the one you "
+        "are running.\n\n"
+        "Clicking OK will:\n"
+        "    1.  Open the download page in your browser.\n"
+        "    2.  Open the folder CombatSession is running from.\n"
+        "    3.  Close CombatSession.\n\n"
+        "Then, to finish the update:\n"
+        "    4.  Download the new version from the page.\n"
+        "    5.  In the folder that opened, delete " + name + ".\n"
+        "    6.  Put the new " + name + " in its place.\n"
+        "    7.  Start CombatSession again.\n\n"
+        "Your settings and your archived sessions are kept. They are stored "
+        "separately from the program, so replacing it does not touch them.\n\n"
+        "Click Cancel to leave everything as it is.";
+
+    if (!ConfirmAction("Update CombatSession", text)) return;
+
+    OpenUrl(kAppUrl);
+    OpenFolder(exe.parent_path());
+
+    quitting_ = true;
+    Wake();
+    if (shell_) shell_->Quit();
 }
 
 //------------------------------------------------------------------------------
 
-void TrayApp::RunGenerator() {
+void App::RunGenerator() {
+    if (!config_.IsValid()) {
+        SetStatus("no World of Warcraft folder set");
+        SetState(TrayState::Idle);
+        return;
+    }
+
     if (busy_.exchange(true)) return;   // a pass is already running here
+
+    // Read BEFORE the pass marks itself Working, which overwrites the very
+    // thing this is asking about. Taken at the end instead, it was always false
+    // - the state was Working by then, never NeedsReload - so every pass that
+    // finished with sessions outstanding announced itself as a first-time
+    // arrival and sounded the alert, whatever the once-or-repeat setting said.
+    // Toggling any option runs a pass, which is why a checkbox made a noise.
+    const bool wasWaiting = (state_.load() == TrayState::NeedsReload);
+
     SetStatus("processing...");
     SetState(TrayState::Working);
 
@@ -140,8 +363,8 @@ void TrayApp::RunGenerator() {
     openSession_ = anyOpen;
     generator.Commit();
 
-    sessionCount_ = generator.Records().size();
-    if (sessionCount_ == 0) {
+    const size_t pending = generator.Records().size();
+    if (pending == 0) {
         SetStatus(added > 0
             ? (std::to_string(added) + " new session(s), all consumed")
             : std::string("up to date"));
@@ -149,24 +372,55 @@ void TrayApp::RunGenerator() {
     } else if (AddonHasSeenQueue()) {
         // Delivered and loaded; the chunks are only still here because the
         // addon has not written its record yet. Nothing for the user to do.
-        SetStatus(std::to_string(sessionCount_)
+        SetStatus(std::to_string(pending)
                   + " session(s) delivered - queue clears on next save");
         SetState(TrayState::Idle);
     } else {
         // Chunks are written and the archive has them; the addon simply cannot
         // see a file that appeared after the client loaded. Red asks for the one
         // thing the application cannot do for itself.
-        SetStatus(std::to_string(sessionCount_)
-                  + " session(s) waiting - /reload in game");
+        SetStatus(std::to_string(pending) + " session(s) waiting - /reload in game");
 
-        // Only on the transition. Repeating it on every pass would turn the one
-        // useful noise this makes into something to be muted.
-        const bool wasWaiting = (state_.load() == TrayState::NeedsReload);
         SetState(TrayState::NeedsReload);
-        if (!wasWaiting) PlaySoundFile(config_.reloadSound);
+        Alert(!wasWaiting);
     }
 
     busy_ = false;
+    Publish();
+
+    // After the pass, because the pass has just rewritten Index.lua with this
+    // application's version and because the thing that most often triggers a
+    // pass is the addon writing its saved variables - which is exactly when its
+    // answer changes.
+    RefreshVersions();
+}
+
+// A large battleground takes seconds to parse and must not stall the interface.
+void App::RunGeneratorAsync() {
+    if (busy_) return;
+    std::thread([this] { RunGenerator(); }).detach();
+}
+
+// Discards every stored read offset so the next pass re-reads every log from
+// the beginning. Only ever the right thing after the addon's data format has
+// changed, and minutes of work on a large Logs folder, so it is a deliberate
+// action rather than something that happens on its own.
+void App::RebuildAll() {
+    if (busy_ || !config_.IsValid()) return;
+
+    if (!Confirm("Rebuild all data",
+                 "Every combat log will be read again from the beginning.\n\n"
+                 "On a large Logs folder this takes several minutes, and it is "
+                 "only worth doing after the addon's data format has changed.\n\n"
+                 "Continue?")) {
+        return;
+    }
+
+    // The read offsets live beside the archive, not beside the executable.
+    // Removing the file is what makes the next pass start from nothing.
+    std::error_code ec;
+    fs::remove(config_.RawDir() / "logs.tsv", ec);
+    RunGeneratorAsync();
 }
 
 // True when the client has loaded since the newest queued chunk was written.
@@ -180,7 +434,7 @@ void TrayApp::RunGenerator() {
 // The timestamps settle it. SavedVariables newer than the newest chunk means a
 // client load happened after that chunk existed, so the addon has seen it. The
 // queue will drain on the next save; nothing is being asked of the user.
-bool TrayApp::AddonHasSeenQueue() const {
+bool App::AddonHasSeenQueue() const {
     std::error_code ec;
 
     fs::file_time_type newestChunk{};
@@ -230,10 +484,10 @@ bool TrayApp::AddonHasSeenQueue() const {
 // Two things are watched, because two different events matter. The logs growing
 // means there may be new sessions to emit. The addon's SavedVariables being
 // written means it has published what it now holds, which is the only signal
-// that queued chunks have become collectable - and without it the tray went on
+// that queued chunks have become collectable - and without it the icon went on
 // asking for a reload after the reload that had already done the job, because
 // nothing else had changed so no pass ran so nothing looked.
-uint64_t TrayApp::WatchFingerprint() const {
+uint64_t App::WatchFingerprint() const {
     uint64_t stamp = 0;
     std::error_code ec;
 
@@ -260,29 +514,64 @@ uint64_t TrayApp::WatchFingerprint() const {
         Add(account.path() / "SavedVariables" / "CombatSession.lua");
     }
 
+    // The addon's own manifest, so installing or updating the addon is noticed
+    // on its own account. Without it the version check only ran when something
+    // else happened to trigger a pass, and a user who updated their addon
+    // between matches could sit in front of a program that had not looked.
+    Add(config_.AddOnsDir() / "CombatSession" / "CombatSession.toc");
+
     return stamp;
 }
 
-void TrayApp::WatchLoop() {
-    // An initial pass catches anything written while the app was not running.
-    RunGenerator();
+void App::WatchLoop() {
+    // An initial pass catches anything written while the application was not
+    // running - but only if there is somewhere to look.
+    if (config_.IsValid()) RunGenerator();
+    else                   SetStatus("no World of Warcraft folder set");
 
-    uint64_t seen = WatchFingerprint();
-    auto lastChange = std::chrono::steady_clock::now();
+    uint64_t seen = config_.IsValid() ? WatchFingerprint() : 0;
+    auto lastChange = Clock::now();
 
     while (!quitting_) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        {
+            // Interruptible: a quit or a settings change should not wait out
+            // the poll interval, which the user can set as high as five
+            // minutes.
+            std::unique_lock<std::mutex> lock(wakeMutex_);
+            wake_.wait_for(lock, std::chrono::seconds(config_.pollSeconds),
+                           [this] { return quitting_.load() || restart_.load(); });
+        }
         if (quitting_) break;
+
+        // The folder was set or changed while running, so everything the loop
+        // knows is about a different installation.
+        if (restart_.exchange(false)) {
+            if (config_.IsValid()) {
+                RunGenerator();
+                seen = WatchFingerprint();
+            } else {
+                SetStatus("no World of Warcraft folder set");
+                SetState(TrayState::Idle);
+                // Nowhere to read an addon from any more, so whatever was
+                // being said about versions is about a folder that is no
+                // longer the one in use.
+                RefreshVersions();
+            }
+            lastChange = Clock::now();
+            continue;
+        }
+
+        if (!config_.IsValid()) continue;   // inert, by the user's choice
 
         const uint64_t now = WatchFingerprint();
         if (now != seen) {
             seen = now;
             dirty_ = true;
-            lastChange = std::chrono::steady_clock::now();
+            lastChange = Clock::now();
             SetStatus("change detected...");
         }
 
-        const auto quiet = std::chrono::steady_clock::now() - lastChange;
+        const auto quiet = Clock::now() - lastChange;
 
         // The client appends continuously during a match, so processing waits
         // until the log has been quiet for settleSeconds. That turns a burst of
@@ -290,8 +579,16 @@ void TrayApp::WatchLoop() {
         if (dirty_ && quiet >= std::chrono::seconds(config_.settleSeconds)) {
             dirty_ = false;
             RunGenerator();
-            lastChange = std::chrono::steady_clock::now();
+            lastChange = Clock::now();
             continue;
+        }
+
+        // Still waiting on a reload, and the user asked to be reminded.
+        if (state_.load() == TrayState::NeedsReload
+            && config_.soundEnabled
+            && config_.alertRepeat == AlertRepeat::Every
+            && Clock::now() - lastAlert_ >= std::chrono::seconds(config_.repeatSeconds)) {
+            Alert(false);
         }
 
         // A session still open at end-of-data is withheld, on the assumption the
@@ -306,116 +603,117 @@ void TrayApp::WatchLoop() {
         // is finished on a pass that actually happens. This is that pass.
         if (openSession_ && quiet >= std::chrono::seconds(config_.closedAfterSeconds)) {
             RunGenerator();
-            lastChange = std::chrono::steady_clock::now();
+            lastChange = Clock::now();
         }
     }
 }
 
 //------------------------------------------------------------------------------
 
-std::vector<TrayMenuItem> TrayApp::BuildMenu() {
-    std::vector<TrayMenuItem> menu;
+std::vector<MenuItem> App::BuildMenu(bool compact) {
+    std::vector<MenuItem> menu;
 
-    TrayMenuItem status;
-    {
-        std::lock_guard<std::mutex> lock(statusMutex_);
-        status.label = status_;
-    }
-    status.id      = kStatus;
+    MenuItem status;
+    status.id      = kCmdStatus;
+    status.label   = StatusText();
     status.enabled = false;
     menu.push_back(status);
 
-    menu.push_back(TrayMenuItem::Divider());
-    menu.push_back({ kProcessNow, "Process now", !busy_, false, false });
-    menu.push_back({ kOpenData,   "Open data folder", true, false, false });
-    menu.push_back({ kOpenLogs,   "Open Logs folder", true, false, false });
+    // A mismatch is the one thing worth saying in a five-item menu, and on a
+    // shell with no window of its own this is the only place it can be said.
+    const VersionStatus versions = Versions();
+    if (IsMismatch(versions.state)) {
+        MenuItem warning;
+        warning.id      = kCmdStatus;
+        warning.label   = versions.state == VersionState::AddonOutdated
+                        ? "Addon requires update" : "Application requires update";
+        warning.enabled = false;
+        menu.push_back(warning);
+        menu.push_back({ kCmdAddonPage, "Get the Addon (CurseForge)...",
+                         true, false, false });
+        menu.push_back({ kCmdAppPage, "Get the Application (GitHub)...",
+                         true, false, false });
+    }
 
-    menu.push_back(TrayMenuItem::Divider());
-    menu.push_back({ kAutostart, StartAtLoginLabel(), true,
-                     config_.startAtLogin, false });
-    menu.push_back({ kArchive, "Keep raw archive", true,
-                     config_.archiveRaw, false });
+    menu.push_back(MenuItem::Divider());
 
-    menu.push_back(TrayMenuItem::Divider());
-    menu.push_back({ kSetWow, "Set World of Warcraft folder...",
-                     true, false, false });
-    menu.push_back({ kSetSound,
-                     config_.reloadSound.empty() ? "Reload sound: off..."
-                                                 : "Reload sound...",
-                     true, false, false });
+    const bool valid = config_.IsValid();
+    menu.push_back({ kCmdProcessNow, "&Process Now", valid && !busy_, false, false });
+    menu.push_back({ kCmdOpenData,   "Open &Data Folder", valid, false, false });
+    menu.push_back({ kCmdOpenLogs,   "Open &Log Folder",  valid, false, false });
 
-    menu.push_back(TrayMenuItem::Divider());
-    menu.push_back({ kQuit, "Quit CombatSession", true, false, false });
+    // Only where there is no window carrying them. On Windows every one of
+    // these is a control the user can see and read a label for, and repeating
+    // them in a menu would mean two places to change the same thing.
+    if (!compact) {
+        menu.push_back(MenuItem::Divider());
+        menu.push_back({ kCmdSetWowPath, "Set World of Warcraft Folder...",
+                         true, false, false });
+        menu.push_back({ kCmdSetSound, "Reload Sound...", true, false, false });
+    }
+
+    menu.push_back(MenuItem::Divider());
+    menu.push_back({ kCmdQuit, "&Quit", true, false, false });
     return menu;
 }
 
-void TrayApp::OnCommand(int id) {
+void App::OnCommand(int id) {
     switch (id) {
-    case kProcessNow:
-        // On a worker thread: a large battleground takes seconds to parse and
-        // must not stall the event loop.
-        if (!busy_) std::thread([this] { RunGenerator(); }).detach();
+    case kCmdProcessNow:
+        RunGeneratorAsync();
         break;
 
-    case kOpenData:
+    case kCmdOpenData:
         OpenFolder(config_.AddOnsDir() / "CombatSession_Data");
         break;
 
-    case kOpenLogs:
+    case kCmdOpenLogs:
         OpenFolder(config_.LogsDir());
         break;
 
-    case kAutostart:
-        config_.startAtLogin = !config_.startAtLogin;
-        SetStartAtLogin(config_.startAtLogin);
-        config_.Save(DefaultConfigPath());
-        break;
-
-    case kArchive:
-        config_.archiveRaw = !config_.archiveRaw;
-        config_.Save(DefaultConfigPath());
-        break;
-
-    case kSetWow: {
-        const std::string picked =
-            PickFolder("Select the World of Warcraft flavor folder "
-                       "(the one containing Logs and Interface)");
-        if (picked.empty()) break;
-
-        Config probe = config_;
-        probe.wowPath = picked;
-        if (probe.IsValid()) {
-            config_.wowPath = picked;
-            config_.Save(DefaultConfigPath());
-            SetStatus("folder changed - processing...");
-            if (!busy_) std::thread([this] { RunGenerator(); }).detach();
-        } else {
-            ShowMessage("CombatSession",
-                        "That folder does not contain both Logs and "
-                        "Interface/AddOns.\n\nPick the flavor folder itself, "
-                        "usually named _retail_.",
-                        true);
-        }
+    case kCmdSetWowPath: {
+        std::string picked = config_.wowPath;
+        if (!PromptForWowFolder(picked) || picked.empty()) break;
+        config_.wowPath = picked;
+        SettingsChanged();
         break;
     }
 
-    case kSetSound: {
+    case kCmdSetSound: {
         const std::string picked = PickSoundFile(config_.reloadSound);
-        if (!picked.empty()) {
-            config_.reloadSound = picked;
-            config_.Save(DefaultConfigPath());
-            PlaySoundFile(config_.reloadSound);   // so the choice is audible
-        }
+        if (picked.empty()) break;
+        config_.reloadSound = picked;
+        SettingsChanged();
+        PlaySoundFile(config_.reloadSound);   // so the choice is audible
         break;
     }
 
-    case kQuit:
-        // A parse already under way still has to finish before the watcher
-        // thread can be joined. Saying so costs nothing and stops a slow exit
-        // looking like a hang.
-        SetStatus("quitting...");
+    case kCmdUseDefaultSound:
+        config_.reloadSound.clear();
+        SettingsChanged();
+        PlayDefaultAlert();
+        break;
+
+    case kCmdRebuildAll:
+        RebuildAll();
+        break;
+
+    case kCmdAddonPage:
+        // Always the page, whichever way round the mismatch is. Someone
+        // checking whether there is a newer addon is entitled to go and look
+        // without this program deciding they do not need to.
+        OpenUrl(kAddonUrl);
+        break;
+
+    case kCmdAppPage:
+        if (Versions().state == VersionState::AppOutdated) OfferAppUpdate();
+        else                                               OpenUrl(kAppUrl);
+        break;
+
+    case kCmdQuit:
         quitting_ = true;
-        if (host_) host_->Quit();
+        Wake();
+        if (shell_) shell_->Quit();
         break;
 
     default:
@@ -423,19 +721,82 @@ void TrayApp::OnCommand(int id) {
     }
 }
 
-int TrayApp::Run() {
-    std::unique_ptr<TrayHost> host = CreateTrayHost(*this);
-    if (!host) return 1;
-    host_ = host.get();
+void App::SettingsChanged() {
+    // The login item is the only setting that lives outside this file, so it is
+    // the only one that has to be pushed anywhere. Always rewritten when on, so
+    // it points at the copy of the application the user is actually running.
+    SetStartAtLogin(config_.startAtLogin);
 
+    config_.Save(DefaultConfigPath());
+
+    // A changed folder invalidates everything the watcher has been comparing,
+    // and a changed poll interval should take effect now rather than after the
+    // old one elapses. Nothing else here is any of the watcher's business.
+    //
+    // This used to restart unconditionally, so every checkbox kicked off a full
+    // pass: the status line flicked to "processing...", Process Now and Rebuild
+    // All Data greyed out for as long as it took, and the alert sounded. The
+    // pass was at least never a reprocess - it resumed from each log's stored
+    // read offset like any other - but it was work nobody asked for.
+    const bool watchChanged = (config_.wowPath != watchedPath_)
+                           || (config_.pollSeconds != watchedPoll_);
+    watchedPath_ = config_.wowPath;
+    watchedPoll_ = config_.pollSeconds;
+
+    if (watchChanged) {
+        restart_ = true;
+        Wake();
+    }
+    Publish();
+}
+
+//------------------------------------------------------------------------------
+
+int App::Run() {
+    const fs::path settings = DefaultConfigPath();
+    const bool firstRun = !config_.Load(settings);
+
+    // The one question the application cannot start without, asked before any
+    // other window exists so it is the first thing on screen.
+    if (firstRun) {
+        std::string picked;
+        if (PromptForWowFolder(picked) && !picked.empty()) {
+            config_.wowPath = picked;
+        }
+        config_.Save(settings);
+    }
+
+    // The filesystem is the truth about the login item - the user may have
+    // deleted the shortcut themselves - and when it is on it is rewritten, so a
+    // copy of this application somewhere else cannot leave a stale entry.
+    config_.startAtLogin = GetStartAtLogin();
+    if (config_.startAtLogin) SetStartAtLogin(true);
+
+    // Seeded from what the watcher is about to start with, so the first
+    // settings change is compared against reality rather than against an empty
+    // path it would always differ from.
+    watchedPath_ = config_.wowPath;
+    watchedPoll_ = config_.pollSeconds;
+
+    // Before the window is built, because a mismatch overrules the start
+    // minimized setting - and a window cannot decide whether to appear after it
+    // has already decided not to.
+    RefreshVersions();
+
+    std::unique_ptr<ShellHost> shell = CreateShell(*this);
+    if (!shell) return 1;
+    shell_ = shell.get();
+
+    Publish();
     watcher_ = std::thread([this] { WatchLoop(); });
 
-    const int code = host->Run();
+    const int code = shell->Run();
 
     quitting_ = true;
+    Wake();
     if (watcher_.joinable()) watcher_.join();
 
-    host_ = nullptr;
+    shell_ = nullptr;
     return code;
 }
 
@@ -443,36 +804,18 @@ int TrayApp::Run() {
 
 //------------------------------------------------------------------------------
 
-// Asks for the flavor folder outside any window of ours.
-//
-// Exposed because the first run has to ask before the tray exists: detection
-// covers the usual install locations, and when it comes up empty the honest
-// alternative to asking is an icon that silently does nothing.
-std::string PromptForWowFolder() {
-    return PickFolder("Select the World of Warcraft flavor folder "
-                      "(the one containing Logs and Interface)");
-}
-
-int RunTray(Config config) {
-    // One tray at a time.
+int RunApp() {
+    // One at a time.
     //
     // Two watchers on the same folder is not merely untidy: both would run
     // passes, both would write the queue and the read offsets, and both would
     // sound the reload alert. The lock is held for the life of the process and
     // released by the operating system however it exits, so a crash cannot lock
     // the user out of their own application.
-    //
-    // The second instance leaves without a word. A dialog would sit there as a
-    // live process until someone dismissed it, which is indistinguishable in a
-    // process list from the duplicate it was meant to prevent.
-    static NamedLock instance("CombatSessionTray", /*tryOnly=*/true);
+    static NamedLock instance("CombatSessionApp", /*tryOnly=*/true);
     if (!instance.held()) return 0;
 
-    // Keep the login item and the settings file in agreement; the user may have
-    // removed the registry value or the LaunchAgent outside the application.
-    config.startAtLogin = GetStartAtLogin();
-
-    TrayApp app(std::move(config));
+    App app;
     return app.Run();
 }
 

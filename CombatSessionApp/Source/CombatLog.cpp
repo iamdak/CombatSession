@@ -167,6 +167,54 @@ bool ParseMapChange(std::string_view payload, MapChange& out) {
     return true;
 }
 
+bool ParseCombatantInfo(std::string_view payload, CombatantInfo& out) {
+    // GUID and faction are the only fields ahead of the arrays, so they can be
+    // taken by splitting the head. Everything after them is stats until the
+    // spec id, which sits immediately before the first bracket.
+    const size_t firstBracket = payload.find('[');
+    const size_t lastBracket  = payload.rfind(']');
+    if (firstBracket == std::string_view::npos) return false;
+
+    std::string_view head = payload.substr(0, firstBracket);
+    std::vector<std::string_view> f;
+    SplitFields(head, f);
+    // guid, faction, 22 stats, specId - and the trailing comma before the
+    // bracket leaves an empty last field, so the spec is the one before it.
+    if (f.size() < 4) return false;
+
+    out.guid = std::string(Unquote(f[0]));
+    if (out.guid.empty() || out.guid == "nil") return false;
+    ToNumber(f[1], out.faction);
+
+    // Walked back from the bracket rather than indexed from the front: the
+    // stat block has changed width between expansions and the spec has always
+    // been the last thing before the talents.
+    for (size_t i = f.size(); i-- > 2; ) {
+        if (f[i].empty()) continue;
+        if (ToNumber(f[i], out.specId)) break;
+    }
+
+    // honorLevel, season, rating, tier - the only fields after the arrays.
+    if (lastBracket != std::string_view::npos && lastBracket + 1 < payload.size()) {
+        std::vector<std::string_view> tail;
+        SplitFields(payload.substr(lastBracket + 1), tail);
+        // The first entry is whatever followed the closing bracket before the
+        // comma, which is empty.
+        std::vector<std::string_view> values;
+        for (const auto& item : tail) {
+            if (!item.empty()) values.push_back(item);
+        }
+        if (values.size() >= 4) {
+            ToNumber(values[0], out.honorLevel);
+            ToNumber(values[1], out.season);
+            ToNumber(values[2], out.rating);
+            ToNumber(values[3], out.tier);
+        }
+    }
+
+    return out.specId != 0;
+}
+
 bool IsRatedBracket(std::string_view bracket) {
     // Verified brackets: "2v2", "Skirmish", "Rated Solo Shuffle". Anything
     // naming itself rated is rated; a skirmish never is. Plain "NvN" is rated

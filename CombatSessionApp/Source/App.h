@@ -1,21 +1,14 @@
 // CombatSession :: App
 //
-// The status-area shell: a notification icon on Windows, a menu bar item on
-// macOS. Watches the Logs folder and runs the generator when a log settles.
+// The application: a window, a notification icon, and a thread watching the
+// Logs folder. Runs until the user quits.
 
 #pragma once
 
-#include "Config.h"
-
-#include <string>
-
 namespace cs {
 
-// Runs until the user quits. Returns the process exit code. Must be called on
-// the main thread.
-int RunTray(Config config);
-
-// Modal folder picker for the flavor directory, usable before the shell exists.
-std::string PromptForWowFolder();
+// Runs the application and returns the process exit code. Must be called on the
+// main thread. A second copy of the program exits immediately and silently.
+int RunApp();
 
 } // namespace cs

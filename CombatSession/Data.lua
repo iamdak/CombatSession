@@ -66,7 +66,28 @@ ns.API = API
 --     disagrees with GetBattlefieldWinner in skirmishes and had a won match
 --     reported as a loss, and a winner that names no side is no longer treated
 --     as one.
-local DEFINES_VERSION = 16
+-- 17: Killing Blows added as a column of its own, alongside three corrections
+--     to what the existing ones count. Feign Death no longer registers as a
+--     death: the client emits UNIT_DIED for it like any other, and the
+--     unconsciousOnDeath field that tells them apart is now carried through.
+--     Damage a unit deals to itself - Ultimate Sacrifice and the like - is no
+--     longer counted as damage done, only as damage taken. And spell schools
+--     ride along in the stream, so a breakdown row can show what kind of damage
+--     it was.
+-- 18: the log is now read for everything it can answer, with the recorder kept
+--     as the preferred source and the log filling what it left out or never
+--     had. COMBATANT_INFO is parsed instead of discarded, which gives arenas a
+--     participant list, each combatant's side, spec id, honor level and
+--     pre-match rating; ARENA_MATCH_END gives the winner and both final
+--     ratings; and dampening is recovered from the largest stack of the debuff
+--     itself. None of it exists in a battleground log, where the recorder
+--     remains the only source.
+-- 19: faction derived from racial abilities. Nothing in a log states Alliance
+--     or Horde - unit flags carry reaction and COMBATANT_INFO carries the arena
+--     team index - but every race is faction-locked, so a cast racial names the
+--     caster's side. Works in battlegrounds, which is where almost nothing else
+--     does.
+local DEFINES_VERSION = 20
 
 --------------------------------------------------------------------------------
 -- Event kinds, mirroring EventKind in StreamWriter.h. Values are persisted in
@@ -149,8 +170,8 @@ end
 
 local FORMAT_COLUMNS = {
     "Damage Done", "Damage Taken", "Healing Done", "Healing Taken",
-    "Overhealing", "Interrupts", "Dispels", "Purges", "Deaths",
-    "CC Done", "CC Taken",
+    "Overhealing", "Interrupts", "Dispels", "Purges",
+    "Deaths", "Killing Blows", "CC Done", "CC Taken",
 }
 
 local COL = {}
@@ -165,6 +186,7 @@ local COLUMN_SIDE = {
     [COL["Interrupts"]]    = "dest",   [COL["Dispels"]]       = "dest",
     [COL["Purges"]]        = "dest",
     [COL["Deaths"]]        = "source",  -- who landed the killing blow
+    [COL["Killing Blows"]] = "dest",    -- who this unit put down
     [COL["CC Done"]]       = "dest",   [COL["CC Taken"]]      = "source",
 }
 
@@ -184,6 +206,15 @@ function API:GetDefines()
         FORMAT  = FORMAT_COLUMNS,
         EVENTS  = { "death" },
     }
+end
+
+-- The application version handshake, for a viewer that has to say so.
+--
+-- Exposed through the API rather than read off the globals directly, so an
+-- alternative viewer gets the comparison already made and cannot arrive at a
+-- different answer than this addon did from the same two numbers.
+function API:AppVersions()
+    return ns.AppVersions()
 end
 
 --------------------------------------------------------------------------------
@@ -827,8 +858,26 @@ function API:Roster(entry, cache, match)
         return best or (match and match.playerFaction)
     end
 
+    -- COMBATANT_INFO, which the log itself carries for an arena and never for a
+    -- battleground. Keyed by name, resolved from GUID when the cache was built.
+    local ci = cache.CI
+    local haveCombatants = false
+    if ci then for _ in pairs(ci) do haveCombatants = true break end end
+
+    local header = cache.header or {}
+
     local haveRoster = match and match.roster and #match.roster > 0
+
+    -- Which faction number is the recording player's. The scoreboard answers it
+    -- when there is one; COMBATANT_INFO answers it from the log by naming the
+    -- recording character's own side, in the same 0/1 numbering ARENA_MATCH_END
+    -- reports the winner in.
     local ownFaction = OwnFaction()
+    if ownFaction == nil and haveCombatants then
+        local ownName = header.character
+        local own = ownName and (ci[ownName] or ci[byBase[BaseName(ownName)] or ""])
+        if own then ownFaction = own.f end
+    end
 
     if haveRoster then
         local own = ownFaction
@@ -839,17 +888,50 @@ function API:Roster(entry, cache, match)
             end
             local unitName = byBase[BaseName(player.name)]
             if unitName then claimed[unitName] = true end
+
+            -- The recorder wins where it has an answer, and the log fills what
+            -- it left out. A scoreboard carries no honor level at all, so that
+            -- one comes from here whenever the log has it.
+            local logged = (unitName and ci and ci[unitName]) or nil
+
             players[#players + 1] = {
                 name   = player.name,
                 unit   = unitName and byName[unitName] or nil,
                 class  = player.class,
                 team   = team,
                 player = player,
+                specId = logged and logged.s or nil,
+                honor  = logged and logged.h or nil,
+                rating = player.rating or (logged and logged.r) or nil,
             }
         end
+
+    elseif haveCombatants then
+        -- No recorder record, but an arena log states its own participants.
+        -- COMBATANT_INFO is emitted once per combatant, so it defines the
+        -- roster as authoritatively as the scoreboard does - and unlike the
+        -- reaction fallback below it needs no activity filter, because it lists
+        -- exactly the people who were in the match.
+        for name, info in pairs(ci) do
+            local unit = byName[name]
+            local team
+            if ownFaction ~= nil and info.f ~= nil then
+                team = (info.f == ownFaction) and 1 or 2
+            end
+            claimed[name] = true
+            players[#players + 1] = {
+                name   = name,
+                unit   = unit,
+                specId = info.s,
+                honor  = info.h,
+                rating = info.r,
+                team   = team,
+            }
+        end
+
     else
-        -- No recorder data, so fall back to reaction flags. Activity is
-        -- required here, since nothing else keeps the aura burst out.
+        -- Neither, so fall back to reaction flags. Activity is required here,
+        -- since nothing else keeps the aura burst out.
         for _, unit in ipairs(units) do
             if unit.kind == "player" and HasActivity(unit) then
                 local team = (unit.reaction == "friendly") and 1
@@ -862,7 +944,7 @@ function API:Roster(entry, cache, match)
         end
     end
 
-    if haveRoster then
+    if haveRoster or haveCombatants then
         for _, unit in ipairs(units) do
             if unit.kind == "player" and not claimed[unit.name] and HasActivity(unit) then
                 -- Fought but absent from the scoreboard: left early, or was
@@ -896,7 +978,12 @@ function API:Roster(entry, cache, match)
         -- Only 0 and 1 name a side. GetBattlefieldWinner reports 0xFFFFFFFF for
         -- a match that ended without one, which arrives in Lua as a large
         -- positive number and sailed straight through a ">= 0" test.
+        --
+        -- ARENA_MATCH_END is the log's own answer and stands in when there is no
+        -- recorder record. Its -1 means a Solo Shuffle lobby, which has no
+        -- single winner, and is rejected by the same test.
         local winner = match and match.winner
+        if winner == nil then winner = header.winner end
         if winner == 0 or winner == 1 then
             teams[1].won = (winner == teams[1].side)
             teams[2].won = (winner == teams[2].side)
@@ -905,7 +992,7 @@ function API:Roster(entry, cache, match)
         -- Rating and MMR come from GetBattlefieldTeamInfo, which the recorder
         -- stores indexed by arena team id. Only a rated match populates them.
         for i = 1, 2 do
-            local info = match.teams and teams[i].side ~= nil
+            local info = match and match.teams and teams[i].side ~= nil
                      and match.teams[teams[i].side + 1]
             if info then
                 teams[i].teamName = info.name
@@ -913,6 +1000,30 @@ function API:Roster(entry, cache, match)
                 teams[i].mmr      = info.mmr
                 if info.newRating and info.oldRating then
                     teams[i].ratingChange = info.newRating - info.oldRating
+                end
+            end
+        end
+
+        -- The log's ratings, for the sides the recorder did not describe.
+        -- ARENA_MATCH_END reports both teams' NEW ratings indexed by the same
+        -- 0/1 side; the change is recoverable because COMBATANT_INFO carries
+        -- what each player's rating was before the match. MMR is in neither, so
+        -- it stays absent rather than being guessed at.
+        for i = 1, 2 do
+            local side = teams[i].side
+            if teams[i].rating == nil and side ~= nil then
+                local rating = (side == 0) and header.rating1 or header.rating2
+                if rating and rating > 0 then
+                    teams[i].rating = rating
+
+                    local before
+                    for _, row in ipairs(players) do
+                        if row.team == i and row.rating and row.rating > 0 then
+                            before = row.rating
+                            break
+                        end
+                    end
+                    if before then teams[i].ratingChange = rating - before end
                 end
             end
         end
@@ -975,6 +1086,10 @@ function API:Breakdown(cache, index, col)
                     id      = id,
                     spellId = (cache.SX and cache.SX[id]) or id,
                     name    = (cache.SP and cache.SP[id]) or ("spell " .. id),
+                    -- Nil for a session cached before schools were recorded,
+                    -- which the viewer draws as no school icon rather than as
+                    -- a wrong one.
+                    school  = cache.SS and cache.SS[id] or nil,
                     v       = spells[i + 2],
                     n       = spells[i + 3],
                     mn      = spells[i + 4],
@@ -1041,7 +1156,9 @@ function API:BuildCache(key, onDone, onProgress)
     -- GUIDs a battleground creates for identically named creatures into one
     -- entry. The stream's numeric indices stay an encoding detail.
     local nameOf = {}   -- stream unit index -> name it contributes to
+    local nameByGuid = {}   -- unit GUID -> that same name
     local rawKind = {}  -- stream unit index -> what THAT unit is, before rollup
+    local rawReact = {} -- stream unit index -> that unit's own reaction, ditto
     local UNITS = {}
 
     local function UnitEntry(name)
@@ -1091,10 +1208,33 @@ function API:BuildCache(key, onDone, onProgress)
         end
         nameOf[i] = name
         rawKind[i] = UnitKind(u[3])
+        rawReact[i] = UnitReaction(u[3])
+        -- GUID to the name its output lands under, which is what lets
+        -- COMBATANT_INFO join: it identifies people by GUID and the cache
+        -- stores units by name and keeps no GUID of its own.
+        nameByGuid[u[1]] = name
 
         -- An orphan whose owner never appeared standalone still needs an entry.
         local entry = UnitEntry(name)
         if not entry.guid then SetIdentity(entry, u) end
+    end
+
+    -- COMBATANT_INFO, rekeyed from GUID to unit name. The chunk identifies
+    -- combatants by GUID because that is what the log does; the cache stores
+    -- units by name and carries no GUID at all, so the join is resolved once
+    -- here rather than being impossible later.
+    --
+    -- Empty for every battleground, which emits none of these.
+    local CI = nil
+    for _, c in ipairs(stream.combatants or {}) do
+        local name = nameByGuid[c[1]]
+        if name then
+            CI = CI or {}
+            -- f faction (0 or 1), s spec id, h honor level, r rating before
+            -- the match. Season and tier are carried by the log and dropped
+            -- here: nothing reads them.
+            CI[name] = { f = c[2], s = c[3], h = c[4], r = c[6] }
+        end
     end
 
     local t, k   = stream.t,  stream.k
@@ -1111,6 +1251,7 @@ function API:BuildCache(key, onDone, onProgress)
     local interruptCol, dispelCol = COL["Interrupts"], COL["Dispels"]
     local purgeCol            = COL["Purges"]
     local deathCol            = COL["Deaths"]
+    local kbCol               = COL["Killing Blows"]
     local ccDone, ccTaken     = COL["CC Done"], COL["CC Taken"]
 
     local categoryOf = ns.SpellCategory
@@ -1120,6 +1261,18 @@ function API:BuildCache(key, onDone, onProgress)
     -- Keyed by victim name then spell id.
     local openCC = {}
 
+    -- Dampening is an ordinary stacking debuff, one stack per point, so the
+    -- largest dose anyone reached is the figure the match ended on. That makes
+    -- it the one piece of arena state recoverable from a log with no help from
+    -- the client at all.
+    local DAMPENING = 110310
+    local maxDampening = 0
+
+    -- Faction by player name, from the racials they cast. The only account a
+    -- log gives of which side anyone actually plays - see Spells.lua.
+    local racialOf = ns.RACIAL_FACTION or {}
+    local factionOf = nil
+
     -- Adds to a total and, when the column names a counterpart, to that unit's
     -- per-counterpart breakdown.
     -- Spell names are held once per session and referenced by id, rather than
@@ -1127,6 +1280,12 @@ function API:BuildCache(key, onDone, onProgress)
     -- against twenty counterparts for twenty players, repeating the strings
     -- would dominate the stored cache.
     local spellNames = { [0] = "Melee" }
+
+    -- Spell school mask, as the stream carries it. A melee swing has no spell
+    -- and so no school field; it is physical by definition, which is what the
+    -- zero slot stands for. Older chunks predate the field entirely and simply
+    -- leave this empty, which reads downstream as "school unknown".
+    local spellSchools = { [0] = 1 }
 
     -- A dispel row reads "<aura removed> (<spell used>)", so the pair needs one
     -- id to key the breakdown by - the stored format carries a single spell id
@@ -1226,10 +1385,34 @@ function API:BuildCache(key, onDone, onProgress)
             local spellId    = spellRow and spellRow[1] or 0
             if spellRow and spellNames[spellId] == nil then
                 spellNames[spellId] = spellRow[2]
+                spellSchools[spellId] = spellRow[3]
             end
 
             if IS_DAMAGE[kind] then
-                if srcName then Add(UnitEntry(srcName), dmgDone, dstName, amount, 1, spellId) end
+                -- Damage that never crossed the line between the two sides is
+                -- not output. Ultimate Sacrifice, Touch of Karma and the rest
+                -- were being counted twice - once as done and once as taken -
+                -- which credited a player with damage nobody else ever
+                -- received. It is real damage and it is still counted where it
+                -- landed, which is Damage Taken.
+                --
+                -- Self-damage is the obvious case, but not the only one: a
+                -- Lightsmith paladin's Tempered in Battle damages the paladin's
+                -- own allies to fuel its healing, and every one of its damage
+                -- events in the reference log named two units on the same team.
+                -- Testing the reaction rather than the name covers both, and
+                -- covers whatever the next expansion invents, without a spell
+                -- list to maintain. Sides come from the log's own flags, which
+                -- describe everyone relative to the recording player, so
+                -- hostile-on-hostile is the enemy team hitting itself exactly
+                -- as friendly-on-friendly is ours.
+                local reflexive = srcName ~= nil and dstName ~= nil
+                    and (srcName == dstName
+                         or rawReact[s[i]] == rawReact[d[i]])
+
+                if srcName and not reflexive then
+                    Add(UnitEntry(srcName), dmgDone, dstName, amount, 1, spellId)
+                end
                 if dstName then Add(UnitEntry(dstName), dmgTaken, srcName, amount, 1, spellId) end
 
                 -- Overkill above zero marks the killing blow, and is the only
@@ -1242,6 +1425,15 @@ function API:BuildCache(key, onDone, onProgress)
                 -- killer. The total may therefore exceed the breakdown.
                 if ov[i] > 0 and dstName and rawKind[d[i]] == "player" then
                     AddBreakdown(UnitEntry(dstName), deathCol, srcName, 1, 1, spellId)
+
+                    -- The same event read from the other end. Killing Blows is
+                    -- the count of these, which is why it can differ from the
+                    -- sum of everyone else's Deaths: a kill with no overkill
+                    -- behind it is a death with no killer. Dying to your own
+                    -- spell is not a killing blow for anyone.
+                    if srcName and not reflexive then
+                        Add(UnitEntry(srcName), kbCol, dstName, 1, 1, spellId)
+                    end
                 end
 
             elseif IS_HEAL[kind] then
@@ -1334,6 +1526,24 @@ function API:BuildCache(key, onDone, onProgress)
                     end
                 end
 
+            elseif kind == K.CAST_SUCCESS then
+                local spellIndex = sp[i]
+                local cast = spellIndex ~= 0 and spells[spellIndex]
+                             and spells[spellIndex][1] or nil
+                local faction = cast and racialOf[cast]
+                if faction and srcName then
+                    factionOf = factionOf or {}
+                    factionOf[srcName] = faction
+                end
+
+            elseif kind == K.AURA_APPLIED_DOSE then
+                local spellIndex = sp[i]
+                local dosed = spellIndex ~= 0 and spells[spellIndex]
+                              and spells[spellIndex][1] or nil
+                if dosed == DAMPENING and amount > maxDampening then
+                    maxDampening = amount
+                end
+
             elseif kind == K.UNIT_DIED then
                 -- Only units that are themselves players.
                 --
@@ -1344,7 +1554,20 @@ function API:BuildCache(key, onDone, onProgress)
                 -- still used for the entry, so a pet death would land on the
                 -- player - the guard has to be on what the unit IS, before the
                 -- rollup, which is what rawKind carries.
-                if dstName and rawKind[d[i]] == "player" then
+                --
+                -- Feign Death is the other thing this guard keeps out. It writes
+                -- a genuine UNIT_DIED for a hunter who is still standing, and
+                -- the only thing separating the two is the unconsciousOnDeath
+                -- field the application carries here in the amount column.
+                --
+                -- Not detected from the aura, which was the obvious approach and
+                -- is wrong: the talent that grants it applies Survival Tactics
+                -- (202748) rather than Feign Death (5384), so watching for the
+                -- named spell finds nothing. A chunk written before the field
+                -- existed reads zero and counts the death, which is what it
+                -- did before.
+                local unconscious = am[i] == 1
+                if dstName and rawKind[d[i]] == "player" and not unconscious then
                     Add(UnitEntry(dstName), deathCol, nil, 1, 1)
                     events[#events + 1] = {
                         name = "death", t = t[i], unit = dstName, at = i,
@@ -1371,12 +1594,18 @@ function API:BuildCache(key, onDone, onProgress)
                 -- and compaction may have dropped the rest. Composites carry a
                 -- second entry pointing at the real spell they lead with, kept
                 -- on the same "only if still referenced" basis.
-                local usedSpells, usedComposites = {}, {}
+                local usedSpells, usedComposites, usedSchools = {}, {}, {}
                 local function Keep(id)
                     usedSpells[id] = spellNames[id] or ("spell " .. id)
+                    local school = spellSchools[id]
                     if compositeSpell[id] then
                         usedComposites[id] = compositeSpell[id]
+                        -- A composite is a label over a pair, so it has no
+                        -- school of its own; it borrows the one belonging to
+                        -- the spell it leads with.
+                        school = school or spellSchools[compositeSpell[id]]
                     end
+                    if school then usedSchools[id] = school end
                 end
 
                 for _, unit in pairs(U) do
@@ -1403,6 +1632,12 @@ function API:BuildCache(key, onDone, onProgress)
                     E  = E,           -- death events, flat context runs
                     SP = usedSpells,      -- [spellId] = name
                     SX = usedComposites,  -- [syntheticId] = the real spell
+                    SS = usedSchools,     -- [spellId] = school mask
+                    CI = CI,              -- [name] = combatant info, arena only
+                    FA = factionOf,       -- [name] = "Alliance" or "Horde"
+                    -- Highest dampening stack anyone reached, or nil outside an
+                    -- arena where the debuff never exists.
+                    dampening = maxDampening > 0 and maxDampening or nil,
                     -- The chunk is deleted by the application once consumed, so
                     -- everything the viewer needs has to be copied in here.
                     header     = stream.header,
@@ -1428,6 +1663,29 @@ end
 -- addon and therefore loads after it, so the index does not exist yet at
 -- ADDON_LOADED time.
 ns:RegisterEvent("PLAYER_LOGIN", function()
+    -- First, because it is the one thing here that still has to happen when
+    -- the versions disagree - it is how the application finds out that they do.
+    ns:RecordAppVersion()
+
+    -- Said once at login, in full, because chat is where a user can read a
+    -- sentence and an address without the room a window has. The viewer's title
+    -- bar carries the short form for anyone who missed it.
+    local versions = ns.AppVersions()
+    if versions.state == "addon" then
+        ns:Print("|cffff5555the addon is out of date.|r "
+            .. ("It was built for CombatSession %s and the application is %s. ")
+               :format(versions.expectedText, versions.currentText)
+            .. "|cffffffffUpdate CombatSession in your addon manager|r, or get it "
+            .. "from |cff66bbffcurseforge.com/wow/addons/combatsession|r, then /reload.")
+    elseif versions.state == "app" then
+        ns:Print("|cffff5555the CombatSession application is out of date.|r "
+            .. ("You are running %s and this addon needs %s or later. ")
+               :format(versions.currentText, versions.expectedText)
+            .. "|cffffffffOpen the CombatSession application and click "
+            .. "\"Get the App (GitHub)\"|r at the bottom of its window - it will "
+            .. "walk you through replacing it.")
+    end
+
     DropStaleCaches()
     API:ProcessPending(function(processed, skipped)
         if processed == 0 then return end

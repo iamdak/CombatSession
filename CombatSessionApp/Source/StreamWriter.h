@@ -79,7 +79,7 @@ enum class EventKind : uint8_t {
     SpellPurge,
 };
 
-inline constexpr int kStreamVersion = 4;
+inline constexpr int kStreamVersion = 6;
 
 EventKind ClassifyEventKind(std::string_view event);
 
@@ -125,13 +125,23 @@ public:
 
 private:
     int32_t InternUnit(std::string_view guid, std::string_view name, uint32_t flags);
-    int32_t InternSpell(int32_t spellId, std::string_view name);
+    int32_t InternSpell(int32_t spellId, std::string_view name, uint32_t school);
 
     std::vector<StreamUnit> units_;
     std::unordered_map<std::string, int32_t> unitIndex_;
 
+    // COMBATANT_INFO rows, deduplicated by GUID. A Solo Shuffle lobby emits a
+    // fresh set per round and nothing in them changes between rounds, so the
+    // last seen wins rather than the table growing a copy per round.
+    std::vector<CombatantInfo> combatants_;
+    std::unordered_map<std::string, size_t> combatantIndex_;
+
     std::vector<int32_t>     spellIds_;
     std::vector<std::string> spellNames_;
+    // Spell school mask (SCHOOL_MASK_*), a property of the spell rather than of
+    // the event, so it is interned once beside the name instead of costing a
+    // column across every event in the session.
+    std::vector<uint8_t>     spellSchools_;
     std::unordered_map<int32_t, int32_t> spellIndex_;
 
     // Parallel event columns. Every vector is kept the same length.

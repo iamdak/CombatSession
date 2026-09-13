@@ -64,7 +64,11 @@ function Model:SessionLabel(entry)
         name = ("%s  |cff888888round %d|r"):format(name, entry.round)
     end
 
-    local who = ns.ShortName(entry.character or "")
+    -- Class-coloured, which is how a player picks their own character out of a
+    -- list of several without reading any of the names.
+    local class = self:SessionCharacter(entry)
+    local who = ns.Colorize(ns.ShortName(entry.character or ""), class)
+
     local mark = self:OutcomeMark(entry)
     if mark then who = who .. "  " .. mark end
 
@@ -79,32 +83,116 @@ end
 -- disagree about who won: the faction numbering the scoreboard reports for you
 -- is not reliable, and Roster derives it from the log instead.
 --
+-- Everything the session list needs about a row that is not already in the
+-- index header: the outcome, and who the recording character was.
+--
+-- One cached lookup rather than three, because each of them costs a cache read,
+-- a match join and a roster build - and the list asks for all of them for every
+-- row it draws. Fields are false rather than nil when absent so a miss is still
+-- a cache hit.
+--
 -- Cached per session, and only ever asked for the handful of rows on screen.
-function Model:OutcomeMark(entry)
-    state.outcomes = state.outcomes or {}
-    local hit = state.outcomes[entry.key]
-    if hit ~= nil then return hit or nil end
+local function SessionInfo(entry)
+    state.info = state.info or {}
+    local hit = state.info[entry.key]
+    if hit then return hit end
 
     local api = ns:API()
     local cache = api and api:GetCache(entry.key)
     local match = api and api:GetMatch(entry)
 
-    local mark = false
-    if cache and match then
+    local info = { mark = false, class = false, faction = false }
+
+    -- Roster is nil-safe about the match record and falls back to the log's own
+    -- ARENA_MATCH_END, so this runs on the cache alone.
+    if cache then
         local _, teams = api:Roster(entry, cache, match)
         if teams[1].won ~= nil or teams[2].won ~= nil then
             if teams[1].won == false and teams[2].won == false then
-                mark = "|cffcccc66(D)|r"
+                info.mark = "|cffcccc66(D)|r"
             elseif teams[1].won then
-                mark = "|cff66ff66(W)|r"
+                info.mark = "|cff66ff66(W)|r"
             else
-                mark = "|cffff6666(L)|r"
+                info.mark = "|cffff6666(L)|r"
             end
         end
     end
 
-    state.outcomes[entry.key] = mark
-    return mark or nil
+    if match then
+        -- Recorded at the start of the match rather than read now, because the
+        -- list shows sessions from every character on the account and the one
+        -- logged in is rarely the one that played them.
+        info.faction = match.playerFactionGroup or false
+
+        -- The scoreboard names the recording player without their realm when it
+        -- matches yours, so the join is on the base name like everywhere else.
+        local wanted = BaseName(entry.character or "")
+        for _, player in ipairs(match.roster or {}) do
+            if BaseName(player.name or "") == wanted then
+                info.class = player.class or false
+                break
+            end
+        end
+    end
+
+    local character = (cache and cache.header and cache.header.character)
+                      or entry.character or ""
+
+    -- Failing that, the log's own combatant list. It carries a spec id, which
+    -- yields the class, so an arena still colours its row with no recorder
+    -- record behind it at all.
+    if not info.class and cache and cache.CI then
+        local own = cache.CI[character]
+        local byId = own and ns.SpecById(own.s)
+        info.class = (byId and byId.class) or false
+    end
+
+    -- And the faction from whatever racial they were seen to cast, in this
+    -- session or in any other. A character's faction does not change, so one
+    -- sighting anywhere answers for all of their sessions - which matters
+    -- because plenty of matches go by without anyone pressing a racial.
+    if not info.faction then
+        info.faction = Model:FactionOf(character) or false
+    end
+
+    state.info[entry.key] = info
+    return info
+end
+
+-- Faction by character name, pooled across every cache held.
+--
+-- Built once and kept: it reads a small table off each cache rather than
+-- walking any session's events, and the answer cannot change while the client
+-- is running except by a session being added, which drops this with the rest of
+-- the session info.
+function Model:FactionOf(name)
+    if not name or name == "" then return nil end
+
+    if not state.factions then
+        local map = {}
+        local api = ns:API()
+        for _, entry in ipairs((api and api:GetViewable()) or {}) do
+            local cache = api:GetCache(entry.key)
+            for who, faction in pairs((cache and cache.FA) or {}) do
+                map[who] = faction
+            end
+        end
+        state.factions = map
+    end
+
+    return state.factions[name] or state.factions[BaseName(name)]
+end
+
+function Model:OutcomeMark(entry)
+    return SessionInfo(entry).mark or nil
+end
+
+-- Class token and faction group ("Alliance"/"Horde") of the character who
+-- recorded a session, or nil for either when the match predates the recorder
+-- storing it.
+function Model:SessionCharacter(entry)
+    local info = SessionInfo(entry)
+    return info.class or nil, info.faction or nil
 end
 
 function Model:Select(key)
@@ -119,7 +207,10 @@ function Model:Select(key)
     state.match        = nil
     state.players      = nil
     state.teams        = nil
-    state.outcomes     = nil
+    -- Dropped rather than kept: a session whose chunk was consumed since the
+    -- list was last drawn now has an outcome where it had none.
+    state.info         = nil
+    state.factions     = nil
 
     local api = ns:API()
     if not (api and key) then return end
@@ -140,11 +231,24 @@ function Model:Select(key)
     -- keeps it, and a counterpart can arrive in either form.
     state.classByName = {}
     for _, player in ipairs(state.players) do
-        if player.class then
-            state.classByName[player.name] = player.class
-            state.classByName[BaseName(player.name)] = player.class
-            if player.unit then state.classByName[player.unit.name] = player.class end
+        -- The log's spec id yields a class too, so a session with no scoreboard
+        -- behind it still colours its counterpart rows.
+        local byId = ns.SpecById(player.specId)
+        local class = player.class or (byId and byId.class)
+        if class then
+            state.classByName[player.name] = class
+            state.classByName[BaseName(player.name)] = class
+            if player.unit then state.classByName[player.unit.name] = class end
         end
+    end
+
+    -- Honor levels, joined the same way and for the same reason: the recorder
+    -- writes whatever name the client gave it, which drops the realm for your
+    -- own, while the log always carries one.
+    state.honorByName = {}
+    for name, level in pairs((state.match and state.match.honor) or {}) do
+        state.honorByName[name] = level
+        state.honorByName[BaseName(name)] = level
     end
 
     if ns.db then ns.db.lastKey = key end
@@ -158,10 +262,58 @@ function Model:ClassOf(name)
     return map[name] or map[BaseName(name)]
 end
 
+-- Honor level for a name, or nil for anyone the recorder never had a unit token
+-- for - most of the opposing side, usually - and for every session recorded
+-- before honor was captured at all.
+function Model:HonorOf(name)
+    local map = state.honorByName
+    if not map then return nil end
+    return map[name] or map[BaseName(name)]
+end
+
 function Model:Selected()   return state.key end
 function Model:Cache()      return state.cache end
 function Model:Entry()      return state.entry end
 function Model:Teams()      return state.teams end
+function Model:Match()      return state.match end
+
+-- Recorder first, then the log's own account: the recorder sampled the aura
+-- while the match ran, and the cache derived the same figure from the largest
+-- stack the debuff reached. They should agree; where only one exists, that one
+-- stands.
+-- How long the match ran, in seconds.
+--
+-- Three sources, in descending order of how directly they measure it. The
+-- recorder asked the client outright. ARENA_MATCH_END is the log's own figure -
+-- but for a Solo Shuffle lobby it reports the FINAL ROUND rather than the
+-- lobby, so it is not trusted for a session that is a round of one. Failing
+-- both, the span the session covers, which includes the gates opening and is
+-- therefore the loosest of the three.
+function Model:Duration()
+    local match = state.match
+    if match and match.duration and match.duration > 0 then
+        return match.duration
+    end
+
+    local entry  = state.entry
+    local header = state.cache and state.cache.header
+    local isRound = entry and entry.round and entry.round > 0
+
+    if header and header.duration and header.duration > 0 and not isRound then
+        return header.duration
+    end
+
+    if entry and entry.startTime and entry.endTime then
+        local span = entry.endTime - entry.startTime
+        if span > 0 then return span end
+    end
+    return nil
+end
+
+function Model:Dampening()
+    if state.match and state.match.dampening then return state.match.dampening end
+    return state.cache and state.cache.dampening or nil
+end
 
 function Model:Columns()
     local cache = state.cache
@@ -178,20 +330,39 @@ end
 -- Sorting
 --------------------------------------------------------------------------------
 
+-- Column 0 is the name column, which is a sort but not a measure: there is no
+-- quantity behind it, so it cannot be what the bars are drawn against. The last
+-- numeric column chosen stays the bar column while a name sort is in effect,
+-- which is what keeps the grid readable when the order is alphabetical.
+local NAME_COL = 0
+ns.NAME_COL = NAME_COL
+
 function Model:SetSort(col)
     if state.sortCol == col then
         state.sortAsc = not state.sortAsc
     else
         state.sortCol = col
-        state.sortAsc = false        -- a new column always starts largest-first
+        -- Largest-first for a measure; A to Z for a name, which is the only
+        -- direction anyone means by "sort by name".
+        state.sortAsc = (col == NAME_COL)
     end
+    if col ~= NAME_COL then state.barCol = col end
+
     if ns.db then
         ns.db.sortCol = state.sortCol
         ns.db.sortAsc = state.sortAsc
+        ns.db.barCol  = state.barCol
     end
 end
 
 function Model:Sort() return state.sortCol, state.sortAsc end
+
+-- The column the bars are scaled against, which is the sort column unless the
+-- sort is alphabetical.
+function Model:BarColumn()
+    if state.sortCol ~= NAME_COL then return state.sortCol end
+    return state.barCol or 1
+end
 
 -- Saved settings are read at load; the model is built before them, so the sort
 -- has to be pulled across rather than assumed.
@@ -199,6 +370,9 @@ function Model:RestoreSort()
     if not ns.db then return end
     state.sortCol = ns.db.sortCol or 1
     state.sortAsc = ns.db.sortAsc or false
+    state.barCol  = ns.db.barCol
+        or (state.sortCol ~= NAME_COL and state.sortCol)
+        or 1
 end
 
 local function SortValue(row, col)
@@ -281,12 +455,28 @@ function Model:Rows()
     if not (cache and state.players) then return rows end
 
     local api = ns:API()
-    local col, asc = state.sortCol, state.sortAsc
+    local sortCol, asc = state.sortCol, state.sortAsc
+    -- The measure, which is the sort unless the sort is by name.
+    local col = self:BarColumn()
+
+    -- Realm-stripped and case-folded, so an alphabetical sort reads the way the
+    -- names are drawn rather than the way they are stored: "aiden-Ravencrest"
+    -- belongs beside "Aiden", not before every capital letter in the list.
+    local function NameKey(player)
+        return (ns.ShortName(player.name or "") or ""):lower()
+    end
 
     local order = {}
     for _, player in ipairs(state.players) do order[#order + 1] = player end
     table.sort(order, function(a, b)
-        local av, bv = SortValue(a, col), SortValue(b, col)
+        if sortCol == ns.NAME_COL then
+            local an, bn = NameKey(a), NameKey(b)
+            if an == bn then return (a.name or "") < (b.name or "") end
+            if asc then return an < bn end
+            return an > bn
+        end
+
+        local av, bv = SortValue(a, sortCol), SortValue(b, sortCol)
         if av == bv then return (a.name or "") < (b.name or "") end
         if asc then return av < bv end
         return av > bv
@@ -307,11 +497,20 @@ function Model:Rows()
     end
 
     for _, player in ipairs(order) do
+        local byId = ns.SpecById(player.specId)
+
         rows[#rows + 1] = {
             kind     = "unit",
             name     = player.name,
-            class    = player.class,
-            spec     = player.player and player.player.spec or nil,
+            -- Recorder first, log second, for every one of these. The
+            -- scoreboard names a spec in the client's language; the log names
+            -- it by id, which also yields the class. Honor is the reverse: the
+            -- scoreboard has none at all, so the log usually answers it.
+            class    = player.class or (byId and byId.class) or nil,
+            spec     = (player.player and player.player.spec)
+                       or (byId and byId.name) or nil,
+            specId   = player.specId,
+            honor    = self:HonorOf(player.name) or player.honor,
             team     = player.team,
             -- Set only for a player the scoreboard does not list. They are shown
             -- on the side their reaction implies, but marked as not counted.
@@ -344,7 +543,8 @@ function Model:Rows()
                     local slot = totals[use.name]
                     if not slot then
                         slot = { name = use.name, id = use.id,
-                                 spellId = use.spellId, v = 0, n = 0 }
+                                 spellId = use.spellId, school = use.school,
+                                 v = 0, n = 0 }
                         totals[use.name] = slot
                         spellOrder[#spellOrder + 1] = slot
                     end

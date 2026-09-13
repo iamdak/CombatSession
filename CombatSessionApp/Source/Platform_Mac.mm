@@ -75,17 +75,11 @@ void PrepareForModal() {
 // Process
 //------------------------------------------------------------------------------
 
-// Nothing to hand back. A process here inherits a terminal or it does not, and
-// the subsystem trick that makes this necessary on Windows has no equivalent -
-// a command line run blocks because the shell waits for the process, and a
-// launched application does not because nothing is waiting.
-void ReleaseConsole() {}
-
 fs::path ExecutablePath() {
     uint32_t size = 0;
     _NSGetExecutablePath(nullptr, &size);
 
-    std::vector<char> buffer(size + 1, '\0');
+    std::vector<char> buffer(size + 1, (char)0);
     if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
 
     // Resolves symlinks and any ".." the launcher left in the path, so the
@@ -129,13 +123,22 @@ NamedLock::~NamedLock() {
 // Shell
 //------------------------------------------------------------------------------
 
+// The alert sound the user chose in System Settings. Never missing, follows
+// whatever they picked, and means the application ships no audio of its own.
+void PlayDefaultAlert() {
+    NSBeep();
+}
+
 void PlaySoundFile(const std::string& path) {
-    if (path.empty()) return;
+    if (path.empty()) {
+        PlayDefaultAlert();
+        return;
+    }
 
     @autoreleasepool {
         // A file first, then a named system sound - so a settings file carried
         // over from Windows, or one naming a sound this Mac does not have,
-        // still makes the noise it was asked for rather than nothing.
+        // still makes a noise rather than nothing.
         NSSound* sound = [[NSSound alloc] initWithContentsOfFile:Str(path)
                                                      byReference:YES];
         if (!sound) {
@@ -147,8 +150,15 @@ void PlaySoundFile(const std::string& path) {
             [sound play];
             return;
         }
-        NSBeep();
     }
+    PlayDefaultAlert();
+}
+
+// NSBeep is the system alert sound - the one the user picked in Sound
+// preferences - which is as close as macOS has to "the error noise" and is what
+// every other application uses to say the same thing.
+void PlayErrorAlert() {
+    NSBeep();
 }
 
 void OpenFolder(const fs::path& dir) {
@@ -158,19 +168,48 @@ void OpenFolder(const fs::path& dir) {
     }
 }
 
-void ShowMessage(const std::string& title, const std::string& text,
-                 bool warning) {
+// See the Windows note: the scheme check is what keeps this from being a
+// general "open anything" hole for the sake of two compiled-in addresses.
+void OpenUrl(const std::string& url) {
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return;
+    @autoreleasepool {
+        NSURL* target = [NSURL URLWithString:Str(url)];
+        if (target) [[NSWorkspace sharedWorkspace] openURL:target];
+    }
+}
+
+bool Confirm(const std::string& title, const std::string& text) {
     @autoreleasepool {
         PrepareForModal();
 
         NSAlert* alert = [[NSAlert alloc] init];
         alert.messageText     = Str(title);
         alert.informativeText = Str(text);
-        alert.alertStyle      = warning ? NSAlertStyleWarning
-                                        : NSAlertStyleInformational;
-        [alert runModal];
+        alert.alertStyle      = NSAlertStyleWarning;
+        [alert addButtonWithTitle:@"Continue"];
+        [alert addButtonWithTitle:@"Cancel"];
+
+        // The first button added is NSAlertFirstButtonReturn; anything else,
+        // including closing the panel, is a no.
+        return [alert runModal] == NSAlertFirstButtonReturn;
     }
 }
+
+bool ConfirmAction(const std::string& title, const std::string& text) {
+    @autoreleasepool {
+        PrepareForModal();
+
+        NSAlert* alert = [[NSAlert alloc] init];
+        alert.messageText     = Str(title);
+        alert.informativeText = Str(text);
+        alert.alertStyle      = NSAlertStyleInformational;
+        [alert addButtonWithTitle:@"OK"];
+        [alert addButtonWithTitle:@"Cancel"];
+
+        return [alert runModal] == NSAlertFirstButtonReturn;
+    }
+}
+
 
 std::string PickFolder(const std::string& title) {
     @autoreleasepool {
@@ -260,33 +299,5 @@ bool GetStartAtLogin() {
 }
 
 const char* StartAtLoginLabel() { return "Open at Login"; }
-
-//------------------------------------------------------------------------------
-// Defaults
-//------------------------------------------------------------------------------
-
-std::string DefaultAlertSound() {
-    // Shipped with every macOS and unlikely to be the sound anything else uses
-    // for something routine.
-    static const char* kCandidates[] = {
-        "/System/Library/Sounds/Glass.aiff",
-        "/System/Library/Sounds/Ping.aiff",
-        "/System/Library/Sounds/Submarine.aiff",
-    };
-
-    std::error_code ec;
-    for (const char* candidate : kCandidates) {
-        if (fs::exists(candidate, ec)) return candidate;
-    }
-    return {};
-}
-
-std::vector<fs::path> DefaultWowRoots() {
-    std::vector<fs::path> roots = {
-        "/Applications/World of Warcraft",
-    };
-    roots.push_back(HomeDir() / "Applications" / "World of Warcraft");
-    return roots;
-}
 
 } // namespace cs

@@ -215,3 +215,67 @@ ns.SpellCategories = {
 function ns:CategoryOf(spellId)
     return T[spellId]
 end
+
+--------------------------------------------------------------------------------
+-- Racial abilities, by faction
+--
+-- Nothing in a combat log says Alliance or Horde. Unit flags carry reaction -
+-- friendly or hostile to whoever was recording - and COMBATANT_INFO's faction
+-- field is the arena team index, 0 or 1, not a faction. So the only account a
+-- log gives of which side someone actually plays is what they cast: every race
+-- is faction-locked and every racial belongs to one race.
+--
+-- Every id below was taken from this project's own 12.1.0 captures rather than
+-- written from memory, and validated by co-occurrence: across every player who
+-- cast one, not one cast two racials belonging to different races. That check
+-- is also what rejected three other spells named "Berserking" - weapon procs
+-- that apply a buff but are never cast, so only the Troll racial survives.
+--
+-- Pandaren are deliberately absent. They choose a faction at level ten, so
+-- Quaking Palm (107079) says nothing about which one.
+--
+-- Read only from SPELL_CAST_SUCCESS. A racial can be applied as an aura by
+-- other means; being cast is what identifies the caster.
+--------------------------------------------------------------------------------
+
+local HORDE    = "Horde"
+local ALLIANCE = "Alliance"
+
+local RACIAL = {}
+
+local function Racials(faction, ids)
+    for _, id in ipairs(ids) do RACIAL[id] = faction end
+end
+
+-- Blood Fury, War Stomp, Berserking, Will of the Forsaken, Cannibalize,
+-- Arcane Torrent, Rocket Jump, Arcane Pulse, Bull Rush, Ancestral Call,
+-- Regeneratin', Bag of Tricks.
+Racials(HORDE, {
+    20572, 33697, 33702,                                  -- Orc
+    20549,                                                -- Tauren
+    26297,                                                -- Troll
+    7744, 20577, 20578,                                   -- Undead
+    28730, 25046, 69179, 80483, 155145, 202719, 232633,   -- Blood Elf
+    69070,                                                -- Goblin
+    260364, 260369,                                       -- Nightborne
+    255654, 255723,                                       -- Highmountain Tauren
+    274738,                                               -- Mag'har Orc
+    291944,                                               -- Zandalari Troll
+    312411,                                               -- Vulpera
+})
+
+-- Shadowmeld, Escape Artist, Gift of the Naaru, Stoneform, Darkflight,
+-- Spatial Rift, Haymaker, Fireblood, Light's Judgment.
+Racials(ALLIANCE, {
+    58984,                                                -- Night Elf
+    20589,                                                -- Gnome
+    28880, 59542, 59543, 59545, 59547, 59548,             -- Draenei
+    65116,                                                -- Dwarf
+    68992,                                                -- Worgen
+    256948, 257040,                                       -- Void Elf
+    287712,                                               -- Kul Tiran
+    273104,                                               -- Dark Iron Dwarf
+    255647, 256893,                                       -- Lightforged Draenei
+})
+
+ns.RACIAL_FACTION = RACIAL

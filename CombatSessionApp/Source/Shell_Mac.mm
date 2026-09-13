@@ -6,9 +6,10 @@
 // menu must be touched only on the main thread, so Update marshals; and AppKit
 // owns the event loop, so Run is [NSApp run] rather than a loop of our own.
 
-#include "Tray.h"
+#include "Shell.h"
 
 #include "Icon.h"
+#include "Platform.h"
 
 #import <Cocoa/Cocoa.h>
 
@@ -78,7 +79,7 @@ NSImage* MakeIcon(uint32_t accent) {
 // Menu actions have to land on an Objective-C object, so this is the bridge
 // between a clicked NSMenuItem and the controller. The tag carries the id.
 @interface CombatSessionTarget : NSObject
-@property(nonatomic, assign) cs::TrayController* controller;
+@property(nonatomic, assign) cs::AppController* controller;
 - (void)itemClicked:(id)sender;
 @end
 
@@ -95,9 +96,9 @@ NSImage* MakeIcon(uint32_t accent) {
 namespace cs {
 namespace {
 
-class MacTray : public TrayHost {
+class MacTray : public ShellHost {
 public:
-    explicit MacTray(TrayController& controller) : controller_(controller) {}
+    explicit MacTray(AppController& controller) : controller_(controller) {}
     ~MacTray() override;
 
     bool Create();
@@ -105,6 +106,7 @@ public:
     void Update(TrayState state, const std::string& tooltip) override;
     int  Run() override;
     void Quit() override;
+    bool HasWindow() const override { return false; }
 
     // Called from the menu delegate when the user opens the menu.
     void RebuildMenu(NSMenu* menu);
@@ -112,7 +114,7 @@ public:
 private:
     void ApplyState(TrayState state);
 
-    TrayController&      controller_;
+    AppController&      controller_;
     NSStatusItem*        item_    = nil;
     // One strong pointer rather than a C array of three: an array of retained
     // object pointers inside a C++ class is the kind of thing ARC has opinions
@@ -152,7 +154,7 @@ namespace {
 void MacTray::RebuildMenu(NSMenu* menu) {
     [menu removeAllItems];
 
-    for (const TrayMenuItem& entry : controller_.BuildMenu()) {
+    for (const MenuItem& entry : controller_.BuildMenu(false)) {
         if (entry.separator) {
             [menu addItem:[NSMenuItem separatorItem]];
             continue;
@@ -267,10 +269,41 @@ MacTray::~MacTray() {
 
 } // namespace
 
-std::unique_ptr<TrayHost> CreateTrayHost(TrayController& controller) {
+std::unique_ptr<ShellHost> CreateShell(AppController& controller) {
     auto tray = std::make_unique<MacTray>(controller);
     if (!tray->Create()) return nullptr;
     return tray;
 }
 
+
+// The first-run question, macOS.
+//
+// A panel rather than a window of our own: there is no main window on this
+// system yet, so there is nothing for a custom dialog to be modal to, and the
+// folder chooser already asks exactly the question. A wrong choice is rejected
+// and the user is asked again rather than being left with a setting that will
+// silently never work.
+bool PromptForWowFolder(std::string& path) {
+    for (;;) {
+        const std::string picked = PickFolder(
+            "Select the World of Warcraft folder "
+            "(the one containing Logs and Interface)");
+        if (picked.empty()) return false;          // cancelled
+
+        if (LooksLikeFlavor(picked)) {
+            path = picked;
+            return true;
+        }
+
+        @autoreleasepool {
+            NSAlert* alert = [[NSAlert alloc] init];
+            alert.messageText = @"That is not a World of Warcraft folder";
+            alert.informativeText =
+                @"The folder must contain both Logs and Interface/AddOns. "
+                 "Choose the flavor folder itself, usually named _retail_.";
+            alert.alertStyle = NSAlertStyleWarning;
+            [alert runModal];
+        }
+    }
+}
 } // namespace cs

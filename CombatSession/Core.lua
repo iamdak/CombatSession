@@ -11,6 +11,118 @@ ns.VERSION = (C_AddOns and C_AddOns.GetAddOnMetadata
 ns.DB_SCHEMA = 2
 
 --------------------------------------------------------------------------------
+-- Application version
+--
+-- The addon and the application ship separately, from different places, and are
+-- updated by different means - one through an addon manager, one by replacing a
+-- file by hand. So they drift, and the format they pass between them does not
+-- survive drift: chunks change shape rather than gain fields, and a reader that
+-- guesses at a shape it does not know produces numbers that look real.
+--
+-- Each half therefore states a version and checks the other's. The application
+-- publishes its own into CombatSession_Data/Index.lua, which is the only thing
+-- the two of them share. This addon states the one it was written against
+-- below, and writes it into its saved variables where the application can read
+-- it - the saved file being the only channel that runs the other way.
+--------------------------------------------------------------------------------
+
+-- Declared in the .toc, as X-CombatSession-App, and read back from there.
+--
+-- Not written here as a Lua constant, because the application has to read the
+-- same number and its only immediate way to do that is off disk. A value in
+-- Lua source would mean either parsing Lua from C++ or waiting for this addon
+-- to load and save it - and waiting is what made the first version of this
+-- wrong: the client writes saved variables at the START of a reload, from the
+-- state before the new files loaded, so a freshly updated addon's requirement
+-- did not reach disk until the reload AFTER the one that installed it. The
+-- addon warned and the application sat there agreeing with the old number.
+--
+-- The .toc has neither problem. It is a line of "## Key: Value" that both
+-- sides can read, it is current the moment the files are installed, and it
+-- does not need the addon to have run even once.
+--
+-- Bump it when this addon starts requiring something a previous application
+-- does not produce. Leave it alone for an addon change that needs nothing new:
+-- it is a statement about the application, not a copy of this addon's own
+-- version, and raising it needlessly sends users to fetch an update that would
+-- change nothing for them.
+--
+-- Nil when the metadata is missing, which reads downstream as "no answer" and
+-- turns the check off rather than guessing at a number.
+ns.APP_EXPECTED = C_AddOns and C_AddOns.GetAddOnMetadata
+                  and C_AddOns.GetAddOnMetadata(ADDON, "X-CombatSession-App")
+
+-- "0.11", "0.11.2" and "0.11.2.7" all compare as one ordered number, with
+-- missing fields reading as zero so the short form and the long form of one
+-- release are equal. Zero means unparseable or absent, which is how "no answer"
+-- stays distinct from a real version.
+function ns.ParseVersion(text)
+    if type(text) == "number" then return text end
+    if type(text) ~= "string" then return 0 end
+
+    local field, index, any = { 0, 0, 0, 0 }, 1, false
+    for i = 1, #text do
+        local c = text:sub(i, i)
+        local digit = tonumber(c)
+        if digit then
+            field[index] = math.min(field[index] * 10 + digit, 999)
+            any = true
+        elseif c == "." then
+            index = index + 1
+            if index > 4 then break end
+        else
+            break   -- a suffix such as "-beta" ends the number
+        end
+    end
+
+    if not any then return 0 end
+    return field[1] * 1000000000 + field[2] * 1000000
+         + field[3] * 1000        + field[4]
+end
+
+-- What the application last told us it was. Read from the data addon when it is
+-- present, and otherwise from what was stored the last time it was - the folder
+-- is deleted and recreated by the application as sessions come and go, and its
+-- absence says nothing about which application is installed.
+function ns.CurrentAppVersion()
+    local published = _G.CombatSessionAppVersion
+    if type(published) == "table" and published.code then
+        return published.code, published.text or "unknown"
+    end
+    local db = ns.db
+    if db and db.appVersion and db.appVersion ~= "" then
+        return ns.ParseVersion(db.appVersion), db.appVersion
+    end
+    return 0, "unknown"
+end
+
+-- Where the two halves stand. Mirrors VersionState in the application's
+-- Shell.h, and must keep meaning the same things.
+--   "unknown"  nothing to compare - the application has never run here
+--   "match"    agreed
+--   "addon"    the addon is behind: it asks for an older application than this
+--   "app"      the application is behind: the addon asks for a newer one
+function ns.AppVersions()
+    local expected = ns.ParseVersion(ns.APP_EXPECTED)
+    local current, currentText = ns.CurrentAppVersion()
+
+    local state
+    if current == 0 or expected == 0 then state = "unknown"
+    elseif current == expected then state = "match"
+    elseif current > expected  then state = "addon"
+    else                            state = "app"
+    end
+
+    return {
+        state        = state,
+        expected     = expected,
+        expectedText = ns.APP_EXPECTED or "unknown",
+        current      = current,
+        currentText  = currentText,
+    }
+end
+
+--------------------------------------------------------------------------------
 -- Saved variables
 --------------------------------------------------------------------------------
 
@@ -30,6 +142,15 @@ local DEFAULTS = {
     -- on the strength of it, and SavedVariables are written from memory in one
     -- pass that can come up short.
     oldestWanted = "",
+
+    -- The version handshake, written here rather than merely computed because
+    -- the application cannot see anything else this addon holds. It reads this
+    -- file to find out what the installed addon asks of it; appVersion is the
+    -- other direction, kept so the answer survives the data folder being
+    -- emptied. Both are text, because the reader on the other side scans for
+    -- quoted strings and would need a second kind of parsing for anything else.
+    appExpected = "",
+    appVersion  = "",
 
     settings = {
         autoLog    = true,  -- toggle LoggingCombat on PvP instance entry/exit
@@ -77,6 +198,26 @@ function ns:InitDB()
             :format(tostring(self.db.schema), tostring(ns.DB_SCHEMA)))
     end
     return self.db
+end
+
+-- Publishes the handshake into the saved file.
+--
+-- Called once the data addon has loaded, which is PLAYER_LOGIN - the queue
+-- addon depends on this one and so loads after it. What lands on disk is
+-- whatever was true at the last logout or reload, which is the same latency the
+-- application already lives with for everything else it reads here.
+function ns:RecordAppVersion()
+    if not self.db then return end
+    self.db.appExpected = ns.APP_EXPECTED
+
+    -- Only overwritten when the application has actually said something. An
+    -- empty data folder means no sessions are queued, not that the application
+    -- is gone, and forgetting its version on that basis would report "unknown"
+    -- to a user whose installation is perfectly fine.
+    local published = _G.CombatSessionAppVersion
+    if type(published) == "table" and published.text then
+        self.db.appVersion = published.text
+    end
 end
 
 --------------------------------------------------------------------------------

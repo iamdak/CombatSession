@@ -171,6 +171,117 @@ local function ReadTeamInfo()
 end
 
 --------------------------------------------------------------------------------
+-- Dampening
+--
+-- The arena healing reduction, which climbs for the length of the match. It is
+-- the one figure that says how far a match went in terms a player reads, and
+-- nothing in the combat log carries it.
+--
+-- There is no getter for it either: it exists only as a hidden aura on the
+-- player whose stack count is the percentage, which is how Blizzard own arena
+-- frames read it. Sampled on a timer rather than read once at the end, because
+-- the aura is gone by the time the scoreboard is up. It only ever climbs, so
+-- the largest value seen is the final one.
+--------------------------------------------------------------------------------
+
+local DAMPENING_SPELL = 110310
+local matchTicker = nil
+
+local function ReadDampening()
+    local get = C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID
+    if type(get) ~= "function" then return nil end
+
+    local ok, aura = pcall(get, DAMPENING_SPELL)
+    if not ok or type(aura) ~= "table" then return nil end
+
+    -- Carried as a stack count. Older builds put it in the first aura point
+    -- instead, so both are read and whichever answers is used.
+    local value = aura.applications
+    if type(value) ~= "number" or value <= 0 then
+        value = type(aura.points) == "table" and aura.points[1] or nil
+    end
+    if type(value) ~= "number" or value <= 0 then return nil end
+    return value
+end
+
+local function SampleDampening()
+    if not current then return end
+    local value = ReadDampening()
+    if value and value > (current.dampening or 0) then
+        current.dampening = value
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Honor levels
+--
+-- Not on the scoreboard. C_PvP.GetScoreInfo carries honor GAINED but not the
+-- players honor LEVEL, and there is no lookup by name: UnitHonorLevel wants a
+-- unit token. Taking it from whatever tokens exist while the match is running
+-- is therefore the only way to have it at all.
+--
+-- Which means coverage is uneven, and honestly so. Your own side is reliable -
+-- a battleground puts you in a raid and an arena in a party - while the other
+-- side is only as good as the nameplates that have been on screen. Sampled
+-- repeatedly rather than once because nameplates come and go, and a level only
+-- ever gets written down once per player.
+--------------------------------------------------------------------------------
+
+local function SampleHonor()
+    if not current then return end
+    if type(UnitHonorLevel) ~= "function" then return end
+
+    current.honor = current.honor or {}
+
+    local function Take(unit)
+        if not UnitExists(unit) or not UnitIsPlayer(unit) then return end
+
+        -- Stored the way the combat log names people, so the viewer can join on
+        -- it: UnitName drops the realm for your own, which is the same shape
+        -- the scoreboard uses and the same join the class lookup already makes.
+        local name, realm = UnitName(unit)
+        if not name or name == "" then return end
+        if realm and realm ~= "" then name = name .. "-" .. realm end
+        if current.honor[name] then return end
+
+        local ok, level = pcall(UnitHonorLevel, unit)
+        if ok and type(level) == "number" and level > 0 then
+            current.honor[name] = level
+        end
+    end
+
+    Take("player")
+    for i = 1, 4  do Take("party"     .. i) end
+    for i = 1, 40 do Take("raid"      .. i) end
+    for i = 1, 5  do Take("arena"     .. i) end
+    for i = 1, 40 do Take("nameplate" .. i) end
+end
+
+--------------------------------------------------------------------------------
+
+-- One ticker for everything sampled during a match. Dampening is arena-only;
+-- honor is worth taking everywhere.
+local function SampleMatch()
+    if not current then return end
+    if current.isArena then SampleDampening() end
+    SampleHonor()
+end
+
+local function StopMatchWatch()
+    if not matchTicker then return end
+    matchTicker:Cancel()
+    matchTicker = nil
+end
+
+local function StartMatchWatch()
+    StopMatchWatch()
+    -- Five seconds is well inside the ten a point of dampening takes to tick
+    -- up, and both reads are cheap.
+    matchTicker = C_Timer.NewTicker(5, SampleMatch)
+    SampleMatch()
+end
+
+--------------------------------------------------------------------------------
 -- Match lifecycle
 --------------------------------------------------------------------------------
 
@@ -246,6 +357,11 @@ local function BeginMatch(instanceName, instanceID, instanceType)
         isSkirmish   = Global("IsArenaSkirmish") or false,
         season       = Global("GetCurrentArenaSeason"),
         playerFaction = Global("GetBattlefieldArenaFaction"),
+        -- "Alliance" or "Horde", for the recording character rather than for a
+        -- side of the match. Stored because the viewer lists sessions from
+        -- every character on the account, and the one logged in is rarely the
+        -- one that played them - so it cannot be read back later.
+        playerFactionGroup = Global("UnitFactionGroup", "player"),
         rounds       = {},
 
         -- SavedVariables are account-wide, so records from every character land
@@ -281,6 +397,10 @@ local function BeginMatch(instanceName, instanceID, instanceType)
             ns:Debug("combat logging enabled")
         end
     end
+
+    -- Every match, not arenas only: dampening is arena-only but honor levels
+    -- are worth taking wherever there are unit tokens to read them from.
+    StartMatchWatch()
 end
 
 -- Called on PVP_MATCH_COMPLETE. The scoreboard occasionally lags the event, so
@@ -304,6 +424,10 @@ local function CompleteMatch(attempt)
     current.teams    = ReadTeamInfo()
     current.complete = true
 
+    -- One last read before the aura goes and the group breaks up: completion is
+    -- the closest this gets to the end of the match.
+    SampleMatch()
+
     Trace("COMPLETE", ("roster=%d winner=%s")
         :format(roster and #roster or 0, tostring(current.winner)))
 end
@@ -319,6 +443,7 @@ local function FinalizeMatch()
         Trace("ABANDONED", current.mapName)
     end
 
+    StopMatchWatch()
     current.durationObserved = GetTime() - current.startedGT
 
     local db = ns.db

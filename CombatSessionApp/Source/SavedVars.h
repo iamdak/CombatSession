@@ -35,9 +35,23 @@ inline constexpr const char* kFloorField = "oldestWanted";
 // Table whose keys are the session keys the addon holds.
 inline constexpr const char* kCacheField = "cache";
 
+// The application version the installed addon is written against, e.g.
+//   ["appExpected"] = "0.12"
+//
+// Written as text rather than as a number for one practical reason: this
+// scanner already reads `["field"] = "string"` pairs and would need a second
+// kind of parsing to read anything else. A version is a string everywhere else
+// in both programs anyway.
+inline constexpr const char* kAppExpectedField = "appExpected";
+
 struct AddonState {
     // Session keys the addon currently holds a parsed cache for.
     std::set<std::string> cached;
+
+    // What the addon says it needs. Empty when no addon has written its saved
+    // variables yet, which is the ordinary state of a fresh install and is not
+    // a mismatch - there is nothing to disagree with.
+    std::string appExpected;
 
     // Oldest key the addon still wants. Sessions below it have been declined
     // for good - its cache is full and newer sessions won - so their chunks are

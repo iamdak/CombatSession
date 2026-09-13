@@ -1,0 +1,50 @@
+// Version and icon resources.
+//
+// Windows shows these in the file's Properties tab, in Explorer, in Task
+// Manager and in any prompt about running the file. A binary that reports
+// nothing about itself is both unhelpful to anyone trying to identify what is
+// running and a small negative signal to the heuristics that decide whether an
+// unsigned download looks like software.
+//
+// Not a substitute for a signature, and not claiming to be. It is the part of
+// looking like real software that costs nothing.
+
+#include <winver.h>
+#include "Version.h"
+
+// The lowest-numbered icon resource is the one Explorer, the taskbar and the
+// Alt-Tab list use, so being first is what makes this the program icon.
+// Generated from the same RenderTrayIcon the notification area draws, so the
+// file and the icon are one mark - regenerate it rather than editing by hand.
+1 ICON "CombatSession.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     CS_VERSION_FIELDS
+PRODUCTVERSION  CS_VERSION_FIELDS
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0409 = US English, 04B0 = Unicode.
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "McDakson"
+            VALUE "FileDescription",  "CombatSession - combat log processor for World of Warcraft"
+            VALUE "FileVersion",      CS_VERSION_FULL
+            VALUE "InternalName",     "CombatSession"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 McDakson. MIT licensed."
+            VALUE "OriginalFilename", "CombatSession.exe"
+            VALUE "ProductName",      "CombatSession"
+            VALUE "ProductVersion",   CS_VERSION_FULL
+        END
+    END
+
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -1,0 +1,14 @@
+# Build output. CMake generates Build/ and the linker writes Binary/; both are
+# reproducible from source and neither belongs in history.
+Build/
+Binary/
+out/
+.vs/
+
+# Written beside the executable at runtime, so they appear inside Binary/ on a
+# local build. Listed anyway: they are this user's machine, not the project.
+settings.json
+Raw/
+
+# Release staging.
+Submission Candidates/

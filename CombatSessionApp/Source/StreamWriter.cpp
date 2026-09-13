@@ -197,13 +197,22 @@ std::string StreamWriter::OwnerGuid() const {
     return units_[static_cast<size_t>(ownerIndex_) - 1].guid;
 }
 
-int32_t StreamWriter::InternSpell(int32_t spellId, std::string_view name) {
+int32_t StreamWriter::InternSpell(int32_t spellId, std::string_view name,
+                                 uint32_t school) {
     if (spellId == 0) return 0;
     auto it = spellIndex_.find(spellId);
-    if (it != spellIndex_.end()) return it->second;
+    if (it != spellIndex_.end()) {
+        // The school rides on every event that names the spell, but a line with
+        // the field missing interns a zero. The first real value wins, so one
+        // malformed line cannot leave a spell schoolless for the session.
+        auto& seen = spellSchools_[static_cast<size_t>(it->second) - 1];
+        if (seen == 0) seen = static_cast<uint8_t>(school);
+        return it->second;
+    }
 
     spellIds_.push_back(spellId);
     spellNames_.emplace_back(name);
+    spellSchools_.push_back(static_cast<uint8_t>(school));
     const auto index = static_cast<int32_t>(spellIds_.size());
     spellIndex_.emplace(spellId, index);
     return index;
@@ -220,7 +229,23 @@ void StreamWriter::Feed(const LogLine& line) {
     // because units are keyed by name they all merged into one entry. That is
     // why arenas showed a team with no damage and no healing while
     // battlegrounds, which emit no COMBATANT_INFO, looked fine.
-    if (kind == EventKind::CombatantInfo) return;
+    //
+    // Taken down a path of its own now rather than dropped. Spec, faction,
+    // honor level and pre-match rating are all in there, and every one of them
+    // was otherwise obtainable only from the live client while the match ran.
+    if (kind == EventKind::CombatantInfo) {
+        CombatantInfo info;
+        if (!ParseCombatantInfo(line.payload, info)) return;
+
+        const auto it = combatantIndex_.find(info.guid);
+        if (it != combatantIndex_.end()) {
+            combatants_[it->second] = std::move(info);
+        } else {
+            combatantIndex_.emplace(info.guid, combatants_.size());
+            combatants_.push_back(std::move(info));
+        }
+        return;
+    }
 
     if (!haveBase_) { base_ = line.time; haveBase_ = true; }
 
@@ -250,7 +275,8 @@ void StreamWriter::Feed(const LogLine& line) {
 
             int32_t shieldId = 0;
             ToNumber(f[n - 6], shieldId);
-            const int32_t shieldIdx = InternSpell(shieldId, Unquote(f[n - 5]));
+            const int32_t shieldIdx =
+                InternSpell(shieldId, Unquote(f[n - 5]), ToFlags(f[n - 4]));
 
             int64_t absorbed = 0;
             ToNumber(f[n - 3], absorbed);
@@ -267,7 +293,8 @@ void StreamWriter::Feed(const LogLine& line) {
             if (n >= kBaseFields + kSpellFields + 10) {
                 int32_t attackId = 0;
                 ToNumber(f[kBaseFields], attackId);
-                attackIdx = InternSpell(attackId, Unquote(f[kBaseFields + 1]));
+                attackIdx = InternSpell(attackId, Unquote(f[kBaseFields + 1]),
+                                        ToFlags(f[kBaseFields + 2]));
             }
 
             auto emit = [&](EventKind rowKind, int32_t rowSrc, int32_t rowSpell) {
@@ -310,7 +337,8 @@ void StreamWriter::Feed(const LogLine& line) {
     if (HasSpellPrefix(kind) && f.size() >= cursor + kSpellFields) {
         int32_t spellId = 0;
         ToNumber(f[cursor], spellId);
-        spellIndex = InternSpell(spellId, Unquote(f[cursor + 1]));
+        spellIndex = InternSpell(spellId, Unquote(f[cursor + 1]),
+                                 ToFlags(f[cursor + 2]));
         cursor += kSpellFields;
     }
 
@@ -401,6 +429,34 @@ void StreamWriter::Feed(const LogLine& line) {
         }
         break;
 
+    case EventKind::SpellAuraAppliedDose:
+    case EventKind::SpellAuraRemovedDose:
+        // auraType then the new stack count. Carried so a stacking aura can be
+        // read for how high it got, which is the only way dampening is
+        // recoverable from a log: it is an ordinary debuff that gains a stack
+        // per point, so the largest dose seen is the value the match ended on.
+        if (remaining >= 2) ToNumber(f[cursor + 1], amount);
+        break;
+
+    case EventKind::UnitDied:
+        // One trailing field: unconsciousOnDeath. Set when the unit is down but
+        // not dead - Feign Death is what produces it in PvP, and the event is
+        // otherwise identical to a real death, which is why hunters were being
+        // credited with a dozen deaths a battleground.
+        //
+        // Verified against a 12.1.0 capture: every flagged UNIT_DIED for the
+        // hunter in that match is preceded in the same millisecond by
+        // SPELL_AURA_APPLIED of Survival Tactics. The aura is NOT spell 5384 -
+        // the talent applies its own - so reading the flag is both simpler and
+        // more correct than watching for a particular spell.
+        //
+        // Carried in `amount`, which a death event otherwise leaves at zero, on
+        // the same basis as the extra spell index on a dispel: a column of its
+        // own would cost eight bytes on every event in the session to serve a
+        // few hundred of them.
+        if (remaining >= 1) amount = (f[cursor + 0] == "1") ? 1 : 0;
+        break;
+
     case EventKind::SpellEnergize:
     case EventKind::SpellPeriodicEnergize:
         if (remaining >= 1) ToNumber(f[cursor + 0], amount);
@@ -423,7 +479,8 @@ void StreamWriter::Feed(const LogLine& line) {
         if (remaining >= 3) {
             int32_t extraId = 0;
             ToNumber(f[cursor + 0], extraId);
-            amount = InternSpell(extraId, Unquote(f[cursor + 1]));
+            amount = InternSpell(extraId, Unquote(f[cursor + 1]),
+                                 ToFlags(f[cursor + 2]));
 
             // auraType separates the two directions of a dispel: a DEBUFF off a
             // friend is a dispel, a BUFF off anyone is a purge, and Spellsteal
@@ -520,6 +577,30 @@ bool StreamWriter::Write(const std::string& path, const std::string& key,
     // or clients writing into one Logs folder, this is what separates them.
     out << "    character="; WriteEscaped(out, OwnerName()); out << ",\n";
     out << "    characterGuid="; WriteEscaped(out, OwnerGuid()); out << ",\n";
+
+    // ARENA_MATCH_END, which the segmenter has always parsed and nothing has
+    // ever read. It is the log's own account of who won and what the ratings
+    // became - the only outcome a session can have without the recorder, and
+    // arenas only. A winner of -1 is a Solo Shuffle lobby, meaning "no single
+    // winner", and must not be read as a side.
+    if (session.hasEndInfo) {
+        out << "    winner=" << session.endInfo.winningTeam << ",\n";
+        out << "    duration=" << session.endInfo.duration << ",\n";
+        out << "    rating1=" << session.endInfo.newRating1 << ",\n";
+        out << "    rating2=" << session.endInfo.newRating2 << ",\n";
+    }
+    out << "  },\n";
+
+    // One row per arena combatant, empty for a battleground. Positional to keep
+    // the chunk small, and read back by the addon as
+    //   { guid, faction, specId, honorLevel, season, rating, tier }
+    out << "  combatants={\n";
+    for (const auto& c : combatants_) {
+        out << "    {";
+        WriteEscaped(out, c.guid);
+        out << ',' << c.faction << ',' << c.specId << ',' << c.honorLevel
+            << ',' << c.season << ',' << c.rating << ',' << c.tier << "},\n";
+    }
     out << "  },\n";
 
     out << "  units={\n";
@@ -536,7 +617,7 @@ bool StreamWriter::Write(const std::string& path, const std::string& key,
     for (size_t i = 0; i < spellIds_.size(); ++i) {
         out << "    {" << spellIds_[i] << ',';
         WriteEscaped(out, spellNames_[i]);
-        out << "},\n";
+        out << ',' << static_cast<int>(spellSchools_[i]) << "},\n";
     }
     out << "  },\n";
 

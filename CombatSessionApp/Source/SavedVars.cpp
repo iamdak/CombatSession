@@ -1,5 +1,7 @@
 #include "SavedVars.h"
 
+#include "Version.h"
+
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -45,7 +47,10 @@ AddonState ScanFile(const fs::path& path) {
                 value += text[i];
             }
             // Two strings in a row at the top level is `["field"] = "value"`.
-            if (depth == 1 && haveLast && last == kFloorField) state.oldestWanted = value;
+            if (depth == 1 && haveLast) {
+                if (last == kFloorField)       state.oldestWanted = value;
+                if (last == kAppExpectedField) state.appExpected  = value;
+            }
             last = value;
             haveLast = true;
             continue;
@@ -106,6 +111,15 @@ AddonState ReadAddonState(const fs::path& wtfRoot) {
         if (found[i].oldestWanted.empty() ||
             found[i].oldestWanted < combined.oldestWanted) {
             combined.oldestWanted = found[i].oldestWanted;
+        }
+
+        // Every account on one machine loads the same addon files, so these
+        // agree in every real case. When they do not, one of them has saved
+        // variables from before an addon update and has not logged in since;
+        // the highest is the one the installed files actually ask for.
+        if (combined.appExpected.empty()
+            || ParseVersion(found[i].appExpected) > ParseVersion(combined.appExpected)) {
+            combined.appExpected = found[i].appExpected;
         }
     }
     return combined;
