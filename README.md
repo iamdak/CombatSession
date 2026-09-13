@@ -1,4 +1,4 @@
-<img src="Docs/icon-idle-256.png" width="72" align="left" alt="">
+<img src="icon-idle-256.png" width="72" align="left" alt="">
 
 # CombatSession
 
@@ -21,62 +21,48 @@ Nothing is uploaded anywhere. Everything stays on your machine.
 
 ## Download
 
-After downloading the binary; move it to wherever you want it to live then just
-run it. It will become a background tray task; clicking on the task icon will
-open more settings. You'll be able to start it at boot.
-
-**[Download CombatSession.exe](../../releases/latest/download/CombatSession.exe)**
+**[Download CombatSession.exe](../../../releases/latest/download/CombatSession.exe)**
 (Windows, 64-bit)
+
+macOS is supported in the source but there is no prebuilt binary — see
+[Building](#building).
 
 ---
 
 ## Install
 
-1. Copy the **`CombatSession`** and **`CombatSessionViewer`** folders into
+1. Install the addon from CurseForge or download and copy the **`CombatSession`**
+   and **`CombatSessionViewer`** folders into:
    `World of Warcraft/_retail_/Interface/AddOns/`.
-2. Put `CombatSession.exe` somewhere of its own and run it. It writes
-   `settings.json` beside itself, finds your WoW folder if it can, and asks
-   if it cannot.
-3. Log in and type **`/csv`**.
+   
+2. Download the binary and extract `CombatSession.exe` to any folder and run it.
+   On first launch it will ask for the World of Warcraft installation folder.
+   Choose the flavor folder, the one containing `Logs` and `Interface`, usually
+   named `_retail_`.
+   
+3. Log into WoW and type **`/csv`** or click the minimap icon.
 
-The application lives in the system tray and needs to be running for new matches
-to appear. Between matches it checks the size and timestamp of a handful of files
-twice a second and does nothing else.
 
-### The tray icon
+You can tell the application to Start with Windows; if you move the application
+to a new location, just run it from the new folder and turn "Start with Windows"
+off and on again to set the new location.
+
+---
+
+### What the colour means
+
+The icon on the taskbar button — and in the notification area, if you put it
+there — carries the state.
 
 | | Colour | Meaning |
 |---|---|---|
-| <img src="Docs/icon-idle.png" width="24" alt=""> | **Green** | Idle. Everything the addon can see, it has. |
-| <img src="Docs/icon-working.png" width="24" alt=""> | **Amber** | Reading a log. |
-| <img src="Docs/icon-reload.png" width="24" alt=""> | **Red** | Sessions are waiting — **`/reload`** in game to pick them up. |
+| <img src="icon-idle.png" width="24" alt=""> | **Green** | Idle. Everything the addon can see, it has. |
+| <img src="icon-working.png" width="24" alt=""> | **Amber** | Reading a log. |
+| <img src="icon-reload.png" width="24" alt=""> | **Red** | Sessions are waiting — **`/reload`** in game to pick them up. |
 
 Red is not an error. The addon can only load files that existed when the client
 started, so a match played just now needs one `/reload` before it appears. That
 is the whole reason the icon has colours, and the only thing it ever asks of you.
-A sound plays once when it turns red; you can change or silence it from the menu.
-
----
-
-## Application arguments
-
-Run with no arguments, it sits in the tray. Run with any argument, it does that
-one job on the command line, prints what it did, and exits.
-
-| Argument | What it does |
-|---|---|
-| *(none)* | Run in the system tray |
-| `--once` | Process everything now, then exit |
-| `--list` | Report which logs would be processed; write nothing |
-| `--reprocess` | Re-read every log from the beginning and rebuild all data |
-| `--log <file>` | Process one specific log file |
-| `--wow <path>` | Use this flavor folder (the one named `_retail_`); remembered |
-| `--max <n>` | How many sessions to keep in the raw archive (default 200) |
-| `--no-archive` | Skip the raw archive — reprocessing then becomes impossible |
-
-`--reprocess` is the recovery path after an addon update changes the data
-format. The full sequence is `/combatsession reset` → `/reload` →
-`CombatSession.exe --reprocess` → `/reload`.
 
 ---
 
@@ -122,7 +108,7 @@ logs — `reset` is almost always the one you want.
 ```
 Logs/WoWCombatLog-*.txt
    │  application segments the log into matches
-   ├─ archives each match  ──►  Raw/<session>.log.gz   (beside the .exe)
+   ├─ archives each match  ──►  Raw/<session>.log.gz   (beside the .exe, optional)
    └─ writes a data file   ──►  Interface/AddOns/CombatSession_Data/
 
                     addon loads it at /reload and caches it
@@ -131,14 +117,25 @@ Logs/WoWCombatLog-*.txt
 ```
 
 `CombatSession_Data` is generated — it is a queue, not storage, and it is normal
-for it to be empty. The archive beside the executable is what makes reprocessing
-possible; it is never distributed and contains your raw combat logs.
+for it to be empty. The archive beside the executable is what makes rebuilding
+possible; it is off by default, never distributed, and contains your raw combat
+logs.
 
 | Folder | What it is |
 |---|---|
 | `CombatSession/` | The recorder addon and the data library. No UI of its own. |
 | `CombatSessionViewer/` | The viewer. Read-only; owns no data. |
 | `CombatSessionApp/` | The background application, C++20. |
+
+### What it touches
+
+Everything it writes, and nothing else:
+
+- `settings.json` and `Raw/` beside the executable
+- `CombatSession_Data/` inside the World of Warcraft folder you chose
+- a shortcut in your own Startup folder, only while **Start with Windows** is on
+
+No registry, no network, no installer. Deleting the folder removes it.
 
 ---
 
@@ -156,10 +153,14 @@ Any generator CMake supports works — `-G "Visual Studio 17 2022" -A x64`,
 `-G Xcode`, `-G Ninja`. Requires CMake 3.21 and a C++20 compiler; macOS 11 or
 later.
 
-Only two files are specific to an operating system: `Platform_*` and `Tray_*`,
-implementing `Platform.h` and `Tray.h`. Everything else — reading logs, cutting
+Only two files are specific to an operating system: `Platform_*` and `Shell_*`,
+implementing `Platform.h` and `Shell.h`. Everything else — reading logs, cutting
 sessions, writing data — is portable, so a third system means writing that pair
 and adding them to `CMakeLists.txt`.
+
+`Tools/deploy.ps1` copies the repository into a live World of Warcraft install.
+The two trees are shaped differently, and that script is the only thing that
+should ever write to the game folder.
 
 ---
 
