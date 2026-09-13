@@ -1,0 +1,5 @@
+# Generated build trees. CMake writes these; nothing here is distributed.
+Build/
+# Raw archive and local settings, written at runtime beside the executable.
+Binary/Raw/
+Binary/settings.json
