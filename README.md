@@ -21,8 +21,7 @@ Nothing is uploaded anywhere. Everything stays on your machine.
 
 ## Download
 
-# NOTE: This executable is being rejected by Microsoft; I'm working on a fix.  Please
-# build the executable from the source for now!
+# NOTE: This executable is being rejected by Microsoft; I'm working on a fix.  Please build the executable from the source for now!
 
 **[Download CombatSession.exe](../../../releases/latest/download/CombatSession.exe)**
 (Windows, 64-bit)
