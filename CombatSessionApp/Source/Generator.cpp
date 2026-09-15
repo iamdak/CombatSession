@@ -1,6 +1,7 @@
 #include "Generator.h"
 
 #include "Archive.h"
+#include "Platform.h"
 #include "SavedVars.h"
 #include "StreamWriter.h"
 #include "Version.h"
@@ -79,6 +80,23 @@ std::string MakeSessionKey(const Session& session) {
 }
 
 bool LogLooksClosed(const fs::path& logPath, int settleSeconds) {
+    // Ask the filesystem first. The client holds its combat log open for the
+    // whole session and lets go when it exits or when logging is switched off,
+    // so an unheld file means nothing further is coming - which is the actual
+    // question, answered in the moment rather than inferred from a clock.
+    //
+    // This is what made the last session of an evening take ten minutes to
+    // appear. The timer below cannot tell "finished" from "quiet", so it has to
+    // wait out the longest plausible pause; a player who quit and logged
+    // straight back in beat it every time, found nothing waiting, and needed a
+    // /reload once it finally landed. Asking whether the file is still held
+    // turns that into the next poll.
+    switch (FileHeldOpen(logPath)) {
+    case FileBusy::Yes: return false;   // the client still has it
+    case FileBusy::No:  return true;    // nobody does; it is finished
+    case FileBusy::Unknown: break;      // no answer available - fall through
+    }
+
     std::error_code ec;
     const auto written = fs::last_write_time(logPath, ec);
     if (ec) return true;   // unreadable timestamp: treat as finished

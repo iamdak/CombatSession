@@ -161,7 +161,28 @@ int32_t StreamWriter::InternUnit(std::string_view guid, std::string_view name,
         if (!name.empty() && name != "Unknown" && unit.name == "Unknown") {
             unit.name = std::string(name);
         }
-        if (flags) unit.flags = flags;
+        // Flags are merged rather than simply overwritten, because the reaction
+        // bits are not stable across a session and the last sighting is not
+        // automatically the truthful one.
+        //
+        // COMBATLOG_OBJECT_REACTION_NEUTRAL (0x20) is what the client logs for
+        // a player it will not commit on: before the gates open in a
+        // battleground, out of phase, not yet flagged. Taking that at face
+        // value left real opponents recorded as neutral for the whole session -
+        // two of twenty-five players in the reference match - which is a unit
+        // on neither side. Everything downstream that asks which team someone
+        // was on then gets a third answer that is not an answer, and damage
+        // between two team-mates reads as damage across the line.
+        //
+        // So a definite reaction wins over an indefinite one whichever order
+        // they arrive in, and neutral only fills a gap. A creature that really
+        // is neutral never carries either bit and is unaffected.
+        if (flags) {
+            constexpr uint32_t kDefiniteReaction = 0x10 | 0x40;   // friendly, hostile
+            const bool haveDefinite = (unit.flags & kDefiniteReaction) != 0;
+            const bool newDefinite  = (flags & kDefiniteReaction) != 0;
+            if (newDefinite || !haveDefinite) unit.flags = flags;
+        }
         return it->second;
     }
 

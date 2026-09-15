@@ -246,6 +246,10 @@ end
 local dispatcher = CreateFrame("Frame")
 local handlers   = {}
 
+-- How many times each handler has thrown. Kept so the same fault reports once
+-- and then goes quiet, rather than either spamming chat or being silent.
+local faults = {}
+
 dispatcher:SetScript("OnEvent", function(_, event, ...)
     local list = handlers[event]
     if not list then return end
@@ -253,8 +257,28 @@ dispatcher:SetScript("OnEvent", function(_, event, ...)
         local fn = list[i]
         local ok, err = pcall(fn, event, ...)
         if not ok then
-            table.remove(list, i)
-            ns:Print(("|cffff5555handler error on %s:|r %s"):format(event, tostring(err)))
+            -- A handler that throws is NOT unregistered.
+            --
+            -- It used to be, on the reasoning that a broken listener should not
+            -- be left running. That reasoning was wrong for anything that
+            -- accumulates: one throw inside PVP_MATCH_COMPLETE removed the
+            -- recorder's completion handler for the rest of the session, so
+            -- every later match that day was filed as abandoned - no roster, no
+            -- outcome, no class data - and the only way to get it back was a
+            -- /reload nobody knew they needed. A transient fault in one match
+            -- must not silently disable recording for all the others.
+            --
+            -- The pcall is what provides isolation: the loop carries on to the
+            -- other listeners either way. Removal was never what made this safe.
+            local count = (faults[fn] or 0) + 1
+            faults[fn] = count
+
+            if count <= 3 then
+                ns:Print(("|cffff5555handler error on %s:|r %s"):format(event, tostring(err)))
+                if count == 3 then
+                    ns:Print("|cff888888further errors from that handler will be counted, not printed.|r")
+                end
+            end
         end
     end
 end)

@@ -161,6 +161,13 @@ void PlayErrorAlert() {
     NSBeep();
 }
 
+// Unanswerable here without walking every process's open descriptors, which is
+// a great deal of machinery - and privilege - for a timer that already works.
+// Unknown keeps the caller on its previous behaviour.
+FileBusy FileHeldOpen(const fs::path&) {
+    return FileBusy::Unknown;
+}
+
 void OpenFolder(const fs::path& dir) {
     @autoreleasepool {
         NSURL* url = [NSURL fileURLWithPath:Str(dir.string()) isDirectory:YES];

@@ -183,6 +183,28 @@ void PlayErrorAlert() {
     MessageBeep(MB_ICONERROR);
 }
 
+// Asked by opening the file with no sharing allowed. If the client still has it,
+// the open fails with a sharing violation and nothing has been disturbed - the
+// handle is closed immediately either way, and the file is never written to.
+FileBusy FileHeldOpen(const fs::path& file) {
+    HANDLE handle = CreateFileW(file.wstring().c_str(), GENERIC_READ,
+                                0 /* no sharing */, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+        return FileBusy::No;
+    }
+
+    const DWORD error = GetLastError();
+    if (error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION) {
+        return FileBusy::Yes;
+    }
+
+    // Anything else - gone, renamed, permissions - is not an answer to the
+    // question that was asked.
+    return FileBusy::Unknown;
+}
+
 void OpenFolder(const fs::path& dir) {
     ShellExecuteW(nullptr, L"open", dir.wstring().c_str(),
                   nullptr, nullptr, SW_SHOWNORMAL);

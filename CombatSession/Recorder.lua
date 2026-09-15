@@ -227,27 +227,52 @@ end
 -- ever gets written down once per player.
 --------------------------------------------------------------------------------
 
+-- Units whose honor level could not be read because the client handed back a
+-- secret value. Reported once at match completion rather than per sample.
+local honorFaults = 0
+
 local function SampleHonor()
     if not current then return end
     if type(UnitHonorLevel) ~= "function" then return end
 
     current.honor = current.honor or {}
 
+    -- Wrapped whole, because 12.0 hands back "secret" values here.
+    --
+    -- A secret cannot be compared, concatenated or used as a table key - each
+    -- of those throws, and which one the client objects to is not something
+    -- this code should be trying to predict. UnitName returns one during
+    -- PVP_MATCH_COMPLETE, which is where the last reading is taken, and the
+    -- throw travelled all the way out of the completion handler.
+    --
+    -- A missing honor level is cosmetic: the icon is absent for that player.
+    -- Losing the match record is not. So this fails quietly per unit and the
+    -- caller carries on to the next one.
     local function Take(unit)
         if not UnitExists(unit) or not UnitIsPlayer(unit) then return end
 
-        -- Stored the way the combat log names people, so the viewer can join on
-        -- it: UnitName drops the realm for your own, which is the same shape
-        -- the scoreboard uses and the same join the class lookup already makes.
-        local name, realm = UnitName(unit)
-        if not name or name == "" then return end
-        if realm and realm ~= "" then name = name .. "-" .. realm end
-        if current.honor[name] then return end
+        local ok = pcall(function()
+            -- Stored the way the combat log names people, so the viewer can
+            -- join on it: UnitName drops the realm for your own, which is the
+            -- same shape the scoreboard uses and the same join the class
+            -- lookup already makes.
+            local name, realm = UnitName(unit)
+            if type(name) ~= "string" or name == "" then return end
+            if type(realm) == "string" and realm ~= "" then
+                name = name .. "-" .. realm
+            end
+            if current.honor[name] then return end
 
-        local ok, level = pcall(UnitHonorLevel, unit)
-        if ok and type(level) == "number" and level > 0 then
-            current.honor[name] = level
-        end
+            local level = UnitHonorLevel(unit)
+            if type(level) == "number" and level > 0 then
+                current.honor[name] = level
+            end
+        end)
+
+        -- Counted, never printed: this runs for eighty-odd unit tokens on a
+        -- five second ticker, so a message would be unusable. ns:Debug picks it
+        -- up at the end of the match for anyone who turns tracing on.
+        if not ok then honorFaults = honorFaults + 1 end
     end
 
     Take("player")
@@ -426,10 +451,14 @@ local function CompleteMatch(attempt)
 
     -- One last read before the aura goes and the group breaks up: completion is
     -- the closest this gets to the end of the match.
-    SampleMatch()
+    --
+    -- Guarded as well as being safe internally, because everything above this
+    -- line is the match record and none of it is worth losing to a sampling
+    -- problem. Belt and braces on the one path that must not throw.
+    pcall(SampleMatch)
 
-    Trace("COMPLETE", ("roster=%d winner=%s")
-        :format(roster and #roster or 0, tostring(current.winner)))
+    Trace("COMPLETE", ("roster=%d winner=%s honorFaults=%d")
+        :format(roster and #roster or 0, tostring(current.winner), honorFaults))
 end
 
 -- Called when leaving the instance. A match without a completion snapshot was

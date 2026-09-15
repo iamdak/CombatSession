@@ -85,6 +85,18 @@ void PlayDefaultAlert();
 // has to have configured.
 void PlayErrorAlert();
 
+// Whether another process currently holds the file open for writing.
+//
+// This is how the application can tell that World of Warcraft has finished with
+// a combat log without waiting out a timer: the client holds its log open for
+// the whole session and releases it on exit, or when logging is switched off.
+// Both of those mean "no more is coming", and both are worth knowing at once.
+//
+// Three-valued, because not every system can answer. Unknown means the caller
+// should fall back to whatever it did before rather than assume either way.
+enum class FileBusy { Unknown = 0, No, Yes };
+FileBusy FileHeldOpen(const std::filesystem::path& file);
+
 // Reveals a directory in the system file manager.
 void OpenFolder(const std::filesystem::path& dir);
 

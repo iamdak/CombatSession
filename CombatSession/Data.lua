@@ -87,7 +87,7 @@ ns.API = API
 --     team index - but every race is faction-locked, so a cast racial names the
 --     caster's side. Works in battlegrounds, which is where almost nothing else
 --     does.
-local DEFINES_VERSION = 20
+local DEFINES_VERSION = 21
 
 --------------------------------------------------------------------------------
 -- Event kinds, mirroring EventKind in StreamWriter.h. Values are persisted in
@@ -1485,8 +1485,17 @@ function API:BuildCache(key, onDone, onProgress)
                 -- split the two directions by auraType: a debuff off a friend
                 -- is a dispel, a buff off an enemy is a purge, and a spell
                 -- steal is a purge because it takes a buff.
+                --
+                -- Only counted when the aura came off a PLAYER. A summoned
+                -- guardian that shrugs a root off itself is logged as a dispel
+                -- by whoever owns it - a druid's treants each produce one, so a
+                -- single cast of anything that roots them credits the druid
+                -- with a handful of dispels they did not perform, named after
+                -- the spell that rooted them. What this column is for is a
+                -- player taking something off another player, and that is what
+                -- it now counts.
                 local col = (kind == K.DISPEL) and dispelCol or purgeCol
-                if srcName then
+                if srcName and dstName and rawKind[d[i]] == "player" then
                     Add(UnitEntry(srcName), col, dstName, 1, 1,
                         CompositeSpell(am[i], spellId))
                 end
