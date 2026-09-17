@@ -1662,6 +1662,10 @@ local function LayoutHeader()
                 if mouseButton ~= "RightButton" then
                     Model:SetActiveColumn(self.col)
                 end
+                -- Sorting reorders the rows under an open breakdown, carrying
+                -- it somewhere else in the list - often off screen. Closing it
+                -- first means a sort is only ever a change of order.
+                Model:Collapse()
                 Model:SetSort(self.col)
                 UI:Refresh()
             end)
@@ -2417,6 +2421,8 @@ local function BuildGridPane(parent, sessionPane)
     grid.nameHeader.text:SetJustifyH("LEFT")
 
     grid.nameHeader:SetScript("OnClick", function()
+        -- Closed for the same reason a value header closes it: the rows move.
+        Model:Collapse()
         Model:SetSort(ns.NAME_COL)
         UI:Refresh()
     end)
