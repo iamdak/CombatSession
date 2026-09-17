@@ -595,6 +595,16 @@ function Model:ToggleExpand(name, unit)
     state.activeSource = nil
 end
 
+-- Selects a unit and opens its breakdown, leaving it open if it already was.
+-- For a click that means "show me this", where a toggle would close a breakdown
+-- the user was only trying to look at in a different column.
+function Model:Open(name, unit)
+    self:SelectRow(name)
+    if not unit or state.activeName == name then return end
+    state.activeName   = name
+    state.activeSource = nil
+end
+
 function Model:ToggleSource(sourceName)
     if state.activeSource == sourceName then
         state.activeSource = nil
@@ -775,13 +785,25 @@ function Model:Rows()
         if state.activeName == player.name and player.unit then
             local blockFirst = #rows
 
-            local lists, omitted, partMax = {}, nil, 0
+            local lists, omittedBy, partMax = {}, {}, 0
             for c = 1, #columns do
                 local list, dropped, largest = ColumnList(api, cache, player.unit, c)
                 lists[c] = list
-                if c == activeCol then omitted, partMax = dropped, largest end
+                if dropped and dropped > 0 then omittedBy[c] = dropped end
+                if c == activeCol then partMax = largest end
             end
             local parts = lists[activeCol] or {}
+
+            -- The breakdown is as long as its longest column, whichever column
+            -- is active. Sized by the active column instead, it grew and shrank
+            -- every time the column changed, and every row beneath it moved
+            -- with it - which is exactly the motion a column change should not
+            -- cause. At this length no column ever has more entries than rows,
+            -- so none of them needs the "..." either.
+            local depth = 0
+            for c = 1, #columns do
+                if #lists[c] > depth then depth = #lists[c] end
+            end
 
             -- A counterpart opened under another column may not exist in this
             -- one, or may exist with no spells behind it. Either way there is
@@ -812,7 +834,7 @@ function Model:Rows()
                     -- Where this row sits, and the lists the other columns
                     -- draw their Nth entry from.
                     rank    = rank,
-                    count   = #parts,
+                    count   = depth,
                     lists   = lists,
                     -- The player behind a counterpart, for the same tooltip and
                     -- menu a root row gets. Nil for pets, NPCs and the summary.
@@ -868,33 +890,41 @@ function Model:Rows()
                 end
             end
 
-            if #parts == 0 then
-                -- Nothing in the active column, so this note is the whole of
-                -- the block - and it has to behave like a block of one row.
-                -- As a bare note it was blank in every column and ignored the
-                -- mouse, which left no way to get from an empty measure to one
-                -- that has something without leaving the breakdown. Given the
-                -- lists, each other column shows its one row: its only entry,
-                -- "--" when it is empty too, or "..." when it has more.
+            -- The rest of the breakdown's length, past the end of the active
+            -- column's list. These rows have no entry of their own, so their
+            -- name is blank and the active column reads "--", but every other
+            -- column still shows its entry at that rank and can be clicked to
+            -- become active. The first of them says why the name is missing
+            -- when the active column has nothing at all.
+            --
+            -- A breakdown with nothing in any column still gets that one row,
+            -- rather than opening to nothing.
+            local empty = "no breakdown recorded for this column"
+            for rank = #parts + 1, math.max(depth, 1) do
                 rows[#rows + 1] = {
                     kind  = "note",
-                    key   = "n:" .. root .. ":empty",
+                    key   = "n:" .. root .. ":rank" .. rank,
                     block = block,
-                    name  = omitted
-                            and ("... %d contributor(s) not stored"):format(omitted)
-                            or  "no breakdown recorded for this column",
+                    name  = (rank == 1) and empty or "",
                     col   = activeCol,
-                    rank  = 1,
-                    count = 1,
+                    rank  = rank,
+                    count = math.max(depth, 1),
                     lists = lists,
                 }
-            elseif omitted then
-                -- Trails a real list, whose rows already carry every column.
+            end
+
+            -- Contributors past the storage cap, per column. Shown whenever any
+            -- column has some, not only the active one, so the row does not
+            -- come and go as the column changes; each column carries its own
+            -- count and the rest are blank.
+            if next(omittedBy) then
                 rows[#rows + 1] = {
-                    kind  = "note",
-                    key   = "n:" .. root .. ":omitted",
-                    block = block,
-                    name  = ("... %d smaller contributor(s) not stored"):format(omitted),
+                    kind     = "note",
+                    key      = "n:" .. root .. ":omitted",
+                    block    = block,
+                    name     = "... smaller contributors not stored",
+                    col      = activeCol,
+                    omitted  = omittedBy,
                 }
             end
 

@@ -615,14 +615,20 @@ local function CellTooltip(cell)
     if data.kind == "unit" and data.unit then
         Detail(data.unit.cols[col] or 0,
                data.unit.counts and data.unit.counts[col] or 0)
-        if not isActive then
-            Hint(Model:IsSelected(data.name)
-                and "Click to make this the active column."
-                or  "Click to select this player and make this the active column.")
-        elseif Model:IsExpanded(data.name) then
-            Hint("Click to close this breakdown.")
+        if Model:IsExpanded(data.name) then
+            Hint(isActive and "Click to close this breakdown."
+                          or  "Click to break this column down instead.")
         else
             Hint("Click to break this value down by unit.")
+        end
+
+    elseif data.kind == "note" and data.omitted then
+        local dropped = data.omitted[col]
+        if dropped then
+            GameTooltip:AddLine(("%d smaller contributor(s) in this column were not stored."):format(dropped),
+                                0.7, 0.7, 0.7, true)
+            GameTooltip:AddLine("Only the largest are kept, so each session stays small.",
+                                0.6, 0.6, 0.6, true)
         end
 
     elseif data.kind == "source" or data.kind == "spell"
@@ -701,16 +707,16 @@ local function GridCell(row, index)
         SetHover(nil, nil)
         GameTooltip:Hide()
     end)
-    -- A click outside the active column makes that column active and moves
-    -- the cursor to the row, but opens nothing: the first click on a new
-    -- measure is a request to look at it, and opening something on the same
-    -- click would be two things at once. Inside the active column a click
-    -- opens or closes whatever the cell belongs to.
+    -- On a player's own row, a click in another column makes that column
+    -- active and opens that player's breakdown in it - one click from any
+    -- figure to its breakdown, whichever player and column it is in. A click
+    -- in the active column opens or closes the breakdown instead, which is the
+    -- only way a cell click can close one.
     --
-    -- Only a root row outside the selection moves the cursor. Rows inside it -
-    -- the selected player, and the breakdown open beneath them - are already
-    -- where the cursor is, so for them the click only changes the column, and
-    -- an open breakdown carries on under the new one.
+    -- Inside a breakdown, a click in another column only makes that column
+    -- active: the breakdown is already open, and carries on under the new
+    -- column. A click in the active column opens or closes whatever the row
+    -- belongs to.
     cell:SetScript("OnClick", function(self)
         local data = self.data
         -- A closing breakdown is still drawn for a moment after the model has
@@ -724,13 +730,16 @@ local function GridCell(row, index)
             return
         end
 
-        if self.col ~= Model:ActiveColumn() then
-            Model:SetActiveColumn(self.col)
-            if data.kind == "unit" and not Model:IsSelected(data.name) then
-                Model:SelectRow(data.name)
+        local elsewhere = (self.col ~= Model:ActiveColumn())
+        if data.kind == "unit" then
+            if elsewhere then
+                Model:SetActiveColumn(self.col)
+                Model:Open(data.name, data.unit)
+            else
+                Model:ToggleExpand(data.name, data.unit)
             end
-        elseif data.kind == "unit" then
-            Model:ToggleExpand(data.name, data.unit)
+        elseif elsewhere then
+            Model:SetActiveColumn(self.col)
         elseif data.kind == "source" and HasSpells(data) then
             Model:ToggleSource(data.name)
         else
@@ -1502,11 +1511,21 @@ local function Populate(row, data)
                 value, alpha, entry, more =
                     RankedCell(data.lists and data.lists[i], data.rank, data.count, i)
             end
-        elseif data.kind == "note" and data.lists and i ~= data.col then
-            -- An empty block's one row. Its own column has nothing to show,
-            -- which the note's text already says; the others show their row.
-            value, alpha, entry, more =
-                RankedCell(data.lists[i], data.rank, data.count, i)
+        elseif data.kind == "note" and data.lists then
+            -- A row past the end of the active column's list. The active
+            -- column has run out here, so it reads "--" like any other column
+            -- that has; the rest show their own entry at this rank.
+            if i == data.col then
+                value = "--"
+            else
+                value, alpha, entry, more =
+                    RankedCell(data.lists[i], data.rank, data.count, i)
+            end
+        elseif data.kind == "note" and data.omitted then
+            -- Contributors past the storage cap, counted under each column
+            -- that dropped any.
+            local dropped = data.omitted[i]
+            value = dropped and ("+%d"):format(dropped) or ""
         end
         cell.entry, cell.more = entry, more
 
@@ -1571,8 +1590,12 @@ local function Populate(row, data)
         -- Always set, not only when fading: the pool hands a faded cell to the
         -- next row that needs one.
         cell.text:SetAlpha(alpha)
+        -- A note's cells take the mouse only where there is something to say:
+        -- another column's entry, which can be clicked to, or a dropped count,
+        -- which has a tooltip explaining it.
         cell:EnableMouse(data.kind ~= "note"
-                         or (data.lists ~= nil and i ~= data.col))
+                         or (data.lists ~= nil and i ~= data.col)
+                         or (data.omitted ~= nil and data.omitted[i] ~= nil))
     end
 
     for i = #columns + 1, #row.cells do row.cells[i]:Hide() end
