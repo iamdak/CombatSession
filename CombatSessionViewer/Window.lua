@@ -1652,7 +1652,16 @@ local function LayoutHeader()
             button.text = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
             button.text:SetPoint("RIGHT", -8, 0)
             button.col = i
-            button:SetScript("OnClick", function(self)
+            -- A header sorts either way. The left button also makes the column
+            -- active, which is what is usually wanted - reading a measure and
+            -- ranking by it are the same intent. The right button sorts and
+            -- leaves the active column alone, for ranking by one measure while
+            -- still reading another.
+            button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+            button:SetScript("OnClick", function(self, mouseButton)
+                if mouseButton ~= "RightButton" then
+                    Model:SetActiveColumn(self.col)
+                end
                 Model:SetSort(self.col)
                 UI:Refresh()
             end)
@@ -1660,9 +1669,12 @@ local function LayoutHeader()
                 SetHover(nil, self.col)
                 GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
                 GameTooltip:AddLine(Model:Columns()[self.col] or "", 1, 1, 1)
-                GameTooltip:AddLine("Click to sort by this column.", 0.5, 0.7, 1)
-                if self.col ~= Model:ActiveColumn() then
-                    GameTooltip:AddLine("Click a value below to make it the active column.",
+                if self.col == Model:ActiveColumn() then
+                    GameTooltip:AddLine("Click to sort by this column.", 0.5, 0.7, 1)
+                else
+                    GameTooltip:AddLine("Click to sort by this column and make it active.",
+                                        0.5, 0.7, 1)
+                    GameTooltip:AddLine("Right-click to sort without changing the active column.",
                                         0.7, 0.7, 0.7, true)
                 end
                 GameTooltip:Show()
