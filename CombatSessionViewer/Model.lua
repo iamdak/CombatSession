@@ -559,6 +559,7 @@ function Model:ActiveSource()   return state.activeSource end
 -- what opens it. The box sits on the cursor either way, around the whole open
 -- block when there is one and around the single row when there is not.
 function Model:IsSelected(name) return name ~= nil and state.cursorName == name end
+function Model:Cursor()         return state.cursorName end
 
 -- Closes the drill-down. The active column and the cursor stay: closing a
 -- breakdown is not a decision to stop reading that measure, or that player.
@@ -751,9 +752,23 @@ function Model:Rows()
         return math.min(1, (value or 0) / max)
     end
 
+    -- Every row carries three things the window animates by, because the row
+    -- tables themselves are rebuilt on every refresh and cannot be what an
+    -- animation is keyed on:
+    --
+    --   key    a stable identity - the same player, counterpart or spell gets
+    --          the same key in the next rebuild
+    --   block  the open unit's block this row belongs to; `sub` likewise for
+    --          the open counterpart's spell list inside it
+    --   opens  the block a row reveals beneath itself when it is open
     for _, player in ipairs(order) do
+        local root = player.name
+        local block = "b:" .. root
+
         local unitRow = UnitRowData(player)
-        unitRow.frac = Fraction(SortValue(player, activeCol), activeMax)
+        unitRow.frac  = Fraction(SortValue(player, activeCol), activeMax)
+        unitRow.key   = "u:" .. root
+        unitRow.opens = block
         rows[#rows + 1] = unitRow
         if state.cursorName == player.name then state.cursorRow = #rows end
 
@@ -782,8 +797,12 @@ function Model:Rows()
 
             for rank, part in ipairs(parts) do
                 local class = self:ClassOf(part.name)
+                local sub = "sb:" .. root .. ":" .. part.name
                 rows[#rows + 1] = {
                     kind    = "source",
+                    key     = "s:" .. root .. ":" .. part.name,
+                    block   = block,
+                    opens   = sub,
                     name    = part.name,
                     part    = part,
                     col     = activeCol,
@@ -822,6 +841,9 @@ function Model:Rows()
                     for spellRank, use in ipairs(part.spells) do
                         rows[#rows + 1] = {
                             kind  = "spell",
+                            key   = "p:" .. root .. ":" .. part.name .. ":" .. use.name,
+                            block = block,
+                            sub   = sub,
                             name  = use.name,
                             use   = use,
                             id    = use.spellId or use.id,
@@ -856,6 +878,8 @@ function Model:Rows()
                 -- "--" when it is empty too, or "..." when it has more.
                 rows[#rows + 1] = {
                     kind  = "note",
+                    key   = "n:" .. root .. ":empty",
+                    block = block,
                     name  = omitted
                             and ("... %d contributor(s) not stored"):format(omitted)
                             or  "no breakdown recorded for this column",
@@ -867,8 +891,10 @@ function Model:Rows()
             elseif omitted then
                 -- Trails a real list, whose rows already carry every column.
                 rows[#rows + 1] = {
-                    kind = "note",
-                    name = ("... %d smaller contributor(s) not stored"):format(omitted),
+                    kind  = "note",
+                    key   = "n:" .. root .. ":omitted",
+                    block = block,
+                    name  = ("... %d smaller contributor(s) not stored"):format(omitted),
                 }
             end
 

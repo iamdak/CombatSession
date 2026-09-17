@@ -104,6 +104,148 @@ local function SetHover(row, col)
 end
 
 --------------------------------------------------------------------------------
+-- Motion
+--
+-- Two things move rather than jump: the bar on each root row when the active
+-- column changes, and the height of a breakdown as it opens, closes or changes
+-- length. Both used to snap, and with a dozen columns of figures changing at
+-- the same moment the snap was what made a click feel like a lurch.
+--
+-- Both ease exponentially toward a target, the same curve the scrollbars use,
+-- so everything in the window moves with one feel. At this rate a change is
+-- about four-fifths done in a tenth of a second and settled in about a quarter:
+-- long enough for the eye to follow what moved, short enough never to be
+-- waited on.
+--
+-- State is keyed by identity, not held on rows. The row tables are rebuilt on
+-- every refresh and the frames are recycled on every scroll, so neither lives
+-- long enough to carry an animation.
+--
+-- Nothing is stepped while nothing is moving. The window's OnUpdate runs every
+-- frame it is open, so an idle animation system has to cost one test, not a
+-- walk over every player.
+--------------------------------------------------------------------------------
+
+local ANIM_RATE = 14
+
+-- Bar fractions by player name: { cur, target }.
+local barAnim = {}
+
+-- Breakdown heights by block id ("b:<name>", "sb:<name>:<counterpart>").
+--
+-- An open block is animated by its GAP - how far it is from the height its
+-- rows need - rather than by an absolute height. The difference matters when a
+-- spell list opens inside a breakdown: the breakdown's rows need more room
+-- every frame, and a breakdown chasing that as an absolute target would lag
+-- behind it and briefly hide its own bottom rows. A gap is unaffected by what
+-- happens inside, so nested growth passes straight through and a block only
+-- eases when its own contents change.
+--
+--   gap    open: rows' height minus height shown; eases to zero
+--   v      closing: height shown; eases to zero
+--   full   height its rows need, as of the last layout
+--   shown  height it was drawn at on the last layout
+--   fresh  its rows were just rebuilt, so its gap is re-derived from `shown`
+--          at the next layout - which is what keeps the height continuous
+--          across a change of contents
+--   ghost  while closing, the rows it last showed
+--   root   for a spell list, the block it sits inside
+local blocks = {}
+
+local motion = {
+    active  = false,   -- anything left to step
+    rebuild = false,   -- a closing block finished and must leave the list
+}
+
+local function Clamp(value, low, high)
+    if value < low then return low end
+    if value > high then return high end
+    return value
+end
+
+-- A block's shown height. A block with no state yet is shown whole; so is one
+-- whose first measurement is this one, which is how a refresh that should not
+-- animate puts everything straight into place.
+local function BlockHeight(id, full)
+    full = full or 0
+    local b = blocks[id]
+    if not b then return full end
+    b.full = full
+
+    if b.ghost then
+        if (b.v or 0) >= 0.5 then motion.active = true end
+        return b.v or 0
+    end
+
+    -- Measured for the first time since its rows changed. Whatever it was
+    -- drawn at last is where it starts from; a block with no previous drawing
+    -- simply starts where it belongs.
+    --
+    -- The layout is what measures a block, so it is also what notices a block
+    -- is not where it is heading, and has to wake the stepper - which may have
+    -- gone idle on a frame when the difference could not yet be seen.
+    if b.fresh then
+        b.gap = full - (b.shown or full)
+        b.fresh = false
+    end
+    b.gap = b.gap or 0
+    if math.abs(b.gap) >= 0.5 then motion.active = true end
+    return full - b.gap
+end
+
+-- The fraction a root row's bar is drawn at: where it is, not where it is going.
+local function BarFraction(data)
+    if data.kind ~= "unit" then return data.frac or 0 end
+    local a = barAnim[data.name]
+    if a then return a.cur end
+    return data.frac or 0
+end
+
+-- One frame of motion. True when anything moved and the grid needs laying out.
+local function StepMotion(elapsed)
+    if not motion.active then return false end
+
+    local k = math.min(1, elapsed * ANIM_RATE)
+    local moving = false
+
+    for id, b in pairs(blocks) do
+        if b.ghost then
+            local v = b.v or 0
+            if v < 0.5 then
+                -- Gone from the list on the next rebuild. Assigning nil to a
+                -- key already being traversed is allowed.
+                blocks[id] = nil
+                motion.rebuild = true
+            else
+                b.v = v - v * k
+                moving = true
+            end
+        elseif b.gap and b.gap ~= 0 then
+            if math.abs(b.gap) < 0.5 then
+                b.gap = 0
+            else
+                b.gap = b.gap - b.gap * k
+                moving = true
+            end
+        end
+    end
+
+    for _, a in pairs(barAnim) do
+        local diff = a.target - a.cur
+        if math.abs(diff) * NAME_W < 0.5 then
+            a.cur = a.target
+        else
+            a.cur = a.cur + diff * k
+            moving = true
+        end
+    end
+
+    -- One more layout after the last step, so the final positions are drawn.
+    motion.active = moving or motion.rebuild
+    return true
+end
+
+--------------------------------------------------------------------------------
 -- The school line on a spell tooltip
 --
 -- Appending to the game's own spell tooltip cannot be done by calling AddLine
@@ -429,7 +571,7 @@ end
 
 local function CellTooltip(cell)
     local data, col = cell.data, cell.col
-    if not (data and col) then return end
+    if not (data and col) or data.ghost then return end
 
     local columns = Model:Columns()
     GameTooltip:SetOwner(cell, "ANCHOR_RIGHT")
@@ -571,7 +713,9 @@ local function GridCell(row, index)
     -- an open breakdown carries on under the new one.
     cell:SetScript("OnClick", function(self)
         local data = self.data
-        if not data then return end
+        -- A closing breakdown is still drawn for a moment after the model has
+        -- dropped it; its rows describe a state that no longer exists.
+        if not data or data.ghost then return end
 
         -- A note only takes a click when it stands in for an empty block, and
         -- only to change column: there is nothing under it to open.
@@ -727,6 +871,7 @@ local function GridRow(index)
     -- the value cells beside it - but no column, because a name belongs to none.
     row.name:SetScript("OnEnter", function(self)
         SetHover(row, nil)
+        if self.data and self.data.ghost then return end
 
         if self.data and self.data.kind == "unit" then
             UI:UnitTooltip(self, self.data)
@@ -766,7 +911,7 @@ local function GridRow(index)
     row.name:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     row.name:SetScript("OnClick", function(self, button)
         local data = self.data
-        if not data then return end
+        if not data or data.ghost then return end
 
         if button == "RightButton" then
             -- Players only, root or counterpart. The menu copies a character
@@ -1128,6 +1273,24 @@ function UI:SetDeparted(row, side)
     end
 end
 
+-- The bar's length, from where its animation currently is. Split from Populate
+-- because this is the only part of a row that changes on every frame of an
+-- animation, and repopulating twelve cells to move one texture would be most
+-- of the cost of animating at all.
+local function ApplyBar(row, data)
+    local frac = BarFraction(data)
+    if row.barColor and frac > 0 then
+        -- A floor of two pixels so a small but non-zero contribution still
+        -- registers as present rather than reading as nothing at all. Scaled to
+        -- what is left of the cell after the indent, so a full bar still ends
+        -- where a root unit's full bar ends.
+        row.nameBar:SetWidth(math.max(2, frac * (NAME_W - (row.barIndent or 0))))
+        row.nameBar:Show()
+    else
+        row.nameBar:Hide()
+    end
+end
+
 -- Track behind the row, and the bar drawn over it. A nil bar means the row
 -- carries no value worth comparing - a note, or a zero.
 local function RowColors(data, expanded)
@@ -1209,21 +1372,14 @@ local function Populate(row, data)
     -- away name-cell width for nothing.
     local barIndent = BAR_INDENT[data.kind] or 0
 
-    local frac = data.frac or 0
     row.nameBar:ClearAllPoints()
     row.nameBar:SetPoint("TOPLEFT", barIndent, rule and -SEP_H or 0)
     row.nameBar:SetPoint("BOTTOMLEFT", barIndent, 0)
-    if bar and frac > 0 then
-        row.nameBar:SetColorTexture(bar[1], bar[2], bar[3])
-        -- A floor of two pixels so a small but non-zero contribution still
-        -- registers as present rather than reading as nothing at all. Scaled to
-        -- what is left of the cell after the indent, so a full bar still ends
-        -- where a root unit's full bar ends.
-        row.nameBar:SetWidth(math.max(2, frac * (NAME_W - barIndent)))
-        row.nameBar:Show()
-    else
-        row.nameBar:Hide()
-    end
+    if bar then row.nameBar:SetColorTexture(bar[1], bar[2], bar[3]) end
+    -- Kept for ApplyBar, which runs on every frame of an animation without
+    -- repeating the rest of this.
+    row.barColor, row.barIndent = bar, barIndent
+    ApplyBar(row, data)
 
     local indent, text, icon, school = 0, ns.ShortName(data.name) or "", nil, nil
     if data.kind == "unit" then
@@ -1396,6 +1552,20 @@ local function Populate(row, data)
             color = ns.TEXT.recede
         end
 
+        -- "..." is a marker, not a figure, so it sits in the middle of the cell
+        -- rather than on the right edge the numbers align to. Re-anchored only
+        -- when that changes: a pooled cell is repopulated constantly.
+        local centred = (value == "...")
+        if cell.centred ~= centred then
+            cell.text:ClearAllPoints()
+            if centred then
+                cell.text:SetPoint("CENTER")
+            else
+                cell.text:SetPoint("RIGHT", -8, 0)
+            end
+            cell.centred = centred
+        end
+
         cell.text:SetText(value)
         cell.text:SetTextColor(color[1], color[2], color[3])
         -- Always set, not only when fading: the pool hands a faded cell to the
@@ -1508,44 +1678,276 @@ local function LayoutHeader()
     grid.headerTrack:SetWidth(math.max(1, #columns * COL_W))
 end
 
-local function LayoutGrid()
-    local rows  = grid.data
-    local viewH = grid.nameClip:GetHeight()
-    local columns = Model:Columns()
+-- The list actually drawn: the model's rows, with any breakdown that is still
+-- closing spliced back in beneath the row it belonged to.
+--
+-- When a breakdown closes, the model forgets it at once - its rows are simply
+-- not in the next rebuild. Shrinking it smoothly needs those rows for a moment
+-- longer, so the rows it last showed are kept as a ghost and drawn under their
+-- parent while its height eases to nothing. A block that reopens before that
+-- finishes drops its ghost and grows back from wherever it had got to.
+local function BuildDisplay(animate)
+    local target = grid.target or {}
 
-    grid.vscroll:SetMax(#rows * ROW_H - viewH)
-    grid.hscroll:SetMax(#columns * COL_W - grid.valueClip:GetWidth())
+    -- Which blocks the model has open now, and for a spell list, the block it
+    -- sits inside.
+    local live = {}
+    for _, d in ipairs(target) do
+        if d.block and live[d.block] == nil then live[d.block] = false end
+        if d.sub then live[d.sub] = d.block end
+    end
 
-    local first = math.floor(grid.vscroll.cur / ROW_H)
-    local slots = math.ceil(viewH / ROW_H) + 2
+    if not animate then
+        wipe(blocks)
+    else
+        for id, b in pairs(blocks) do
+            if live[id] ~= nil then
+                if b.ghost then
+                    -- Reopened before it finished closing: grow back from the
+                    -- height it had shrunk to.
+                    b.shown, b.ghost, b.v = b.v, nil, nil
+                end
+                -- Its rows are new, so its gap is re-derived at the next
+                -- layout. For a block whose contents did not change this comes
+                -- out as the gap it already had.
+                b.fresh = true
+            elseif not b.ghost then
+                -- Just closed: keep what it was showing, from the height it
+                -- was showing it at.
+                local rows = {}
+                for _, d in ipairs(grid.display or {}) do
+                    if (b.root and d.sub == id) or (not b.root and d.block == id) then
+                        d.ghost = true
+                        rows[#rows + 1] = d
+                    end
+                end
+                if #rows > 0 then
+                    b.ghost, b.v, b.gap = rows, b.shown or 0, nil
+                    motion.active = true
+                else
+                    blocks[id] = nil
+                end
+            end
+        end
 
-    for i = 1, slots do
-        local index = first + i
-        local data  = rows[index]
-        local row   = GridRow(i)
-        local y     = grid.vscroll.cur - (index - 1) * ROW_H
-
-        -- Clipping hides a frame but does not reliably stop it taking a click,
-        -- and the pool deliberately runs two rows past the visible height so
-        -- easing has something to scroll into. Those spare rows sit over the
-        -- horizontal scrollbar, so they are hidden outright rather than left to
-        -- swallow a click aimed at it.
-        if data and y <= ROW_H and y > -(viewH + ROW_H) then
-            Populate(row, data)
-            row.name:ClearAllPoints()
-            row.name:SetPoint("TOPLEFT", grid.nameClip, "TOPLEFT", 0, y)
-            row.values:ClearAllPoints()
-            row.values:SetPoint("TOPLEFT", grid.valueClip, "TOPLEFT", -grid.hscroll.cur, y)
-            row.name:Show()
-            row.values:Show()
-        else
-            row.name:Hide()
-            row.values:Hide()
+        -- A spell list closing inside a breakdown that is itself closing is
+        -- already among that breakdown's ghost rows. Kept separately as well,
+        -- it would be drawn twice.
+        for id, b in pairs(blocks) do
+            if b.ghost and b.root then
+                local outer = blocks[b.root]
+                if not outer or outer.ghost then blocks[id] = nil end
+            end
         end
     end
-    for i = slots + 1, #grid.rows do
-        grid.rows[i].name:Hide()
-        grid.rows[i].values:Hide()
+
+    for id, rootId in pairs(live) do
+        if not blocks[id] then
+            -- A new block was last drawn at no height at all, so it grows from
+            -- there - unless this refresh should simply show the result, in
+            -- which case it has no previous drawing and starts in place.
+            blocks[id] = { shown = animate and 0 or nil, fresh = true,
+                           root = rootId or nil }
+            if animate then motion.active = true end
+        end
+    end
+
+    local display, index = {}, {}
+    local function Emit(d)
+        display[#display + 1] = d
+        if d.key and not d.ghost then index[d.key] = #display end
+        local b = d.opens and blocks[d.opens]
+        if b and b.ghost then
+            for _, g in ipairs(b.ghost) do Emit(g) end
+        end
+    end
+    for _, d in ipairs(target) do Emit(d) end
+
+    grid.display, grid.index = display, index
+end
+
+-- Points each root bar at its new length. Only the root bars move: the rows
+-- beneath are new each time a breakdown changes, so there is nothing for them
+-- to move from.
+local function SetBarTargets(animate)
+    -- Without animation this is a fresh start, and players from another
+    -- session have no business being stepped every frame.
+    if not animate then wipe(barAnim) end
+
+    for _, d in ipairs(grid.target or {}) do
+        if d.kind == "unit" then
+            local frac = d.frac or 0
+            local a = barAnim[d.name]
+            if not a or not animate then
+                barAnim[d.name] = { cur = frac, target = frac }
+            elseif a.target ~= frac then
+                a.target = frac
+                motion.active = true
+            end
+        end
+    end
+end
+
+local function LayoutGrid()
+    local display = grid.display or {}
+    local count   = #display
+    local viewH   = grid.nameClip:GetHeight()
+    local columns = Model:Columns()
+    local scroll  = grid.vscroll.cur
+
+    -- Pass one: each row's natural height, and how much each block needs.
+    --
+    -- A spell row's natural height is how much of it its own list is currently
+    -- showing, so a spell list opening inside a breakdown makes that breakdown
+    -- taller as it goes. A list that has shrunk but not yet finished shrinking
+    -- holds the difference as space after its last row, so the rows below it
+    -- close up smoothly rather than jumping to the new length.
+    local natural, padAfter = {}, {}
+    local subFull, rootFull, subOffset, subDrawn = {}, {}, {}, {}
+    for _, d in ipairs(display) do
+        if d.sub then subFull[d.sub] = (subFull[d.sub] or 0) + ROW_H end
+    end
+    for i = 1, count do
+        local d = display[i]
+        local h = ROW_H
+        if d.sub then
+            local listHeight = BlockHeight(d.sub, subFull[d.sub])
+            local offset = subOffset[d.sub] or 0
+            h = Clamp(listHeight - offset, 0, ROW_H)
+            subOffset[d.sub] = offset + ROW_H
+            local after = display[i + 1]
+            if not (after and after.sub == d.sub) then
+                padAfter[i] = math.max(0, listHeight - subFull[d.sub])
+            end
+            -- The list's own drawn height, before the breakdown around it
+            -- clips anything: what it continues from if its rows change.
+            subDrawn[d.sub] = (subDrawn[d.sub] or 0) + h + (padAfter[i] or 0)
+        end
+        natural[i] = h
+        if d.block then
+            rootFull[d.block] = (rootFull[d.block] or 0) + h + (padAfter[i] or 0)
+        end
+    end
+
+    -- Pass two: where each row sits and how much of it shows. A block reveals
+    -- its rows from the top, so at most one row in it is partly shown; that row
+    -- is drawn at its full height, faded by how much of it is revealed, and the
+    -- rows after it start where the reveal ends.
+    local top, shown = {}, {}
+    local rootOffset, blockShown, subShown = {}, {}, {}
+    local y = 0
+    for i = 1, count do
+        local d = display[i]
+        if d.block then
+            local height = BlockHeight(d.block, rootFull[d.block])
+            local offset = rootOffset[d.block] or 0
+            local visible = Clamp(height - offset, 0, natural[i])
+            local pad = padAfter[i] or 0
+            local padVisible = Clamp(height - (offset + natural[i]), 0, pad)
+            rootOffset[d.block] = offset + natural[i] + pad
+
+            top[i], shown[i] = y, visible
+            y = y + visible + padVisible
+            blockShown[d.block] = (blockShown[d.block] or 0) + visible + padVisible
+            if d.sub then
+                subShown[d.sub] = (subShown[d.sub] or 0) + visible + padVisible
+            end
+
+            local after = display[i + 1]
+            if not (after and after.block == d.block) then
+                local extra = math.max(0, height - rootFull[d.block])
+                y = y + extra
+                blockShown[d.block] = blockShown[d.block] + extra
+            end
+        else
+            top[i], shown[i] = y, ROW_H
+            y = y + ROW_H
+        end
+    end
+    local total = y
+
+    for id, height in pairs(blockShown) do
+        local b = blocks[id]
+        if b and not b.ghost then b.shown = height end
+    end
+    for id, height in pairs(subDrawn) do
+        local b = blocks[id]
+        if b and not b.ghost then b.shown = height end
+    end
+
+    -- Scrolling is bounded by whichever is larger, what is drawn or what will
+    -- be drawn once motion settles. Bounding by the shrinking height alone
+    -- would pull the view up in a jump as a breakdown near the bottom closed.
+    grid.vscroll:SetMax(math.max(total, #(grid.target or {}) * ROW_H) - viewH)
+    grid.hscroll:SetMax(#columns * COL_W - grid.valueClip:GetWidth())
+
+    -- Pool rows are handed out by identity: a row that showed this entry last
+    -- frame shows it again. During an animation the set of visible rows shifts
+    -- by one every few frames, and handing out frames by position would then
+    -- repopulate every row below the shift - twelve cells each - on each of
+    -- those frames. By identity, a row is only repopulated when what it shows
+    -- actually changes.
+    local holder = {}
+    for _, row in ipairs(grid.rows) do
+        row.claimed = false
+        if row.data then holder[row.data] = row end
+    end
+
+    local wanted = {}
+    for i = 1, count do
+        local rowY = scroll - top[i]
+        -- Clipping hides a frame but does not reliably stop it taking a click,
+        -- and rows past the visible height sit over the horizontal scrollbar,
+        -- so they are hidden outright rather than left to swallow a click
+        -- aimed at it.
+        if shown[i] > 0 and rowY <= ROW_H and rowY > -(viewH + ROW_H) then
+            wanted[#wanted + 1] = i
+            local row = holder[display[i]]
+            if row then row.claimed = true end
+        end
+    end
+
+    local spare, nextSpare = {}, 0
+    for _, row in ipairs(grid.rows) do
+        if not row.claimed then spare[#spare + 1] = row end
+    end
+
+    for _, i in ipairs(wanted) do
+        local d = display[i]
+        local row = holder[d]
+        if not (row and row.claimed and row.data == d) then
+            nextSpare = nextSpare + 1
+            row = spare[nextSpare] or GridRow(#grid.rows + 1)
+            row.claimed = true
+        end
+
+        if row.data ~= d or row.version ~= grid.version then
+            Populate(row, d)
+            row.data, row.version = d, grid.version
+        end
+        ApplyBar(row, d)
+
+        local rowY = scroll - top[i]
+        row.name:ClearAllPoints()
+        row.name:SetPoint("TOPLEFT", grid.nameClip, "TOPLEFT", 0, rowY)
+        row.values:ClearAllPoints()
+        row.values:SetPoint("TOPLEFT", grid.valueClip, "TOPLEFT", -grid.hscroll.cur, rowY)
+
+        -- Frame alpha carries to everything the row draws, so one call fades
+        -- the whole row as it is revealed.
+        local alpha = shown[i] / ROW_H
+        row.name:SetAlpha(alpha)
+        row.values:SetAlpha(alpha)
+        row.name:Show()
+        row.values:Show()
+    end
+
+    for _, row in ipairs(grid.rows) do
+        if not row.claimed then
+            row.name:Hide()
+            row.values:Hide()
+            row.data = nil
+        end
     end
 
     grid.headerTrack:ClearAllPoints()
@@ -1563,7 +1965,7 @@ local function LayoutGrid()
                              (activeCol - 1) * COL_W - grid.hscroll.cur, 0)
         -- Stops at the last row, not at the bottom of the window. A box running
         -- on past the data implied there was more of it below.
-        local filled = math.max(0, #rows * ROW_H - grid.vscroll.cur)
+        local filled = math.max(0, total - scroll)
         grid.colBox:SetSize(COL_W,
             math.max(1, math.min(grid.valueClip:GetHeight(), filled)))
         grid.colBox:Show()
@@ -1571,39 +1973,49 @@ local function LayoutGrid()
         grid.colBox:Hide()
     end
 
-    -- Both blocks are placed the same way, so the positioning is written once.
-    -- Extents come from the model's row ranges, not from the rows that happened
-    -- to be drawn: a block's first row is often scrolled off the top while its
-    -- children are still visible, and the bracket has to survive that.
+    -- The selection box and the counterpart bracket, placed from the layout
+    -- above rather than from row counts, so they grow and shrink with the
+    -- breakdown they surround.
     --
     -- Two halves, one per pane, because each is then clipped by its own pane - a
     -- single frame spanning both would draw over the header when a block is
     -- half-scrolled. The value half anchors to the pane rather than to a row's
     -- column track, so it wraps the block instead of sliding off with the
     -- columns.
-    local function PlaceBlock(nameBox, valueBox, first, count)
-        if not first then
+    local function PlaceBox(nameBox, valueBox, i, height)
+        if not i then
             nameBox:Hide()
             valueBox:Hide()
             return
         end
 
-        local y = grid.vscroll.cur - (first - 1) * ROW_H - SEP_H
-        local h = math.max(1, count * ROW_H - SEP_H)
+        local boxY = scroll - top[i] - SEP_H
+        local h = math.max(1, height - SEP_H)
 
         nameBox:ClearAllPoints()
-        nameBox:SetPoint("TOPLEFT", grid.nameClip, "TOPLEFT", 0, y)
+        nameBox:SetPoint("TOPLEFT", grid.nameClip, "TOPLEFT", 0, boxY)
         nameBox:SetSize(NAME_W, h)
         nameBox:Show()
 
         valueBox:ClearAllPoints()
-        valueBox:SetPoint("TOPLEFT", grid.valueClip, "TOPLEFT", 0, y)
+        valueBox:SetPoint("TOPLEFT", grid.valueClip, "TOPLEFT", 0, boxY)
         valueBox:SetSize(math.max(1, grid.valueClip:GetWidth()), h)
         valueBox:Show()
     end
 
-    PlaceBlock(grid.rowBoxName, grid.rowBoxValue, Model:OpenBlock())
-    PlaceBlock(grid.srcBoxName, grid.srcBoxValue, Model:OpenSourceBlock())
+    local index = grid.index or {}
+    local cursor = Model:Cursor()
+    local cursorIndex = cursor and index["u:" .. cursor]
+    PlaceBox(grid.rowBoxName, grid.rowBoxValue, cursorIndex,
+             ROW_H + (cursor and blockShown["b:" .. cursor] or 0))
+
+    local openName, openSource = cursor, Model:ActiveSource()
+    local sourceIndex = openSource and Model:IsOpen()
+                        and index["s:" .. openName .. ":" .. openSource]
+    PlaceBox(grid.srcBoxName, grid.srcBoxValue, sourceIndex or nil,
+             ROW_H + (sourceIndex
+                      and (subShown["sb:" .. openName .. ":" .. openSource] or 0)
+                      or 0))
 
     grid.vbar.syncing, grid.hbar.syncing = true, true
     grid.vbar:SetMinMaxValues(0, math.max(1, grid.vscroll.max))
@@ -1775,11 +2187,27 @@ local function LayoutWarning()
     warning:Show()
 end
 
-function UI:Refresh()
+-- `animate` defaults on: nearly every refresh is the answer to a click. Opening
+-- the window passes false, and so does a change of session, since a different
+-- match has nothing to move from.
+function UI:Refresh(animate)
     if not frame or not frame:IsShown() then return end
+    if animate == nil then animate = true end
+
+    local key = Model:Selected()
+    if key ~= grid.shownKey then
+        grid.shownKey = key
+        animate = false
+    end
 
     sessions.list = Model:Sessions()
-    grid.data     = Model:Rows()
+    grid.target   = Model:Rows()
+    -- Every row's content may have changed, so every visible row repopulates
+    -- once. Frames showing the same entry between refreshes are otherwise left
+    -- alone - which is what keeps animation and scrolling cheap.
+    grid.version  = grid.version + 1
+    SetBarTargets(animate)
+    BuildDisplay(animate)
 
     LayoutWarning()
     ClampWidth()
@@ -1853,7 +2281,9 @@ local function BuildSessionPane(parent)
 end
 
 local function BuildGridPane(parent, sessionPane)
-    grid = { rows = {}, headers = {}, data = {} }
+    -- target: the model's rows. display: those plus any breakdown still closing.
+    grid = { rows = {}, headers = {}, target = {}, display = {}, index = {},
+             version = 0 }
 
     local pane = CreateFrame("Frame", nil, parent)
     pane:SetPoint("TOPLEFT", sessionPane, "TOPRIGHT", PAD, 0)
@@ -2178,7 +2608,14 @@ function UI:Create()
         -- horizontal step whenever the vertical one was still moving.
         local movedV = grid.vscroll:Step(elapsed)
         local movedH = grid.hscroll:Step(elapsed)
-        if movedV or movedH then LayoutGrid() end
+        local moved  = StepMotion(elapsed)
+        -- A breakdown that has finished closing leaves the drawn list here,
+        -- once, rather than from inside the step that noticed.
+        if motion.rebuild then
+            motion.rebuild = false
+            BuildDisplay(true)
+        end
+        if movedV or movedH or moved then LayoutGrid() end
         if sessions.scroll:Step(elapsed) then LayoutSessions() end
     end)
 
@@ -2213,7 +2650,8 @@ function UI:Show()
     end
 
     frame:Show()
-    self:Refresh()
+    -- Opening the window shows the grid as it is; nothing in it has moved.
+    self:Refresh(false)
 end
 
 function UI:Hide()
