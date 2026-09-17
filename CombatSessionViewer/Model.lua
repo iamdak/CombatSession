@@ -846,15 +846,29 @@ function Model:Rows()
                 end
             end
 
-            if omitted then
+            if #parts == 0 then
+                -- Nothing in the active column, so this note is the whole of
+                -- the block - and it has to behave like a block of one row.
+                -- As a bare note it was blank in every column and ignored the
+                -- mouse, which left no way to get from an empty measure to one
+                -- that has something without leaving the breakdown. Given the
+                -- lists, each other column shows its one row: its only entry,
+                -- "--" when it is empty too, or "..." when it has more.
+                rows[#rows + 1] = {
+                    kind  = "note",
+                    name  = omitted
+                            and ("... %d contributor(s) not stored"):format(omitted)
+                            or  "no breakdown recorded for this column",
+                    col   = activeCol,
+                    rank  = 1,
+                    count = 1,
+                    lists = lists,
+                }
+            elseif omitted then
+                -- Trails a real list, whose rows already carry every column.
                 rows[#rows + 1] = {
                     kind = "note",
                     name = ("... %d smaller contributor(s) not stored"):format(omitted),
-                }
-            elseif #parts == 0 then
-                rows[#rows + 1] = {
-                    kind = "note",
-                    name = "no breakdown recorded for this column",
                 }
             end
 

@@ -483,15 +483,18 @@ local function CellTooltip(cell)
             Hint("Click to break this value down by unit.")
         end
 
-    elseif data.kind == "source" or data.kind == "spell" then
+    elseif data.kind == "source" or data.kind == "spell"
+        or (data.kind == "note" and data.lists) then
         -- In the active column the cell is the row's own figure. Anywhere else
         -- it is that column's entry at this rank, which is usually somebody or
         -- something else - so it is named, or the number is unreadable.
+        --
+        -- An empty block's note ranks counterparts, the same as a source row.
         local entry = cell.entry
         if entry then
             if not isActive then
                 local label = entry.summary and ns.SPELL_TOTALS
-                    or (data.kind == "source"
+                    or (data.kind ~= "spell"
                         and ns.Colorize(ns.ShortName(entry.name) or "",
                                         Model:ClassOf(entry.name))
                         or entry.name)
@@ -501,6 +504,8 @@ local function CellTooltip(cell)
         elseif cell.more then
             GameTooltip:AddLine(("%d more in this column than fit here."):format(cell.more),
                                 0.7, 0.7, 0.7)
+        elseif data.rank == 1 then
+            GameTooltip:AddLine("Nothing recorded in this column.", 0.6, 0.6, 0.6)
         else
             GameTooltip:AddLine("Nothing ranked this far down in this column.",
                                 0.6, 0.6, 0.6)
@@ -566,7 +571,14 @@ local function GridCell(row, index)
     -- an open breakdown carries on under the new one.
     cell:SetScript("OnClick", function(self)
         local data = self.data
-        if not data or data.kind == "note" then return end
+        if not data then return end
+
+        -- A note only takes a click when it stands in for an empty block, and
+        -- only to change column: there is nothing under it to open.
+        if data.kind == "note"
+           and not (data.lists and self.col ~= Model:ActiveColumn()) then
+            return
+        end
 
         if self.col ~= Model:ActiveColumn() then
             Model:SetActiveColumn(self.col)
@@ -1167,6 +1179,7 @@ local function Populate(row, data)
     -- anything revealed beneath it. Only one unit is ever open, so every
     -- counterpart and spell row belongs to it.
     local inBlock = expanded or data.kind == "source" or data.kind == "spell"
+                 or data.kind == "note"
 
     -- Whether this row's active cell is one that was opened to reveal the level
     -- below it: the open unit, and - when its spells are showing - the open
@@ -1333,6 +1346,11 @@ local function Populate(row, data)
                 value, alpha, entry, more =
                     RankedCell(data.lists and data.lists[i], data.rank, data.count, i)
             end
+        elseif data.kind == "note" and data.lists and i ~= data.col then
+            -- An empty block's one row. Its own column has nothing to show,
+            -- which the note's text already says; the others show their row.
+            value, alpha, entry, more =
+                RankedCell(data.lists[i], data.rank, data.count, i)
         end
         cell.entry, cell.more = entry, more
 
@@ -1383,7 +1401,8 @@ local function Populate(row, data)
         -- Always set, not only when fading: the pool hands a faded cell to the
         -- next row that needs one.
         cell.text:SetAlpha(alpha)
-        cell:EnableMouse(data.kind ~= "note")
+        cell:EnableMouse(data.kind ~= "note"
+                         or (data.lists ~= nil and i ~= data.col))
     end
 
     for i = #columns + 1, #row.cells do row.cells[i]:Hide() end
