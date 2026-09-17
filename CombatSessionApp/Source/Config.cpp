@@ -102,6 +102,9 @@ bool Config::Load(const fs::path& path) {
     alertRepeat = (FindValue(text, "alertRepeat") == "every")
                 ? AlertRepeat::Every : AlertRepeat::Once;
 
+    // Defaults off, so an absent key and "false" agree and no guard is needed.
+    alertOnNewSessions = FindValue(text, "alertOnNewSessions") == "true";
+
     auto Number = [&text](const char* key, int& target, int low, int high) {
         if (!Has(text, key)) return;
         const int value = std::atoi(FindValue(text, key).c_str());
@@ -134,6 +137,8 @@ bool Config::Save(const fs::path& path) const {
     out << "  \"reloadSound\": \"" << Escape(reloadSound) << "\",\n";
     out << "  \"alertRepeat\": \""
         << (alertRepeat == AlertRepeat::Every ? "every" : "once") << "\",\n";
+    out << "  \"alertOnNewSessions\": "
+        << (alertOnNewSessions ? "true" : "false") << ",\n";
     out << "  \"pollSeconds\": " << pollSeconds << ",\n";
     out << "  \"repeatSeconds\": " << repeatSeconds << ",\n";
     out << "  \"rawLimit\": " << rawLimit << ",\n";

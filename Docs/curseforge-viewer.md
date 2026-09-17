@@ -20,4 +20,34 @@ or macOS.
 
 # AI Disclosure
 
-As a courtesy to those taking a stance on AI, please note that this addon was created using Claude heavily.  I am a professional software engineer so while this isn't exactly slop, it is certainly a vibe project.  You're welcome to use the CombatSession library as a basis for your own projects, but please include this ai disclosure.
+As a courtesy to those taking a stance on AI, please note that this addon was
+created using Claude heavily.  I am a professional software engineer so while this
+isn't exactly slop, it is certainly a vibe project.  You're welcome to use the
+CombatSession library as a basis for your own projects, but please include this ai
+disclosure.
+
+# How to Read the Data
+
+Clicking a header will sort the data by that category. If you click on any header
+other than the "Player Name" then it will become the active value (indicated with
+a yellow highlight). The comparison bars on the "Player Name" column will reflect
+the active value. Click on any cell to open up the breakdown for that value; this
+does not have to be the active value's column. A yellow row and column indicator
+will highlight the selected breakdown.
+
+
+[Player Name]
+  |
+  |--- Target or Source Player 1
+  | |
+  | |--- Spell 1
+  | |--- Spell 2
+  | `--- Spell 3
+  |
+  |--- Target or Source Player 2
+  | |
+  | |--- Spell 1
+  | |--- Spell 2
+  | `--- Spell 3
+  |
+  etc...

@@ -217,6 +217,33 @@ function API:AppVersions()
     return ns.AppVersions()
 end
 
+-- Told whenever a session's cache is built or dropped.
+--
+-- Caches are built a few at a time across many frames after login, so anything
+-- that draws from them is drawn before most of them exist. A viewer that asks
+-- once and remembers the answer then remembers "nothing here" for every session
+-- that was still being built - which is why a session's W or L appeared only
+-- after it was clicked, since selecting one was the only thing that asked again.
+-- This is how a reader learns that its answer has changed.
+--
+-- Declared here, ahead of the build, because the build's completion callback
+-- closes over it: a local declared after that closure is written would be a
+-- global of the same name as far as the closure is concerned.
+local cacheListeners = {}
+
+function API:OnCacheChanged(fn)
+    if type(fn) == "function" then
+        cacheListeners[#cacheListeners + 1] = fn
+    end
+end
+
+local function NotifyCacheChanged(key)
+    for _, fn in ipairs(cacheListeners) do
+        -- A listener belongs to another addon; its fault is not ours to raise.
+        pcall(fn, key)
+    end
+end
+
 --------------------------------------------------------------------------------
 -- Session discovery
 --------------------------------------------------------------------------------
@@ -454,6 +481,7 @@ local function DropStaleCaches()
         if not CacheIsCurrent(cache) then
             db.cache[key] = nil
             dropped = dropped + 1
+            NotifyCacheChanged(key)
         end
     end
     if dropped > 0 then
@@ -1658,6 +1686,7 @@ function API:BuildCache(key, onDone, onProgress)
                     ns.db.cache = ns.db.cache or {}
                     ns.db.cache[key] = cache
                 end
+                NotifyCacheChanged(key)
                 if onDone then onDone(cache) end
             end)
         end

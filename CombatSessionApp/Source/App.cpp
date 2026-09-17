@@ -382,7 +382,14 @@ void App::RunGenerator() {
         SetStatus(std::to_string(pending) + " session(s) waiting - /reload in game");
 
         SetState(TrayState::NeedsReload);
-        Alert(!wasWaiting);
+
+        // The first arrival always counts. A later one counts only when the
+        // user asked to hear about each session, and only when this pass
+        // actually produced one - a pass run because the addon saved, or
+        // because a setting changed, adds nothing and must stay quiet.
+        const bool arrived = !wasWaiting
+                          || (config_.alertOnNewSessions && added > 0);
+        Alert(arrived);
     }
 
     busy_ = false;

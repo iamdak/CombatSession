@@ -54,6 +54,7 @@ enum ControlId {
     kRepeatOnce,
     kRepeatEvery,
     kRepeatSeconds,
+    kAlertNew,
     kStatusText,
     kVersionBanner,
     kAddonStatus,
@@ -469,6 +470,14 @@ void WindowsShell::BuildControls() {
         kMargin + 146, y + 1, 48, 21, kRepeatSeconds);
     Add(L"STATIC", L"seconds", 0, kMargin + 200, y + 4, 70, 20, -1);
 
+    // Not part of the once-or-repeat group: it is a separate trigger, not a
+    // third way of repeating the first one. Placed under the group, and after
+    // the WS_GROUP radios, so it is not swallowed into their tab stop.
+    y += kRowH + 4;
+    Add(L"BUTTON", L"Play again for each new session waiting to load",
+        BS_AUTOCHECKBOX | WS_GROUP, kMargin + 20, y, kRight - kMargin - 20, kRowH,
+        kAlertNew);
+
     //--- status and actions --------------------------------------------------
     y += kRowH + 12;
     Add(L"STATIC", L"", SS_ETCHEDHORZ, kMargin, y, kRight - kMargin, 2, -1);
@@ -538,13 +547,15 @@ void WindowsShell::WriteControls() {
                   static_cast<UINT>(config.pollSeconds), FALSE);
     SetDlgItemInt(window_, kRepeatSeconds,
                   static_cast<UINT>(config.repeatSeconds), FALSE);
+    CheckDlgButton(window_, kAlertNew,
+                   config.alertOnNewSessions ? BST_CHECKED : BST_UNCHECKED);
 
     // The alert controls mean nothing while the alert is off, and a control
     // that does nothing should not look like it does. Spelled as an array
     // because the ids come from two different enumerations.
     static const int kAlertControls[] = {
         kSoundText, kCmdSetSound, kCmdUseDefaultSound,
-        kRepeatOnce, kRepeatEvery, kRepeatSeconds,
+        kRepeatOnce, kRepeatEvery, kRepeatSeconds, kAlertNew,
     };
     for (int id : kAlertControls) {
         EnableWindow(Item(id), config.soundEnabled);
@@ -579,6 +590,7 @@ void WindowsShell::ReadControls() {
     config.soundEnabled   = IsDlgButtonChecked(window_, kSoundOn)  == BST_CHECKED;
     config.alertRepeat    = IsDlgButtonChecked(window_, kRepeatEvery) == BST_CHECKED
                           ? AlertRepeat::Every : AlertRepeat::Once;
+    config.alertOnNewSessions = IsDlgButtonChecked(window_, kAlertNew) == BST_CHECKED;
 
     // Clamped rather than rejected: someone mid-edit has an empty or silly box
     // for a moment, and that should not be an error dialog. A value out of
@@ -825,6 +837,7 @@ LRESULT WindowsShell::Handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case kSoundOn:
         case kRepeatOnce:
         case kRepeatEvery:
+        case kAlertNew:
             ReadControls();
             controller_.SettingsChanged();
             WriteControls();
@@ -903,7 +916,7 @@ bool WindowsShell::Create() {
     wc.hIconSm       = appIcon;
     RegisterClassExW(&wc);
 
-    RECT wanted{ 0, 0, kWidth, 678 };
+    RECT wanted{ 0, 0, kWidth, 706 };
     AdjustWindowRect(&wanted, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                               WS_MINIMIZEBOX, FALSE);
     const int w = wanted.right - wanted.left;

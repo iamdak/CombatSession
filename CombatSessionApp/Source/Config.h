@@ -83,6 +83,16 @@ struct Config {
     AlertRepeat alertRepeat   = AlertRepeat::Once;
     int         repeatSeconds = 60;
 
+    // Sound again whenever a pass adds a session, even though a reload was
+    // already pending and the alert has already been heard.
+    //
+    // The once-only alert answers "is there anything to load". This answers
+    // "has anything else arrived", which is a different question for someone
+    // playing match after match without reloading: the queue grows and the
+    // icon stays the same red. Off by default, because for most people one
+    // prompt per reload is the right amount of noise.
+    bool alertOnNewSessions = false;
+
     //--------------------------------------------------------------------------
     // Tuning, not shown in the window
     //--------------------------------------------------------------------------

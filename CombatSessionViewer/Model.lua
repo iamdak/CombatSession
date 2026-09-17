@@ -33,8 +33,12 @@ local state = {
     teams        = nil,
 
     activeName   = nil,   -- expanded unit, by player name
-    activeCol    = nil,   -- which column of it is open
-    activeSource = nil,   -- expanded counterpart within that column
+    -- The active column: what the bars measure, what a drill-down breaks down,
+    -- and what the names in an open block are ranked by. Always set - there is
+    -- always something the bars are drawn against - and independent of both
+    -- the sort and of whether anything is open.
+    activeCol    = 1,
+    activeSource = nil,   -- expanded counterpart within the open unit
 
     sortCol      = 1,
     sortAsc      = false,
@@ -155,8 +159,29 @@ local function SessionInfo(entry)
         info.faction = Model:FactionOf(character) or false
     end
 
-    state.info[entry.key] = info
+    -- Only remembered once there was a cache to read. Without one this is not
+    -- an answer, it is "not yet": the library builds caches over many frames
+    -- after login, and the list is drawn long before it finishes. Storing the
+    -- empty result is what kept a W or L off a row until that row was clicked -
+    -- selecting was the only thing that ever asked again.
+    if cache then state.info[entry.key] = info end
     return info
+end
+
+-- Forgets what was worked out about a session, because its cache has just been
+-- built, rebuilt or dropped. The one that is selected is re-read on the spot so
+-- the grid is drawn from the new cache rather than the one it replaced.
+function Model:Invalidate(key)
+    if state.info then state.info[key] = nil end
+    -- Faction is pooled across every cache, so any change can move it.
+    state.factions = nil
+
+    if key and key == state.key then
+        state.key = nil
+        -- Select clears the expansion, which is right: the rows it pointed at
+        -- belong to the old cache and may not exist in the new one.
+        self:Select(key)
+    end
 end
 
 -- Faction by character name, pooled across every cache held.
@@ -199,8 +224,10 @@ function Model:Select(key)
     if state.key == key then return end
 
     state.key          = key
+    -- The active column survives a change of session: it is a choice about
+    -- what to look at, not about which match, and resetting it on every click
+    -- in the list would undo that choice for no reason.
     state.activeName   = nil
-    state.activeCol    = nil
     state.activeSource = nil
     state.entry        = nil
     state.cache        = nil
@@ -271,6 +298,59 @@ function Model:HonorOf(name)
     return map[name] or map[BaseName(name)]
 end
 
+-- A player as a root row describes them, in the one shape that the grid, the
+-- player tooltip and the name menu all read. Kept in one place so a counterpart
+-- in a breakdown is described exactly as the same player is at the root.
+local function UnitRowData(player)
+    local byId = ns.SpecById(player.specId)
+    return {
+        kind     = "unit",
+        name     = player.name,
+        -- Recorder first, log second, for every one of these. The scoreboard
+        -- names a spec in the client's language; the log names it by id, which
+        -- also yields the class. Honor is the reverse: the scoreboard has none
+        -- at all, so the log usually answers it.
+        class    = player.class or (byId and byId.class) or nil,
+        spec     = (player.player and player.player.spec)
+                   or (byId and byId.name) or nil,
+        specId   = player.specId,
+        honor    = Model:HonorOf(player.name) or player.honor,
+        team     = player.team,
+        -- Set only for a player the scoreboard does not list. They are shown
+        -- on the side their reaction implies, but marked as not counted.
+        departed = (player.team == nil) and player.inferredTeam or nil,
+        unit     = player.unit,
+        player   = player,
+    }
+end
+
+-- The same description for a name met somewhere other than the root - a
+-- counterpart in a breakdown - or nil when that name is not a player here.
+--
+-- Counterparts are named the way the log names them, realm and region
+-- included, so the log's own name is tried first. The realm-stripped fallback
+-- is taken only when it is unambiguous: two players sharing a name on
+-- different realms is ordinary in a battleground, and guessing between them
+-- would show one player's details on the other's row.
+function Model:PlayerData(name)
+    if not (name and state.players) then return nil end
+
+    for _, player in ipairs(state.players) do
+        if player.name == name or (player.unit and player.unit.name == name) then
+            return UnitRowData(player)
+        end
+    end
+
+    local base, found = BaseName(name), nil
+    for _, player in ipairs(state.players) do
+        if BaseName(player.name) == base then
+            if found then return nil end   -- ambiguous
+            found = player
+        end
+    end
+    return found and UnitRowData(found) or nil
+end
+
 function Model:Selected()   return state.key end
 function Model:Cache()      return state.cache end
 function Model:Entry()      return state.entry end
@@ -315,6 +395,84 @@ function Model:Dampening()
     return state.cache and state.cache.dampening or nil
 end
 
+-- The scoreboard column that decides each kind of battleground, with the short
+-- name the summary gives it. Earlier entries win when a map has several: Eye of
+-- the Storm has both flags and bases, and keeps a score as well, which is used
+-- ahead of either when it was captured.
+--
+-- Matched on the English column names. Another client language falls through to
+-- the map's first column under its own name, which is still the right kind of
+-- figure - the scoreboard lists the objective columns first.
+local WIN_COLUMNS = {
+    { name = "Flag Captures",     label = "Flags"   },
+    { name = "Victory Points",    label = "Points"  },
+    { name = "Carts Controlled",  label = "Carts"   },
+    { name = "Azerite Collected", label = "Azerite" },
+    { name = "Bases Assaulted",   label = "Bases"   },
+    { name = "Orb Possessions",   label = "Orbs"    },
+}
+
+local function WinColumn(columns)
+    if not (columns and columns[1]) then return nil end
+    for _, wanted in ipairs(WIN_COLUMNS) do
+        for _, column in ipairs(columns) do
+            if column.name == wanted.name then return column, wanted.label end
+        end
+    end
+    return columns[1], columns[1].name or "Objective"
+end
+
+-- What decided the match, per team: { label = "Flags", [1] = 3, [2] = 1 }, or
+-- nil where there is nothing to say.
+--
+-- Battlegrounds only. An arena is won by elimination, and there is no figure
+-- for that beyond the outcome already on the line.
+--
+-- The recorder's widget reading comes first, because where a map keeps a score
+-- that score IS the win condition. Otherwise the map's deciding scoreboard
+-- column, summed over each side's players - which for a capture-the-flag map is
+-- exactly the number of flags that side took. Both come from the recorder, so a
+-- match played without it, or before this was captured, has neither.
+function Model:Objective()
+    local match, teams, entry = state.match, state.teams, state.entry
+    if not (match and teams and entry) then return nil end
+    if entry.type ~= "battleground" then return nil end
+
+    -- Every scoring battleground draws its bar Alliance on the left, Horde on
+    -- the right. Sides are numbered the way the scoreboard numbers them.
+    local score = match.score
+    if score and score.left and score.right then
+        local out = { label = "Score" }
+        for i = 1, 2 do
+            local side = teams[i] and teams[i].side
+            if side == 1 then
+                out[i] = score.left
+            elseif side == 0 then
+                out[i] = score.right
+            end
+        end
+        if out[1] or out[2] then return out end
+    end
+
+    local column, label = WinColumn(match.statColumns)
+    if not column then return nil end
+
+    local out, any = { label = label }, false
+    for _, player in ipairs(state.players or {}) do
+        local stats = player.player and player.player.stats
+        local value = stats and stats[column.id]
+        if value and player.team then
+            out[player.team] = (out[player.team] or 0) + value
+            any = true
+        end
+    end
+    if not any then return nil end
+
+    -- A side that scored nothing scored zero, which is worth saying.
+    out[1], out[2] = out[1] or 0, out[2] or 0
+    return out
+end
+
 function Model:Columns()
     local cache = state.cache
     if cache and cache.FORMAT and cache.FORMAT.columns then
@@ -330,13 +488,17 @@ end
 -- Sorting
 --------------------------------------------------------------------------------
 
--- Column 0 is the name column, which is a sort but not a measure: there is no
--- quantity behind it, so it cannot be what the bars are drawn against. The last
--- numeric column chosen stays the bar column while a name sort is in effect,
--- which is what keeps the grid readable when the order is alphabetical.
+-- Column 0 is the name column, which sorts but measures nothing.
 local NAME_COL = 0
 ns.NAME_COL = NAME_COL
 
+-- Sorting and the active column are two separate choices.
+--
+-- They used to be one: clicking a header both reordered the rows and moved the
+-- bars to that column. That made it impossible to rank players by one measure
+-- while reading another, and meant a header click could silently change what a
+-- drill-down was about. A header now only sorts. The active column is chosen by
+-- clicking a value in it.
 function Model:SetSort(col)
     if state.sortCol == col then
         state.sortAsc = not state.sortAsc
@@ -346,33 +508,34 @@ function Model:SetSort(col)
         -- direction anyone means by "sort by name".
         state.sortAsc = (col == NAME_COL)
     end
-    if col ~= NAME_COL then state.barCol = col end
 
     if ns.db then
         ns.db.sortCol = state.sortCol
         ns.db.sortAsc = state.sortAsc
-        ns.db.barCol  = state.barCol
     end
 end
 
 function Model:Sort() return state.sortCol, state.sortAsc end
 
--- The column the bars are scaled against, which is the sort column unless the
--- sort is alphabetical.
-function Model:BarColumn()
-    if state.sortCol ~= NAME_COL then return state.sortCol end
-    return state.barCol or 1
+-- The active column. Kept in the saved setting that used to hold the bar
+-- column, because it is the same choice under a better rule: what the bars are
+-- drawn against.
+function Model:ActiveColumn() return state.activeCol or 1 end
+function Model:BarColumn()    return self:ActiveColumn() end
+
+function Model:SetActiveColumn(col)
+    if not col or col < 1 then return end
+    state.activeCol = col
+    if ns.db then ns.db.barCol = col end
 end
 
--- Saved settings are read at load; the model is built before them, so the sort
--- has to be pulled across rather than assumed.
+-- Saved settings are read at load; the model is built before them, so both
+-- choices have to be pulled across rather than assumed.
 function Model:RestoreSort()
     if not ns.db then return end
-    state.sortCol = ns.db.sortCol or 1
-    state.sortAsc = ns.db.sortAsc or false
-    state.barCol  = ns.db.barCol
-        or (state.sortCol ~= NAME_COL and state.sortCol)
-        or 1
+    state.sortCol   = ns.db.sortCol or 1
+    state.sortAsc   = ns.db.sortAsc or false
+    state.activeCol = ns.db.barCol or 1
 end
 
 local function SortValue(row, col)
@@ -384,34 +547,31 @@ end
 --------------------------------------------------------------------------------
 
 function Model:IsExpanded(name) return state.activeName == name end
-function Model:ActiveColumn()   return state.activeCol end
+function Model:IsOpen()         return state.activeName ~= nil end
 function Model:ActiveSource()   return state.activeSource end
 
+-- Closes the drill-down. The active column stays: closing a breakdown is not a
+-- decision to stop reading that measure.
 function Model:Collapse()
     state.activeName   = nil
-    state.activeCol    = nil
     state.activeSource = nil
 end
 
--- Clicking a value opens that column. Clicking the same value again closes it,
--- which is the only way a cell click can be undone without moving the mouse to
--- the name.
-function Model:ToggleColumn(name, col, unit)
+-- Opens a unit's breakdown in the active column, or closes it if it is the one
+-- already open. Only one unit is open at a time, so opening another closes the
+-- first. A player with nothing in the log has nothing to break down.
+--
+-- The root name used to be inert while collapsed, on the reasoning that there
+-- was no column to open until one had been chosen. There always is now - the
+-- active column - so the name is the natural thing to click.
+function Model:ToggleExpand(name, unit)
     if not unit then return end
-    if state.activeName == name and state.activeCol == col then
+    if state.activeName == name then
         self:Collapse()
         return
     end
     state.activeName   = name
-    state.activeCol    = col
     state.activeSource = nil
-end
-
--- The root name is inert while collapsed, per the layout: there is nothing to
--- show until a column has been chosen, so a click there would either do nothing
--- visible or guess at a column on the user's behalf.
-function Model:ClickName(name)
-    if state.activeName == name then self:Collapse() end
 end
 
 function Model:ToggleSource(sourceName)
@@ -448,6 +608,73 @@ function Model:OpenSourceBlock()
     return range.first, range.count
 end
 
+-- One column of a unit's breakdown, as the drill-down shows it: the unit's
+-- spell totals first when it has any, then each counterpart, largest first.
+--
+-- Built for every column of the open unit, not only the active one, because an
+-- open block now shows a value in every column. Each column is its own ranked
+-- list; row N of the block shows the Nth entry of each. Only the active column's
+-- list decides how many rows there are and what they are called.
+--
+-- "Spell Totals" answers the question the per-counterpart lists cannot: what
+-- did this unit actually cast? The same spells summed across everyone they were
+-- used on. It leads the list because it is the whole of which the rest are
+-- parts, and because it leads every column it lines up across all of them.
+--
+-- Its own value is the unit's column total rather than the sum of the spells
+-- beneath it. The itemisation is capped, so the two can differ, and the total
+-- is the figure that is exact.
+local function ColumnList(api, cache, unit, col)
+    local parts, omitted = api:Breakdown(cache, unit.index, col)
+
+    -- Breakdown sorts largest-first, so before the summary goes in, the first
+    -- entry is the largest counterpart - the scale every counterpart bar uses.
+    local partMax = parts[1] and parts[1].v or 0
+
+    local totals, spellOrder = {}, {}
+    for _, part in ipairs(parts) do
+        for _, use in ipairs(part.spells or {}) do
+            local slot = totals[use.name]
+            if not slot then
+                slot = { name = use.name, id = use.id,
+                         spellId = use.spellId, school = use.school,
+                         v = 0, n = 0 }
+                totals[use.name] = slot
+                spellOrder[#spellOrder + 1] = slot
+            end
+            slot.v = slot.v + (use.v or 0)
+            slot.n = slot.n + (use.n or 0)
+            -- The extremes carry across the merge: the largest hit on anyone
+            -- is still the largest hit.
+            if use.mn and (not slot.mn or use.mn < slot.mn) then slot.mn = use.mn end
+            if use.mx and (not slot.mx or use.mx > slot.mx) then slot.mx = use.mx end
+        end
+    end
+
+    if #spellOrder > 0 then
+        table.sort(spellOrder, function(a, b) return a.v > b.v end)
+        table.insert(parts, 1, {
+            name    = SPELL_TOTALS,
+            v       = unit.cols[col] or 0,
+            n       = (unit.counts and unit.counts[col]) or 0,
+            spells  = spellOrder,
+            summary = true,
+        })
+    end
+
+    return parts, omitted, partMax
+end
+
+-- The entry with a given name in a list, or nil. Counterparts are unique by name
+-- within a column, and the summary is named SPELL_TOTALS in every column, so a
+-- plain name match finds "the same thing" in another column either way.
+local function FindEntry(list, name)
+    for _, entry in ipairs(list or {}) do
+        if entry.name == name then return entry end
+    end
+    return nil
+end
+
 function Model:Rows()
     local rows = {}
     local cache = state.cache
@@ -455,9 +682,13 @@ function Model:Rows()
     if not (cache and state.players) then return rows end
 
     local api = ns:API()
+    local columns = self:Columns()
     local sortCol, asc = state.sortCol, state.sortAsc
-    -- The measure, which is the sort unless the sort is by name.
-    local col = self:BarColumn()
+
+    -- A saved active column from a build with more columns than this session
+    -- carries would point past the end of the grid.
+    if (state.activeCol or 1) > #columns then state.activeCol = 1 end
+    local activeCol = self:ActiveColumn()
 
     -- Realm-stripped and case-folded, so an alphabetical sort reads the way the
     -- names are drawn rather than the way they are stored: "aiden-Ravencrest"
@@ -482,13 +713,13 @@ function Model:Rows()
         return av > bv
     end)
 
-    -- Bars are scaled so the largest value in the active column fills the
-    -- name cell, and every deeper level rescales against its own siblings. A
-    -- single global scale would make every drill-down bar a sliver, which is
-    -- the opposite of what the level is for: comparing that level's entries.
+    -- Bars are scaled so the largest value in the active column fills the name
+    -- cell, and every deeper level rescales against its own siblings. A single
+    -- global scale would make every drill-down bar a sliver, which is the
+    -- opposite of what the level is for: comparing that level's entries.
     local activeMax = 0
     for _, player in ipairs(order) do
-        local value = SortValue(player, col)
+        local value = SortValue(player, activeCol)
         if value > activeMax then activeMax = value end
     end
     local function Fraction(value, max)
@@ -497,92 +728,51 @@ function Model:Rows()
     end
 
     for _, player in ipairs(order) do
-        local byId = ns.SpecById(player.specId)
+        local unitRow = UnitRowData(player)
+        unitRow.frac = Fraction(SortValue(player, activeCol), activeMax)
+        rows[#rows + 1] = unitRow
 
-        rows[#rows + 1] = {
-            kind     = "unit",
-            name     = player.name,
-            -- Recorder first, log second, for every one of these. The
-            -- scoreboard names a spec in the client's language; the log names
-            -- it by id, which also yields the class. Honor is the reverse: the
-            -- scoreboard has none at all, so the log usually answers it.
-            class    = player.class or (byId and byId.class) or nil,
-            spec     = (player.player and player.player.spec)
-                       or (byId and byId.name) or nil,
-            specId   = player.specId,
-            honor    = self:HonorOf(player.name) or player.honor,
-            team     = player.team,
-            -- Set only for a player the scoreboard does not list. They are shown
-            -- on the side their reaction implies, but marked as not counted.
-            departed = (player.team == nil) and player.inferredTeam or nil,
-            unit     = player.unit,
-            player   = player,
-            frac     = Fraction(SortValue(player, col), activeMax),
-        }
-
-        if state.activeName == player.name and state.activeCol and player.unit then
+        if state.activeName == player.name and player.unit then
             local blockFirst = #rows
-            local parts, omitted =
-                api:Breakdown(cache, player.unit.index, state.activeCol)
 
-            -- Breakdown returns both levels already sorted largest-first, so the
-            -- first entry is the maximum and no second pass is needed.
-            local partMax = parts[1] and parts[1].v or 0
+            local lists, omitted, partMax = {}, nil, 0
+            for c = 1, #columns do
+                local list, dropped, largest = ColumnList(api, cache, player.unit, c)
+                lists[c] = list
+                if c == activeCol then omitted, partMax = dropped, largest end
+            end
+            local parts = lists[activeCol] or {}
 
-            -- "Spell Totals" answers the question the per-counterpart lists
-            -- cannot: what did this unit actually cast? The same spells summed
-            -- across everyone they were used on. It leads the list because it is
-            -- the whole of which the rest are parts.
-            --
-            -- Its own value is the unit's column total rather than the sum of
-            -- the spells beneath it. The itemisation is capped, so the two can
-            -- differ, and the total is the figure that is exact.
-            local totals, spellOrder = {}, {}
-            for _, part in ipairs(parts) do
-                for _, use in ipairs(part.spells or {}) do
-                    local slot = totals[use.name]
-                    if not slot then
-                        slot = { name = use.name, id = use.id,
-                                 spellId = use.spellId, school = use.school,
-                                 v = 0, n = 0 }
-                        totals[use.name] = slot
-                        spellOrder[#spellOrder + 1] = slot
-                    end
-                    slot.v = slot.v + (use.v or 0)
-                    slot.n = slot.n + (use.n or 0)
-                    -- The extremes carry across the merge: the largest hit on
-                    -- anyone is still the largest hit.
-                    if use.mn and (not slot.mn or use.mn < slot.mn) then
-                        slot.mn = use.mn
-                    end
-                    if use.mx and (not slot.mx or use.mx > slot.mx) then
-                        slot.mx = use.mx
-                    end
+            -- A counterpart opened under another column may not exist in this
+            -- one, or may exist with no spells behind it. Either way there is
+            -- nothing to show open, so it is closed rather than left claiming a
+            -- level that has no rows - which would take the yellow off every
+            -- counterpart and put it nowhere.
+            if state.activeSource then
+                local kept = FindEntry(parts, state.activeSource)
+                if not (kept and kept.spells and #kept.spells > 0) then
+                    state.activeSource = nil
                 end
             end
 
-            if #spellOrder > 0 then
-                table.sort(spellOrder, function(a, b) return a.v > b.v end)
-                local unit = player.unit
-                table.insert(parts, 1, {
-                    name    = SPELL_TOTALS,
-                    v       = unit.cols[state.activeCol] or 0,
-                    n       = (unit.counts and unit.counts[state.activeCol]) or 0,
-                    spells  = spellOrder,
-                    summary = true,
-                })
-            end
-
-            for _, part in ipairs(parts) do
+            for rank, part in ipairs(parts) do
                 local class = self:ClassOf(part.name)
                 rows[#rows + 1] = {
                     kind    = "source",
                     name    = part.name,
                     part    = part,
-                    col     = state.activeCol,
+                    col     = activeCol,
                     team    = player.team,
                     class   = class,
                     summary = part.summary,
+                    -- Where this row sits, and the lists the other columns
+                    -- draw their Nth entry from.
+                    rank    = rank,
+                    count   = #parts,
+                    lists   = lists,
+                    -- The player behind a counterpart, for the same tooltip and
+                    -- menu a root row gets. Nil for pets, NPCs and the summary.
+                    playerData = (not part.summary) and self:PlayerData(part.name) or nil,
                     -- The summary line is the whole, so it always fills. Scaled
                     -- against the counterparts it would simply be the longest
                     -- bar and would squash every real one beside it.
@@ -591,17 +781,32 @@ function Model:Rows()
 
                 if state.activeSource == part.name and part.spells then
                     local sourceFirst = #rows   -- the counterpart row just added
+
+                    -- The same counterpart's spells in every other column. Its
+                    -- spells in column C are what it did to this unit in the
+                    -- measure C counts, so a row reads across as one spell
+                    -- list per measure, all for the one counterpart that was
+                    -- opened.
+                    local spellLists = {}
+                    for c = 1, #columns do
+                        local same = FindEntry(lists[c], part.name)
+                        spellLists[c] = (same and same.spells) or {}
+                    end
+
                     local spellMax = part.spells[1] and part.spells[1].v or 0
-                    for _, use in ipairs(part.spells) do
+                    for spellRank, use in ipairs(part.spells) do
                         rows[#rows + 1] = {
                             kind  = "spell",
                             name  = use.name,
                             use   = use,
                             id    = use.spellId or use.id,
-                            col   = state.activeCol,
+                            col   = activeCol,
                             -- The spells belong to the counterpart, so they keep
                             -- that unit's class colour rather than the root's.
                             class = class,
+                            rank  = spellRank,
+                            count = #part.spells,
+                            lists = spellLists,
                             frac  = Fraction(use.v, spellMax),
                         }
                     end

@@ -49,7 +49,7 @@ local SUMMARY_BAND_ALPHA = 0.90
 
 -- The summary field that belongs to the match rather than to either team: how
 -- long it ran on the top line, and the dampening it ended on beneath.
-local SUMMARY_RIGHT = 7
+local SUMMARY_RIGHT = 8
 
 local SCHOOL_W      = 5     -- school stripe down the left edge of a spell icon
 local SPELL_W       = ROW_H - 6
@@ -378,6 +378,55 @@ end
 -- Grid rows
 --------------------------------------------------------------------------------
 
+-- Whether a counterpart row opens into anything. One with no spells recorded is
+-- a leaf, and treating it as openable would bracket an empty block.
+--
+-- Declared ahead of the cell and row builders, whose click handlers close over it.
+local function HasSpells(data)
+    if not (data and data.kind == "source" and data.part) then return false end
+    return (data.part.spells ~= nil) and (#data.part.spells > 0)
+end
+
+-- What a non-active column shows at one row of an open block.
+--
+-- Each column is its own ranked list, and the active column's length decides
+-- how many rows there are. So another column can run out early - its remaining
+-- rows read "--" - or have more than fit, in which case the last row stands in
+-- for the rest as "..." and the rows leading into it fade, which says "this
+-- carries on" without implying the list simply ended.
+--
+-- The fade needs rows to happen over. With fewer than FADE_ROWS above the
+-- "...", a fade is a couple of rows at odd opacities rather than a fade, so it
+-- is left out and only the "..." is shown - including the one-row case, where
+-- the "..." is the whole of it.
+--
+-- Returns the text, an opacity, the entry shown (or nil), and how many entries
+-- the "..." stands for (or nil).
+local FADE_ROWS = 3
+
+local function RankedCell(list, rank, count, col)
+    local length = list and #list or 0
+
+    if length <= count then
+        local entry = list and list[rank]
+        if not entry then return "--", 1, nil, nil end
+        return ns.FormatCell(col, entry.v, entry.n), 1, entry, nil
+    end
+
+    if rank >= count then
+        return "...", 1, nil, length - count + 1
+    end
+
+    local entry = list[rank]
+    local alpha = 1
+    if count - 1 >= FADE_ROWS then
+        -- 1 for the row just above the "...", FADE_ROWS for the first to fade.
+        local fromEnd = count - rank
+        if fromEnd <= FADE_ROWS then alpha = fromEnd / (FADE_ROWS + 1) end
+    end
+    return ns.FormatCell(col, entry.v, entry.n), alpha, entry, nil
+end
+
 local function CellTooltip(cell)
     local data, col = cell.data, cell.col
     if not (data and col) then return end
@@ -415,19 +464,53 @@ local function CellTooltip(cell)
         end
     end
 
+    local isActive = (col == Model:ActiveColumn())
+    local function Hint(text)
+        GameTooltip:AddLine(" ")
+        GameTooltip:AddLine(text, 0.5, 0.7, 1)
+    end
+
     if data.kind == "unit" and data.unit then
         Detail(data.unit.cols[col] or 0,
                data.unit.counts and data.unit.counts[col] or 0)
-        GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("Click to break this value down by unit.", 0.5, 0.7, 1)
-    elseif data.kind == "source" and col == data.col then
-        Detail(data.part.v, data.part.n)
-        GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("Click to break this down by spell.", 0.5, 0.7, 1)
-    elseif data.kind == "spell" and col == data.col then
-        Detail(data.use.v, data.use.n, data.use.mn, data.use.mx)
-    else
-        GameTooltip:AddLine("Not part of the open breakdown.", 0.6, 0.6, 0.6)
+        if not isActive then
+            Hint("Click to make this the active column.")
+        elseif Model:IsExpanded(data.name) then
+            Hint("Click to close this breakdown.")
+        else
+            Hint("Click to break this value down by unit.")
+        end
+
+    elseif data.kind == "source" or data.kind == "spell" then
+        -- In the active column the cell is the row's own figure. Anywhere else
+        -- it is that column's entry at this rank, which is usually somebody or
+        -- something else - so it is named, or the number is unreadable.
+        local entry = cell.entry
+        if entry then
+            if not isActive then
+                local label = entry.summary and ns.SPELL_TOTALS
+                    or (data.kind == "source"
+                        and ns.Colorize(ns.ShortName(entry.name) or "",
+                                        Model:ClassOf(entry.name))
+                        or entry.name)
+                GameTooltip:AddLine(label or "", 1, 1, 1)
+            end
+            Detail(entry.v, entry.n, entry.mn, entry.mx)
+        elseif cell.more then
+            GameTooltip:AddLine(("%d more in this column than fit here."):format(cell.more),
+                                0.7, 0.7, 0.7)
+        else
+            GameTooltip:AddLine("Nothing ranked this far down in this column.",
+                                0.6, 0.6, 0.6)
+        end
+
+        if not isActive then
+            Hint(cell.more and "Click to make this the active column and see all of them."
+                            or "Click to make this the active column.")
+        elseif data.kind == "source" and data.part.spells and #data.part.spells > 0 then
+            Hint(Model:ActiveSource() == data.name and "Click to close its spells."
+                                                   or "Click to break this down by spell.")
+        end
     end
     GameTooltip:Show()
 end
@@ -439,6 +522,12 @@ local function GridCell(row, index)
     cell = CreateFrame("Button", nil, row.values)
     cell:SetSize(COL_W, ROW_H)
     cell:SetPoint("TOPLEFT", (index - 1) * COL_W, 0)
+
+    -- The yellow wash on an opened value and on the figures it revealed. Under
+    -- the hover light and the text, over the row's own track.
+    cell.bg = cell:CreateTexture(nil, "BACKGROUND")
+    cell.bg:SetAllPoints(cell)
+    cell.bg:Hide()
 
     cell.hi = cell:CreateTexture(nil, "ARTWORK")
     cell.hi:SetAllPoints(cell)
@@ -463,13 +552,23 @@ local function GridCell(row, index)
         SetHover(nil, nil)
         GameTooltip:Hide()
     end)
+    -- A click outside the active column makes that column active and does
+    -- nothing else: the first click on a new measure is a request to look at
+    -- it, and opening or closing something on the same click would be two
+    -- things at once. Inside the active column a click opens or closes
+    -- whatever the cell belongs to.
     cell:SetScript("OnClick", function(self)
         local data = self.data
-        if not data then return end
-        if data.kind == "unit" then
-            Model:ToggleColumn(data.name, self.col, data.unit)
-        elseif data.kind == "source" then
+        if not data or data.kind == "note" then return end
+
+        if self.col ~= Model:ActiveColumn() then
+            Model:SetActiveColumn(self.col)
+        elseif data.kind == "unit" then
+            Model:ToggleExpand(data.name, data.unit)
+        elseif data.kind == "source" and HasSpells(data) then
             Model:ToggleSource(data.name)
+        else
+            return
         end
         UI:Refresh()
     end)
@@ -612,6 +711,13 @@ local function GridRow(index)
             return
         end
 
+        -- A counterpart who is a player is described exactly as they are at the
+        -- root. The data comes from the same builder, so the two can't drift.
+        if self.data and self.data.playerData then
+            UI:UnitTooltip(self, self.data.playerData)
+            return
+        end
+
         -- Only real spell ids get the game's tooltip. Dispel and purge entries
         -- carry a synthetic id standing for an aura-and-dispeller pair, which
         -- no client lookup resolves, so those fall back to the row's own text.
@@ -641,15 +747,21 @@ local function GridRow(index)
         if not data then return end
 
         if button == "RightButton" then
-            UI:NameMenu(self, data)
+            -- Players only, root or counterpart. The menu copies a character
+            -- name, which means nothing for "Spell Totals", a spell, or a pet.
+            if data.kind == "unit" then
+                UI:NameMenu(self, data)
+            elseif data.playerData then
+                UI:NameMenu(self, data.playerData)
+            end
             return
         end
 
+        -- A name always stands for its row's entry in the active column, so a
+        -- click here is the same as a click on that column's cell.
         if data.kind == "unit" then
-            -- Inert while collapsed: there is no column chosen yet, so there is
-            -- nothing this click could open without guessing.
-            Model:ClickName(data.name)
-        elseif data.kind == "source" then
+            Model:ToggleExpand(data.name, data.unit)
+        elseif HasSpells(data) then
             Model:ToggleSource(data.name)
         else
             return
@@ -1012,7 +1124,7 @@ local function RowColors(data, expanded)
         -- The whole root level recedes while a drill-down is open, including the
         -- rows that were not clicked, so the revealed level reads as the
         -- foreground rather than as one more thing competing for attention.
-        if Model:ActiveColumn() then bar = ns.Shade(bar, ns.SHADE.unitOpen) end
+        if Model:IsOpen() then bar = ns.Shade(bar, ns.SHADE.unitOpen) end
         return track, bar
     end
 
@@ -1032,13 +1144,25 @@ local function Populate(row, data)
     local columns = Model:Columns()
     local expanded = (data.kind == "unit") and Model:IsExpanded(data.name)
     local activeCol = Model:ActiveColumn()
+    local open = Model:IsOpen()
 
-    -- The deepest level currently revealed: counterparts once a column is open,
-    -- spells once one of those counterparts is open.
+    -- The deepest level currently revealed: counterparts once a unit is open,
+    -- spells once one of those counterparts is open. Nil when nothing is.
     local innermost
-    if activeCol then
+    if open then
         innermost = Model:ActiveSource() and "spell" or "source"
     end
+
+    -- Whether this row sits inside the open block: the open unit itself, or
+    -- anything revealed beneath it. Only one unit is ever open, so every
+    -- counterpart and spell row belongs to it.
+    local inBlock = expanded or data.kind == "source" or data.kind == "spell"
+
+    -- Whether this row's active cell is one that was opened to reveal the level
+    -- below it: the open unit, and - when its spells are showing - the open
+    -- counterpart.
+    local opened = expanded
+        or (data.kind == "source" and Model:ActiveSource() == data.name)
 
     local track, bar = RowColors(data, expanded)
     row.nameBg:SetColorTexture(track[1], track[2], track[3])
@@ -1090,7 +1214,12 @@ local function Populate(row, data)
         elseif not data.unit then
             text = text .. " |cff886644(no log data)|r"
         end
-        if expanded then text = "|cffffcc00v|r " .. text end
+        -- The same open/closed marker a counterpart row carries, now that the
+        -- name itself opens the row. Absent for a player with no log data,
+        -- since there is nothing to open.
+        if data.unit then
+            text = (expanded and "|cffffcc00v|r " or "|cff777777>|r ") .. text
+        end
 
     elseif data.kind == "source" then
         indent = 18
@@ -1160,8 +1289,8 @@ local function Populate(row, data)
     -- unambiguous test for "this row has a real spell behind it".
     row.name.spellId = icon and data.id or nil
     row.name.school  = school
-    row.name.clickable = (data.kind == "source")
-                      or (data.kind == "unit" and expanded)
+    row.name.clickable = HasSpells(data)
+                      or (data.kind == "unit" and data.unit ~= nil)
 
     -- The cross-hair lights every row it passes over, so clickability can no
     -- longer be "this row highlights". It is carried by how brightly it does.
@@ -1174,44 +1303,73 @@ local function Populate(row, data)
         cell.data = data
         cell:Show()
 
-        local value, active
+        -- Every column carries a value now. A unit row shows its own totals;
+        -- a counterpart or spell row shows its own figure in the active column
+        -- and, in every other column, that column's entry at the same rank.
+        local value, alpha, entry, more = "", 1, nil, nil
         if data.kind == "unit" and data.unit then
             value = ns.FormatCell(i, data.unit.cols[i] or 0,
                                   data.unit.counts and data.unit.counts[i] or 0)
         elseif data.kind == "unit" then
             value = "--"
-        elseif data.kind == "source" then
-            -- Only the column being broken down carries a number here. The rest
-            -- would be a different question entirely - how much this counterpart
-            -- contributed to some other total - and inventing one would read as
-            -- a figure the drill-down does not actually hold.
-            value = (i == data.col) and ns.FormatCell(i, data.part.v, data.part.n) or "--"
-        elseif data.kind == "spell" then
-            value = (i == data.col) and ns.FormatCell(i, data.use.v, data.use.n) or "--"
-        else
-            value = ""
+        elseif data.kind == "source" or data.kind == "spell" then
+            if i == data.col then
+                entry = (data.kind == "source") and data.part or data.use
+                value = ns.FormatCell(i, entry.v, entry.n)
+            else
+                value, alpha, entry, more =
+                    RankedCell(data.lists and data.lists[i], data.rank, data.count, i)
+            end
         end
+        cell.entry, cell.more = entry, more
+
+        local isActiveCol = (i == activeCol)
 
         -- Yellow marks the innermost level on show and nothing above it. Marking
-        -- every level in the open chain put yellow on the root row, on every
-        -- counterpart and on every spell at once, which is three answers to
-        -- "what am I looking at" and no emphasis at all.
-        active = (data.kind == innermost) and (i == data.col)
+        -- every level in the open chain in the same yellow put it on the root
+        -- row, on every counterpart and on every spell at once, which is three
+        -- answers to "what am I looking at" and no emphasis at all. The chain
+        -- is still traceable, but by a paler wash on each value that was
+        -- opened, rather than by the same colour everywhere.
+        local inner  = isActiveCol and innermost ~= nil and data.kind == innermost
+        local parent = isActiveCol and opened
+
+        local wash = (parent and ns.COLOR.cellParent)
+                  or (inner and ns.COLOR.cellInner)
+                  or nil
+        if wash then
+            cell.bg:SetColorTexture(wash[1], wash[2], wash[3], wash[4])
+            cell.bg:Show()
+        else
+            cell.bg:Hide()
+        end
+
+        local color
+        if value == "--" or value == "" then
+            color = ns.TEXT.empty
+        elseif parent then
+            color = ns.TEXT.parent
+        elseif inner then
+            color = ns.TEXT.active
+        elseif not open then
+            color = ns.TEXT.normal
+        elseif inBlock then
+            -- Inside the open block, but not the figures being read. Lighter
+            -- than the rest of the grid, because these are part of the answer:
+            -- the other measures for the same unit, ranked alongside it.
+            color = ns.TEXT.inBlock
+        else
+            -- While a drill-down is up everything outside it recedes, including
+            -- the active column on other units: the same measure, but not what
+            -- is being broken down.
+            color = ns.TEXT.recede
+        end
 
         cell.text:SetText(value)
-        if value == "--" or value == "" then
-            cell.text:SetTextColor(0.35, 0.35, 0.38)
-        elseif active then
-            cell.text:SetTextColor(1, 0.85, 0.3)
-        elseif activeCol then
-            -- While a drill-down is up everything recedes except the figures it
-            -- is actually about, which are the yellow ones above. That includes
-            -- the active column on rows other than the open one: they are the
-            -- same measure, but they are not what is being broken down.
-            cell.text:SetTextColor(0.42, 0.42, 0.45)
-        else
-            cell.text:SetTextColor(0.85, 0.85, 0.85)
-        end
+        cell.text:SetTextColor(color[1], color[2], color[3])
+        -- Always set, not only when fading: the pool hands a faded cell to the
+        -- next row that needs one.
+        cell.text:SetAlpha(alpha)
         cell:EnableMouse(data.kind ~= "note")
     end
 
@@ -1222,25 +1380,34 @@ end
 -- Grid layout
 --------------------------------------------------------------------------------
 
--- The arrow on whichever header is sorting. Ascending is up.
+-- The arrow on whichever header is sorting. Ascending is up. White rather than
+-- yellow, because yellow belongs to the active column.
 local function SortMark(asc)
-    return asc and "|cffffcc00^|r " or "|cffffcc00v|r "
+    return asc and "|cffffffff^|r " or "|cffffffffv|r "
+end
+
+-- A header's sorted look: a grey box and a darker grey fill. Deliberately not
+-- the yellow of the active column, which is a separate choice now.
+local function SetSorted(button, sorted)
+    local fill = sorted and ns.COLOR.sortBg or ns.COLOR.header
+    button.bg:SetColorTexture(fill[1], fill[2], fill[3])
+    for _, edge in ipairs(button.outline) do edge:SetShown(sorted) end
 end
 
 local function LayoutHeader()
     local columns = Model:Columns()
     local sortCol, asc = Model:Sort()
-    local barCol = Model:BarColumn()
+    local activeCol = Model:ActiveColumn()
 
-    -- The name column sorts but does not measure, so it takes the arrow and
-    -- leaves the box on whichever column the bars are still drawn against.
+    local nameSorted = (sortCol == ns.NAME_COL)
     local nameLabel = "Player Name"
-    if sortCol == ns.NAME_COL then
-        nameLabel = SortMark(asc) .. "|cffffd94c" .. nameLabel .. "|r"
+    if nameSorted then
+        nameLabel = SortMark(asc) .. "|cffffffff" .. nameLabel .. "|r"
     else
         nameLabel = "|cff999999" .. nameLabel .. "|r"
     end
     grid.nameHeader.text:SetText(nameLabel)
+    SetSorted(grid.nameHeader, nameSorted)
 
     for i = 1, #columns do
         local button = grid.headers[i]
@@ -1270,33 +1437,36 @@ local function LayoutHeader()
                 GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
                 GameTooltip:AddLine(Model:Columns()[self.col] or "", 1, 1, 1)
                 GameTooltip:AddLine("Click to sort by this column.", 0.5, 0.7, 1)
+                if self.col ~= Model:ActiveColumn() then
+                    GameTooltip:AddLine("Click a value below to make it the active column.",
+                                        0.7, 0.7, 0.7, true)
+                end
                 GameTooltip:Show()
             end)
             button:SetScript("OnLeave", function()
                 SetHover(nil, nil)
                 GameTooltip:Hide()
             end)
-            button.outline = Outline(button, ns.COLOR.active, MARKER_W)
+            button.outline = Outline(button, ns.COLOR.sortBox, MARKER_W)
             grid.headers[i] = button
         end
 
         local label = ns.ColumnLabel(columns[i])
-        local isSort = (i == sortCol)
-        local isBar  = (i == barCol)
-        if isSort then
-            label = SortMark(asc) .. label
-            button.text:SetTextColor(1, 0.85, 0.3)
-        elseif isBar then
-            -- Sorting by name leaves this column carrying the bars without
-            -- being the sort, which is a state worth showing as its own.
-            button.text:SetTextColor(0.90, 0.80, 0.55)
+        local isSort   = (i == sortCol)
+        local isActive = (i == activeCol)
+        if isSort then label = SortMark(asc) .. label end
+
+        -- The text names the active column, in the same yellow as the box that
+        -- runs down it. The box and fill say what is sorted. The two can land
+        -- on one column or two; each look is read on its own.
+        if isActive then
+            button.text:SetTextColor(ns.TEXT.active[1], ns.TEXT.active[2], ns.TEXT.active[3])
+        elseif isSort then
+            button.text:SetTextColor(1, 1, 1)
         else
             button.text:SetTextColor(0.75, 0.75, 0.75)
         end
-
-        -- The box marks what the bars are drawn against, which is the sort
-        -- column unless the sort is alphabetical.
-        for _, edge in ipairs(button.outline) do edge:SetShown(isBar) end
+        SetSorted(button, isSort)
 
         button.text:SetText(label)
         button:Show()
@@ -1349,11 +1519,13 @@ local function LayoutGrid()
     grid.headerTrack:ClearAllPoints()
     grid.headerTrack:SetPoint("TOPLEFT", grid.headerClip, "TOPLEFT", -grid.hscroll.cur, 0)
 
-    -- The active column is the one a drill-down was opened on, so the tall box
-    -- only exists while something is open. It lives inside the value pane and is
-    -- clipped by it, rather than being hidden by hand when it scrolls out.
+    -- The tall box marks the active column, which always exists now - it is
+    -- what the bars measure whether or not anything is open, and with the
+    -- header no longer carrying it this box is the only place it is shown.
+    -- It lives inside the value pane and is clipped by it, rather than being
+    -- hidden by hand when it scrolls out.
     local activeCol = Model:ActiveColumn()
-    if activeCol and activeCol <= #columns then
+    if Model:Cache() and activeCol <= #columns then
         grid.colBox:ClearAllPoints()
         grid.colBox:SetPoint("TOPLEFT", grid.valueClip, "TOPLEFT",
                              (activeCol - 1) * COL_W - grid.hscroll.cur, 0)
@@ -1441,6 +1613,9 @@ local function LayoutSummary()
     -- winner per side, so a match that ended without one marks neither as won.
     local draw = (teams[1].won == false) and (teams[2].won == false)
 
+    -- What decided it, where there is a figure for that.
+    local objective = Model:Objective()
+
     for i = 1, 2 do
         local team = teams[i]
         local fields = grid.summaryRows[i]
@@ -1498,12 +1673,18 @@ local function LayoutSummary()
         -- side was which until you looked away from it.
         UI:SetSummaryBand(i, (i == 1) and ns.COLOR.team1Bar or ns.COLOR.team2Bar)
 
+        local goal = ""
+        if objective and objective[i] then
+            goal = ("|cff888888%s|r %s"):format(objective.label, ns.Commas(objective[i]))
+        end
+
         fields[1]:SetText(("%s |cff888888(%d)|r"):format(label, team.count))
         fields[2]:SetText(outcome)
-        fields[3]:SetText(("|cff888888Damage|r %s"):format(ns.Short(team.damage)))
-        fields[4]:SetText(("|cff888888Healing|r %s"):format(ns.Short(team.healing)))
-        fields[5]:SetText(rating)
-        fields[6]:SetText(mmr)
+        fields[3]:SetText(goal)
+        fields[4]:SetText(("|cff888888Damage|r %s"):format(ns.Short(team.damage)))
+        fields[5]:SetText(("|cff888888Healing|r %s"):format(ns.Short(team.healing)))
+        fields[6]:SetText(rating)
+        fields[7]:SetText(mmr)
         fields[SUMMARY_RIGHT]:SetText(extra)
     end
 end
@@ -1653,9 +1834,12 @@ local function BuildGridPane(parent, sessionPane)
     -- up - "Alliance" and "Horde" are different widths at the same character
     -- count, and colour codes count toward a %-16s while occupying no space at
     -- all. Fixed anchors are the only thing that actually produces columns.
-    -- Six columns of team figures, then a seventh for facts about the match
-    -- itself, sitting past the MMR.
-    grid.summaryFields = { 0, 118, 172, 272, 372, 452, 548 }
+    -- Team figures, then a last field for facts about the match itself,
+    -- sitting past the MMR. The objective sits beside the outcome because it
+    -- is the reason for it. It keeps its column in an arena, where it is empty,
+    -- so the figures after it line up the same in every kind of match.
+    --   name, outcome, objective, damage, healing, rating, MMR, match
+    grid.summaryFields = { 0, 118, 172, 262, 362, 462, 542, 638 }
 
     -- One per summary line, behind the text. BORDER puts them over the pane's
     -- own fill and under the OVERLAY font strings, so no layering by hand.
@@ -1709,7 +1893,8 @@ local function BuildGridPane(parent, sessionPane)
     grid.nameHeader = CreateFrame("Button", nil, pane)
     grid.nameHeader:SetPoint("TOPLEFT", grid.headerClip, "TOPLEFT", -NAME_W, 0)
     grid.nameHeader:SetSize(NAME_W, HEADER_H)
-    Fill(grid.nameHeader, ns.COLOR.header)
+    grid.nameHeader.bg = Fill(grid.nameHeader, ns.COLOR.header)
+    grid.nameHeader.outline = Outline(grid.nameHeader, ns.COLOR.sortBox, MARKER_W)
 
     grid.nameHeader.text =
         grid.nameHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -1724,8 +1909,7 @@ local function BuildGridPane(parent, sessionPane)
         GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
         GameTooltip:AddLine("Player Name", 1, 1, 1)
         GameTooltip:AddLine("Click to sort by name.", 0.5, 0.7, 1)
-        GameTooltip:AddLine("The bars keep the last column you sorted by, since\n"
-                         .. "a name is not a quantity to scale them against.",
+        GameTooltip:AddLine("Click a name to open its breakdown in the active column.",
                             0.7, 0.7, 0.7, true)
         GameTooltip:Show()
     end)

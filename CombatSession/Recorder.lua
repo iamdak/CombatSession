@@ -108,6 +108,142 @@ local function Trace(event, detail)
 end
 
 --------------------------------------------------------------------------------
+-- Plain values
+--
+-- 12.0 can hand back "secret" values from the scoreboard and the UI widgets, and
+-- a secret cannot be compared, used in arithmetic or saved meaningfully. These
+-- turn a value into an ordinary one or into nil, doing the forbidden operation
+-- inside a pcall so a secret is rejected rather than thrown. The comparison is
+-- part of each test on purpose: an operation that quietly produced another
+-- secret would otherwise pass.
+--------------------------------------------------------------------------------
+
+local function SafeCall(fn, ...)
+    local ok, result = pcall(fn, ...)
+    if ok then return result end
+    return nil
+end
+
+local function PlainNumber(value)
+    if type(value) ~= "number" then return nil end
+    return SafeCall(function()
+        local n = value + 0
+        if n ~= n then return nil end   -- NaN, and the comparison is the test
+        return n
+    end)
+end
+
+local function PlainString(value)
+    if type(value) ~= "string" then return nil end
+    return SafeCall(function()
+        local s = value .. ""
+        if s == "" then return nil end
+        return s
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- Objectives
+--
+-- What decides a battleground is not on the scoreboard as a team figure. The
+-- scoreboard carries per-player objective columns - flag captures, bases
+-- assaulted, orbs held, carts escorted - and the team's running score exists
+-- only in the widget across the top of the screen. Both are taken, and the
+-- viewer decides which one says who won: the score where a map keeps one, the
+-- summed columns where it does not.
+--------------------------------------------------------------------------------
+
+-- Column names and order, gathered from the players' own stat entries as the
+-- roster is read. A fallback for a client without the column query.
+local statMeta = {}
+
+-- A player's objective columns as { [statId] = value }, or nil.
+local function ReadStats(list)
+    if type(list) ~= "table" then return nil end
+    local out = {}
+    for _, stat in ipairs(list) do
+        local id    = PlainNumber(stat.pvpStatID or stat.statID)
+        local value = PlainNumber(stat.pvpStatValue or stat.value)
+        if id and value then
+            out[id] = value
+            if not statMeta[id] then
+                statMeta[id] = {
+                    name  = PlainString(stat.name),
+                    order = PlainNumber(stat.orderIndex) or id,
+                }
+            end
+        end
+    end
+    return next(out) and out or nil
+end
+
+-- The map's objective columns, in scoreboard order, as { id, name, order }.
+local function ReadStatColumns()
+    local columns = {}
+
+    if C_PvP and type(C_PvP.GetMatchPVPStatColumns) == "function" then
+        for _, column in ipairs(SafeCall(C_PvP.GetMatchPVPStatColumns) or {}) do
+            local id = PlainNumber(column.pvpStatID)
+            if id then
+                columns[#columns + 1] = {
+                    id    = id,
+                    name  = PlainString(column.name)
+                            or (statMeta[id] and statMeta[id].name),
+                    order = PlainNumber(column.orderIndex) or #columns,
+                }
+            end
+        end
+    end
+
+    if #columns == 0 then
+        for id, meta in pairs(statMeta) do
+            columns[#columns + 1] = { id = id, name = meta.name, order = meta.order }
+        end
+    end
+
+    table.sort(columns, function(a, b) return a.order < b.order end)
+    return #columns > 0 and columns or nil
+end
+
+-- The team score from the top-centre widget, or nil for a map that keeps none.
+--
+-- Found by walking the widget set rather than by a list of widget ids: the ids
+-- differ from map to map and change between patches, while "a two-sided bar in
+-- the top-centre set" is what a scoring battleground looks like on all of them.
+-- Left and right are recorded as the widget draws them; which side is which is
+-- the viewer's call.
+local function ReadWidgetScore()
+    local W = C_UIWidgetManager
+    local V = Enum and Enum.UIWidgetVisualizationType
+    if not (W and V and V.DoubleStatusBar) then return nil end
+    if type(W.GetTopCenterWidgetSetID) ~= "function"
+       or type(W.GetAllWidgetsBySetID) ~= "function"
+       or type(W.GetDoubleStatusBarWidgetVisualizationInfo) ~= "function" then
+        return nil
+    end
+
+    local setID = SafeCall(W.GetTopCenterWidgetSetID)
+    if not setID then return nil end
+
+    for _, widget in ipairs(SafeCall(W.GetAllWidgetsBySetID, setID) or {}) do
+        if widget.widgetType == V.DoubleStatusBar then
+            local info = SafeCall(W.GetDoubleStatusBarWidgetVisualizationInfo,
+                                  widget.widgetID)
+            local left  = info and PlainNumber(info.leftBarValue)
+            local right = info and PlainNumber(info.rightBarValue)
+            if left and right then
+                return {
+                    left  = left,
+                    right = right,
+                    max   = PlainNumber(info.leftBarMax) or PlainNumber(info.rightBarMax),
+                }
+            end
+        end
+    end
+    return nil
+end
+
+--------------------------------------------------------------------------------
 -- Scoreboard
 --------------------------------------------------------------------------------
 
@@ -143,6 +279,10 @@ local function ReadRoster()
                 ratingChange = info.ratingChange,
                 prematchMMR  = info.prematchMMR,
                 mmrChange    = info.mmrChange,
+                -- The map's own scoreboard columns - flag captures, bases,
+                -- orbs, carts. Guarded on its own so a problem with the one
+                -- field that varies by map cannot cost the rest of the row.
+                stats        = SafeCall(ReadStats, info.stats),
             }
         else
             local name, kb, _, deaths, _, faction, race, _, classToken, damage, healing =
@@ -286,10 +426,20 @@ end
 
 -- One ticker for everything sampled during a match. Dampening is arena-only;
 -- honor is worth taking everywhere.
+-- Kept from the last time the widget could be read. By the time the scoreboard
+-- is up the widget has often gone, so the last reading taken while it was on
+-- screen is the final score. Arenas have no such widget.
+local function SampleScore()
+    if not current or current.isArena then return end
+    local reading = SafeCall(ReadWidgetScore)
+    if reading then current.score = reading end
+end
+
 local function SampleMatch()
     if not current then return end
     if current.isArena then SampleDampening() end
     SampleHonor()
+    SampleScore()
 end
 
 local function StopMatchWatch()
@@ -434,6 +584,9 @@ local function CompleteMatch(attempt)
     if not current then return end
     attempt = attempt or 1
 
+    -- Column names are gathered as the roster is read, and belong to this map.
+    if attempt == 1 then statMeta = {} end
+
     Global("RequestBattlefieldScoreData")
     local roster = ReadRoster()
 
@@ -447,6 +600,9 @@ local function CompleteMatch(attempt)
     current.winner   = Global("GetBattlefieldWinner")
     current.roster   = roster
     current.teams    = ReadTeamInfo()
+    -- After the roster, which is what fills in names on a client whose column
+    -- query comes back empty.
+    current.statColumns = SafeCall(ReadStatColumns)
     current.complete = true
 
     -- One last read before the aura goes and the group breaks up: completion is

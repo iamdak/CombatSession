@@ -525,6 +525,33 @@ ns.COLOR = {
     activeDim   = { 0.72, 0.58, 0.12 },   -- the column box, under the header box
     selected    = { 0.20, 0.34, 0.24 },
     neutral     = { 0.45, 0.45, 0.48 },   -- pets and NPCs, which have no class
+
+    -- The sorted header. Grey on purpose: yellow means "the active column" in
+    -- the grid body, and a header that sorted in yellow read as a second claim
+    -- about which column was active.
+    sortBox     = { 0.52, 0.52, 0.56 },
+    sortBg      = { 0.26, 0.26, 0.29 },
+
+    -- Cell washes inside an open block. The innermost level - the figures the
+    -- drill-down is actually about - gets the faint one; each value that was
+    -- opened to reveal them gets the stronger one, so the chain from the root
+    -- down to what is being read can be traced by colour alone.
+    cellInner   = { 1.00, 0.82, 0.20, 0.10 },
+    cellParent  = { 1.00, 0.82, 0.20, 0.22 },
+}
+
+-- Value text. Named because the same few greys are chosen between in several
+-- places and a bare triple does not say which state it belongs to.
+ns.TEXT = {
+    normal   = { 0.85, 0.85, 0.85 },   -- nothing open
+    recede   = { 0.42, 0.42, 0.45 },   -- outside an open block
+    inBlock  = { 0.58, 0.58, 0.62 },   -- inside one, not the thing being read
+    empty    = { 0.35, 0.35, 0.38 },   -- "--"
+    active   = { 1.00, 0.85, 0.30 },   -- the innermost level's own figures
+    -- On the stronger wash. Grey went muddy against yellow and full yellow
+    -- disappeared into it, so an opened value is a pale cream: warm enough to
+    -- belong to the wash, light enough to read on it.
+    parent   = { 1.00, 0.95, 0.80 },
 }
 
 -- Opening a level pushes the whole level behind it back, not just the row that
@@ -565,8 +592,23 @@ loader:RegisterEvent("PLAYER_LOGIN")
 loader:SetScript("OnEvent", function()
     ns:InitDB()
     if ns.CreateMinimapButton then ns:CreateMinimapButton() end
-    if not ns:API() then
+    local api = ns:API()
+    if not api then
         ns:Print("CombatSession is not loaded - there is nothing to view.")
+    elseif api.OnCacheChanged then
+        -- Caches arrive one at a time over the first seconds after login, so a
+        -- redraw per cache would be dozens of full layouts in a row. One redraw
+        -- shortly after the last of a burst is all the window needs.
+        local pending = false
+        api:OnCacheChanged(function(key)
+            if ns.Model then ns.Model:Invalidate(key) end
+            if pending then return end
+            pending = true
+            C_Timer.After(0.2, function()
+                pending = false
+                if ns.UI then ns.UI:Refresh() end
+            end)
+        end)
     end
 
     -- Set by the viewer's own Reload UI button. Cleared before it is acted on,
