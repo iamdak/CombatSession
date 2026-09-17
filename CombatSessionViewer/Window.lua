@@ -1359,10 +1359,9 @@ local function Populate(row, data)
     local opened = expanded
         or (data.kind == "source" and Model:ActiveSource() == data.name)
 
-    -- The selected row takes the lighter track an open row has, collapsed or
-    -- not, so the row under the box reads as the focus and not only as boxed.
-    local selected = (data.kind == "unit") and Model:IsSelected(data.name)
-    local track, bar = RowColors(data, expanded or selected)
+    -- The open row takes a lighter track, so the row under the box reads as the
+    -- focus and not only as boxed. Selected and open are the same thing now.
+    local track, bar = RowColors(data, expanded)
     row.nameBg:SetColorTexture(track[1], track[2], track[3])
     row.valueBg:SetColorTexture(track[1], track[2], track[3])
 
@@ -2028,9 +2027,28 @@ local function LayoutGrid()
 
     local index = grid.index or {}
     local cursor = Model:Cursor()
-    local cursorIndex = cursor and index["u:" .. cursor]
-    PlaceBox(grid.rowBoxName, grid.rowBoxValue, cursorIndex,
-             ROW_H + (cursor and blockShown["b:" .. cursor] or 0))
+
+    -- The box - and the black spacers above and below it - belong to the open
+    -- player, so with nobody open there is none. Rather than vanish at the
+    -- click, it stays on a breakdown that is still closing, shrinks with it,
+    -- and fades out over the last row, so the deselect is as smooth as the
+    -- close. A player opened meanwhile takes it straight away.
+    local boxed, fade = cursor, 1
+    if not boxed then
+        local largest = 0
+        for id, b in pairs(blocks) do
+            local height = blockShown[id] or 0
+            if b.ghost and not b.root and height > largest then
+                boxed, largest = id:sub(3), height   -- "b:<name>"
+            end
+        end
+        if boxed then fade = Clamp(largest / ROW_H, 0, 1) end
+    end
+
+    PlaceBox(grid.rowBoxName, grid.rowBoxValue, boxed and index["u:" .. boxed],
+             ROW_H + (boxed and blockShown["b:" .. boxed] or 0))
+    grid.rowBoxName:SetAlpha(fade)
+    grid.rowBoxValue:SetAlpha(fade)
 
     local openName, openSource = cursor, Model:ActiveSource()
     local sourceIndex = openSource and Model:IsOpen()

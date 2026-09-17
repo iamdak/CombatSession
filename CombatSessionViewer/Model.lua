@@ -229,7 +229,6 @@ function Model:Select(key)
     -- in the list would undo that choice for no reason.
     state.activeName   = nil
     state.activeSource = nil
-    state.cursorName   = nil
     state.entry        = nil
     state.cache        = nil
     state.match        = nil
@@ -551,58 +550,48 @@ function Model:IsExpanded(name) return state.activeName == name end
 function Model:IsOpen()         return state.activeName ~= nil end
 function Model:ActiveSource()   return state.activeSource end
 
--- The row cursor: the root row the yellow selection box is on.
+-- The selected row is the open row, and nothing else.
 --
--- Usually the open row, but not necessarily open. Making a column active from a
--- row puts the cursor on that row without opening it - the first click on a new
--- measure is a request to look at it, and a second click in the same place is
--- what opens it. The box sits on the cursor either way, around the whole open
--- block when there is one and around the single row when there is not.
-function Model:IsSelected(name) return name ~= nil and state.cursorName == name end
-function Model:Cursor()         return state.cursorName end
+-- There used to be a cursor that could rest on a closed row, left there by a
+-- click that only changed the column. Every click on a player opens them now,
+-- so a selected row with nothing open beneath it was a highlight with no
+-- purpose: closing a breakdown now deselects the row, box and all.
+function Model:IsSelected(name) return name ~= nil and state.activeName == name end
+function Model:Cursor()         return state.activeName end
 
--- Closes the drill-down. The active column and the cursor stay: closing a
--- breakdown is not a decision to stop reading that measure, or that player.
+-- Closes the drill-down. The active column stays: closing a breakdown is not a
+-- decision to stop reading that measure.
 function Model:Collapse()
     state.activeName   = nil
     state.activeSource = nil
 end
 
--- Moves the cursor to a root row. Anything open elsewhere closes, because it is
--- outside the selection now and only the selected row may be open.
-function Model:SelectRow(name)
-    if state.cursorName == name then return end
-    if state.activeName ~= name then self:Collapse() end
-    state.cursorName = name
+-- Opens a unit's breakdown in the active column, leaving it open if it already
+-- was. Only one unit is open at a time, so this closes any other. A player with
+-- nothing in the log has nothing to open, so a click on them only closes
+-- whatever was open - the same as a click on any row outside the selection.
+--
+-- For a click that means "show me this", where a toggle would close a breakdown
+-- the user was only trying to look at in a different column.
+function Model:Open(name, unit)
+    if state.activeName == name then return end
+    self:Collapse()
+    if not unit then return end
+    state.activeName   = name
+    state.activeSource = nil
 end
 
--- Opens a unit's breakdown in the active column, or closes it if it is the one
--- already open, and puts the cursor on it either way. Only one unit is open at a
--- time, so opening another closes the first. A player with nothing in the log
--- is still selected, but has nothing to break down.
+-- Opens a unit's breakdown, or closes it if it is the one already open.
 --
 -- The root name used to be inert while collapsed, on the reasoning that there
 -- was no column to open until one had been chosen. There always is now - the
 -- active column - so the name is the natural thing to click.
 function Model:ToggleExpand(name, unit)
-    self:SelectRow(name)
-    if not unit then return end
     if state.activeName == name then
         self:Collapse()
         return
     end
-    state.activeName   = name
-    state.activeSource = nil
-end
-
--- Selects a unit and opens its breakdown, leaving it open if it already was.
--- For a click that means "show me this", where a toggle would close a breakdown
--- the user was only trying to look at in a different column.
-function Model:Open(name, unit)
-    self:SelectRow(name)
-    if not unit or state.activeName == name then return end
-    state.activeName   = name
-    state.activeSource = nil
+    self:Open(name, unit)
 end
 
 function Model:ToggleSource(sourceName)
@@ -624,14 +613,10 @@ end
 -- row revealed beneath it. Returned as an index range rather than measured from
 -- the rendered rows, because the unit row can be scrolled off the top while its
 -- children are still on screen, and the box has to be drawn either way.
---
--- With nothing open it is the cursor row alone, so the box stays on the
--- selected player between one breakdown and the next.
 function Model:OpenBlock()
     local range = state.openRange
-    if range then return range.first, range.count end
-    if state.cursorRow then return state.cursorRow, 1 end
-    return nil
+    if not range then return nil end
+    return range.first, range.count
 end
 
 -- The same, one level down: the open counterpart and the spells under it. Nil
@@ -713,7 +698,7 @@ end
 function Model:Rows()
     local rows = {}
     local cache = state.cache
-    state.openRange, state.sourceRange, state.cursorRow = nil, nil, nil
+    state.openRange, state.sourceRange = nil, nil
     if not (cache and state.players) then return rows end
 
     local api = ns:API()
@@ -780,7 +765,6 @@ function Model:Rows()
         unitRow.key   = "u:" .. root
         unitRow.opens = block
         rows[#rows + 1] = unitRow
-        if state.cursorName == player.name then state.cursorRow = #rows end
 
         if state.activeName == player.name and player.unit then
             local blockFirst = #rows
