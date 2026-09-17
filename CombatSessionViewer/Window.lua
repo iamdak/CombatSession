@@ -474,7 +474,9 @@ local function CellTooltip(cell)
         Detail(data.unit.cols[col] or 0,
                data.unit.counts and data.unit.counts[col] or 0)
         if not isActive then
-            Hint("Click to make this the active column.")
+            Hint(Model:IsSelected(data.name)
+                and "Click to make this the active column."
+                or  "Click to select this player and make this the active column.")
         elseif Model:IsExpanded(data.name) then
             Hint("Click to close this breakdown.")
         else
@@ -552,17 +554,25 @@ local function GridCell(row, index)
         SetHover(nil, nil)
         GameTooltip:Hide()
     end)
-    -- A click outside the active column makes that column active and does
-    -- nothing else: the first click on a new measure is a request to look at
-    -- it, and opening or closing something on the same click would be two
-    -- things at once. Inside the active column a click opens or closes
-    -- whatever the cell belongs to.
+    -- A click outside the active column makes that column active and moves
+    -- the cursor to the row, but opens nothing: the first click on a new
+    -- measure is a request to look at it, and opening something on the same
+    -- click would be two things at once. Inside the active column a click
+    -- opens or closes whatever the cell belongs to.
+    --
+    -- Only a root row outside the selection moves the cursor. Rows inside it -
+    -- the selected player, and the breakdown open beneath them - are already
+    -- where the cursor is, so for them the click only changes the column, and
+    -- an open breakdown carries on under the new one.
     cell:SetScript("OnClick", function(self)
         local data = self.data
         if not data or data.kind == "note" then return end
 
         if self.col ~= Model:ActiveColumn() then
             Model:SetActiveColumn(self.col)
+            if data.kind == "unit" and not Model:IsSelected(data.name) then
+                Model:SelectRow(data.name)
+            end
         elseif data.kind == "unit" then
             Model:ToggleExpand(data.name, data.unit)
         elseif data.kind == "source" and HasSpells(data) then
@@ -1164,7 +1174,10 @@ local function Populate(row, data)
     local opened = expanded
         or (data.kind == "source" and Model:ActiveSource() == data.name)
 
-    local track, bar = RowColors(data, expanded)
+    -- The selected row takes the lighter track an open row has, collapsed or
+    -- not, so the row under the box reads as the focus and not only as boxed.
+    local selected = (data.kind == "unit") and Model:IsSelected(data.name)
+    local track, bar = RowColors(data, expanded or selected)
     row.nameBg:SetColorTexture(track[1], track[2], track[3])
     row.valueBg:SetColorTexture(track[1], track[2], track[3])
 
