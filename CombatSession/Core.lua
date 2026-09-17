@@ -41,11 +41,15 @@ ns.DB_SCHEMA = 2
 -- sides can read, it is current the moment the files are installed, and it
 -- does not need the addon to have run even once.
 --
--- Bump it when this addon starts requiring something a previous application
--- does not produce. Leave it alone for an addon change that needs nothing new:
--- it is a statement about the application, not a copy of this addon's own
--- version, and raising it needlessly sends users to fetch an update that would
--- change nothing for them.
+-- It must equal the version of the application released alongside this addon.
+--
+-- The two are compared for equality, not for "at least": an application newer
+-- than this number reports the ADDON as out of date, and an older one reports
+-- the application. So whenever a release moves the application's version, this
+-- moves with it - even for a release where the addon changed nothing - or the
+-- addon being shipped would tell every user it needs updating. It is a
+-- statement about which application this addon is meant to run with, not a
+-- copy of the addon's own version, which can move independently.
 --
 -- Nil when the metadata is missing, which reads downstream as "no answer" and
 -- turns the check off rather than guessing at a number.

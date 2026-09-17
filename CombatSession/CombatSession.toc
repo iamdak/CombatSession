@@ -1,10 +1,10 @@
 ## Interface: 120100
 ## Title: CombatSession
 ## Notes: Records PvP match metadata and processes combat log sessions.
-## Version: 0.11
+## Version: 0.12
 ## SavedVariables: CombatSessionDB
 ## X-Category: PvP
-## X-CombatSession-App: 0.11
+## X-CombatSession-App: 0.12
 ## IconTexture: Interface\Icons\Achievement_BG_winWSG
 
 Core.lua

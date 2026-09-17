@@ -7,14 +7,14 @@
 #pragma once
 
 #define CS_VERSION_MAJOR 0
-#define CS_VERSION_MINOR 11
+#define CS_VERSION_MINOR 12
 #define CS_VERSION_PATCH 0
 #define CS_VERSION_BUILD 0
 
 // VERSIONINFO wants four comma-separated numbers; everything else wants text.
-#define CS_VERSION_FIELDS 0,11,0,0
-#define CS_VERSION_FULL   "0.11.0.0"
-#define CS_VERSION_SHORT  "0.11"
+#define CS_VERSION_FIELDS 0,12,0,0
+#define CS_VERSION_FULL   "0.12.0.0"
+#define CS_VERSION_SHORT  "0.12"
 
 // The resource compiler reads this file for the macros above and cannot parse
 // C++, so everything below is hidden from it.
