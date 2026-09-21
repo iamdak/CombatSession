@@ -759,6 +759,17 @@ local function ColumnList(api, cache, unit, col)
         end
     end
 
+    -- Counts and extremes for the totals line come from the unit's own casts,
+    -- not from adding up the rows above: those count a Wild Growth once for
+    -- every ally it landed on, and a spell total is about the cast.
+    local casts = api.SpellCasts and api:SpellCasts(cache, unit.index, col) or {}
+    for _, slot in ipairs(spellOrder) do
+        local whole = casts[slot.name]
+        if whole then
+            slot.n, slot.mn, slot.mx = whole.n, whole.mn, whole.mx
+        end
+    end
+
     if #spellOrder > 0 then
         table.sort(spellOrder, function(a, b) return a.v > b.v end)
         table.insert(parts, 1, {

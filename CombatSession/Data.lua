@@ -87,7 +87,12 @@ ns.API = API
 --     team index - but every race is faction-locked, so a cast racial names the
 --     caster's side. Works in battlegrounds, which is where almost nothing else
 --     does.
-local DEFINES_VERSION = 21
+-- 22: damage, healing and absorbs counted in casts rather than log lines, so a
+--     count, average, smallest and largest describe what one cast did. A Life
+--     Cocoon that absorbed thirty hits had been thirty "casts" averaging a
+--     thirtieth of its real size. Units also carry each spell's casts taken
+--     whole across targets, for spell totals.
+local DEFINES_VERSION = 22
 
 --------------------------------------------------------------------------------
 -- Event kinds, mirroring EventKind in StreamWriter.h. Values are persisted in
@@ -717,6 +722,33 @@ local function Compact(UNITS, events)
                 out.s[col] = spellFlat
             end
         end
+
+        -- Each spell's casts taken whole, for the unit's own spell totals: spell
+        -- id, casts, smallest and largest, four numbers a spell. Summing the
+        -- per-target rows cannot give these - one Wild Growth on six allies is
+        -- six rows there and one cast here.
+        --
+        -- Counted per spell name and written once under every id the name was
+        -- seen with, so whichever of them survived trimming carries the figure.
+        -- A reader takes it from any one of them; adding them up would count a
+        -- cast once for every id it touched.
+        for col, totals in pairs(entry.whole or {}) do
+            local flat = {}
+            for _, w in pairs(totals) do
+                if w.n > 0 then
+                    for spellId in pairs(w.ids) do
+                        flat[#flat + 1] = spellId
+                        flat[#flat + 1] = w.n
+                        flat[#flat + 1] = w.mn or 0
+                        flat[#flat + 1] = w.mx or 0
+                    end
+                end
+            end
+            if #flat > 0 then
+                out.w = out.w or {}
+                out.w[col] = flat
+            end
+        end
         out.m = entry.more
         U[nameIndex[name]] = out
     end
@@ -1254,6 +1286,29 @@ function API:Breakdown(cache, index, col)
     return out, unit.m and unit.m[col]
 end
 
+-- One unit's casts in one column, by spell name: { [name] = { n, mn, mx } },
+-- each cast taken whole across every target it landed on. What a spell-totals
+-- line should show for a count, smallest and largest; the per-counterpart rows
+-- Breakdown returns count a cast once per target instead.
+--
+-- Empty for a session built before these were recorded, and for a live one.
+function API:SpellCasts(cache, index, col)
+    local unit = cache.U and cache.U[index]
+    local flat = unit and unit.w and unit.w[col]
+    local out = {}
+    if not flat then return out end
+
+    for i = 1, #flat, 4 do
+        local name = cache.SP and cache.SP[flat[i]]
+        -- Written once per id under the same name with the same figures, so
+        -- the first one found stands for all of them.
+        if name and not out[name] then
+            out[name] = { n = flat[i + 1], mn = flat[i + 2], mx = flat[i + 3] }
+        end
+    end
+    return out
+end
+
 -- Death events with their preceding action window, names resolved.
 function API:EventList(cache)
     local categoryOf = ns.SpellCategory
@@ -1478,7 +1533,11 @@ function API:BuildCache(key, onDone, onProgress)
     -- Self counts as a counterpart. A unit healing or damaging itself is real
     -- output and is listed by name like anyone else, so a self-healer's row can
     -- be opened to see how much of their healing was on themselves.
-    local function AddBreakdown(entry, col, other, value, count, spellId)
+    -- `partial` marks a value that is one piece of a cast still being added up.
+    -- Its count, smallest and largest are left alone here and settled when the
+    -- cast closes, from the cast's own total; the pairing and spell it landed in
+    -- are returned so the cast can find them again.
+    local function AddBreakdown(entry, col, other, value, count, spellId, partial)
         if not other then return end
 
         local map = entry.by[col]
@@ -1496,25 +1555,450 @@ function API:BuildCache(key, onDone, onProgress)
         -- range says whether that was every cast or one crit carrying twenty
         -- glancing ticks. Two numbers per spell is the cheapest way to answer a
         -- question the totals genuinely cannot.
+        local use
         if spellId then
             local spells = slot.s
             if not spells then spells = {}; slot.s = spells end
-            local use = spells[spellId]
+            use = spells[spellId]
             if not use then
-                use = { v = 0, n = 0, mn = value, mx = value }
+                use = { v = 0, n = 0 }
                 spells[spellId] = use
             end
             use.v = use.v + value
-            use.n = use.n + count
-            if value < use.mn then use.mn = value end
-            if value > use.mx then use.mx = value end
+            if not partial then
+                use.n = use.n + count
+                if not use.mn or value < use.mn then use.mn = value end
+                if not use.mx or value > use.mx then use.mx = value end
+            end
         end
+        return slot, use
     end
 
     local function Add(entry, col, other, value, count, spellId)
         entry.cols[col]   = entry.cols[col] + value
         entry.counts[col] = entry.counts[col] + count
         AddBreakdown(entry, col, other, value, count, spellId)
+    end
+
+    ----------------------------------------------------------------------------
+    -- Casts
+    --
+    -- Damage, healing and absorbs are counted in casts, not in log lines. The
+    -- log writes a line per tick of a DoT, per absorbed hit on a shield, per bolt
+    -- of a channel - a single Life Cocoon that soaked thirty hits was thirty
+    -- lines, and was being shown as thirty casts averaging a thirtieth of what it
+    -- actually absorbed. What anyone reading a breakdown wants is what one cast
+    -- did, so each line is assigned to the cast it came from and a cast's count,
+    -- average, smallest and largest are its whole total.
+    --
+    -- The log never says which cast a line came from, so it is inferred, per
+    -- source, target and spell NAME - by name because a spell's effect often
+    -- has an id of its own: Spinning Crane Kick is cast as 101546 and hits as
+    -- 107270, Consecration is cast as 26573, ticks as 81297 and slows as 204242.
+    -- Three rules, in order:
+    --
+    --   * An aura - a DoT, a HoT, a shield, a channel's debuff - is one cast from
+    --     application to removal, and a reapplication is a new one. Everything
+    --     under that name from that source on that target in between is it.
+    --   * Otherwise, a spell the source casts: each SPELL_CAST_SUCCESS is a cast,
+    --     and a hit belongs to the earliest cast this target has not been hit by
+    --     yet that is recent enough to have caused it - so a projectile landing
+    --     after the next cast began still counts against its own cast, and a
+    --     channel's later ticks stay with the cast that started it.
+    --   * Otherwise - a proc, a passive, anything never cast under its own name -
+    --     each hit is its own, except hits landing in the same instant.
+    --
+    -- Melee swings are always one each.
+    --
+    -- Against a full evening's log this matched Life Cocoon 8 for 8, Spinning
+    -- Crane Kick 31 per-target casts to 32 casts, and put every Consecration at
+    -- 20 ticks or fewer where the per-line count had one running to 658.
+    --
+    -- A cast has two sides. For the target it is simply what landed on them.
+    -- For the caster, one cast can land on several targets - a Wild Growth, a
+    -- Power Word: Radiance - and those pieces are one cast in the caster's own
+    -- spell totals: "whole" below. Per target, in a breakdown's counterpart
+    -- rows, each target's share stays its own.
+    ----------------------------------------------------------------------------
+
+    local LINK_MS   = 250    -- an event this close to an application or removal belongs to it
+    local FLIGHT_MS = 1500   -- the longest a cast's first hit can trail the cast
+    local BURST_MS  = 50     -- hits of an uncast effect this close together are one
+    local RECENT    = 8      -- casts remembered per source and spell
+
+    -- Spell names as small integers, so the keys below can be numbers and a
+    -- quarter of a million events do not each build a string.
+    local nameIds, nameCount = {}, 0
+    local nameIdOf = {}      -- spell index -> name id
+    local function NameId(spellIndex)
+        local id = nameIdOf[spellIndex]
+        if id then return id end
+        local row = spells[spellIndex]
+        local name = row and row[2] or ("#" .. spellIndex)
+        id = nameIds[name]
+        if not id then
+            nameCount = nameCount + 1
+            id = nameCount
+            nameIds[name] = id
+        end
+        nameIdOf[spellIndex] = id
+        return id
+    end
+
+    local open    = {}    -- source, target, name -> the cast still collecting
+    local claimed = {}    -- source, target, name -> the last cast it was hit by
+    local castLog = {}    -- source, name -> { n = casts so far, [serial] = time }
+    local wholes  = {}    -- source, name -> serial -> the cast across targets
+    local early   = {}    -- source, name -> applications still waiting for their cast
+
+    local function NewWhole()
+        return { acc = {}, open = 0 }
+    end
+
+    -- The caster's view of a cast is shared by every target it landed on, so
+    -- casts that claimed the same serial meet here. Anything with no cast behind
+    -- it gets one of its own.
+    local function WholeFor(castKey, serial)
+        if not serial then return NewWhole() end
+        local bySerial = wholes[castKey]
+        if not bySerial then bySerial = {}; wholes[castKey] = bySerial end
+        local whole = bySerial[serial]
+        if not whole then
+            whole = NewWhole()
+            whole.key, whole.serial = castKey, serial
+            bySerial[serial] = whole
+        end
+        return whole
+    end
+
+    -- The unit's running figures for one spell name in one column: casts,
+    -- smallest, largest, and every id the name was seen under. By name, because
+    -- that is how spell totals are drawn - Penance hits under one id and heals
+    -- under another, and one cast of it is still one cast.
+    local function WholeOf(entry, col, name)
+        entry.whole = entry.whole or {}
+        local totals = entry.whole[col]
+        if not totals then totals = {}; entry.whole[col] = totals end
+        local w = totals[name]
+        if not w then w = { n = 0, ids = {} }; totals[name] = w end
+        return w
+    end
+
+    -- A finished cast into the per-spell and per-column figures of every unit it
+    -- was credited to.
+    local function SettleWhole(whole)
+        for entry, cols in pairs(whole.acc) do
+            for col, byName in pairs(cols) do
+                entry.counts[col] = entry.counts[col] + 1
+                for name, total in pairs(byName) do
+                    local w = WholeOf(entry, col, name)
+                    w.n = w.n + 1
+                    if not w.mn or total < w.mn then w.mn = total end
+                    if not w.mx or total > w.mx then w.mx = total end
+                end
+            end
+        end
+    end
+
+    local function CloseCast(key)
+        local cast = open[key]
+        if not cast then return end
+        open[key] = nil
+
+        for use, total in pairs(cast.uses) do
+            use.n = use.n + 1
+            if not use.mn or total < use.mn then use.mn = total end
+            if not use.mx or total > use.mx then use.mx = total end
+        end
+        for slot in pairs(cast.slots) do slot.n = slot.n + 1 end
+
+        -- The target's side: this cast is all of it.
+        SettleWhole(cast)
+
+        local whole = cast.whole
+        whole.open = whole.open - 1
+        if whole.open == 0 then
+            SettleWhole(whole)
+            -- A target hit later still by the same cast - rare, and only ever a
+            -- straggler - starts a fresh one rather than reopening a settled one.
+            if whole.key then wholes[whole.key][whole.serial] = nil end
+        end
+    end
+
+    -- The earliest cast after `after` recent enough to have caused a hit now.
+    local function FreshCast(castKey, after, now)
+        local log = castLog[castKey]
+        if not log then return nil end
+        for serial = math.max(after + 1, log.n - RECENT + 1), log.n do
+            local at = log[serial]
+            if at and at >= now - FLIGHT_MS then return serial end
+        end
+        return nil
+    end
+
+    local function OpenCast(key, castKey, now, aura, serial)
+        if serial then claimed[key] = serial end
+        local cast = {
+            key = key, t0 = now, last = now, aura = aura, serial = serial or 0,
+            uses = {}, slots = {}, acc = {},
+        }
+        cast.whole = WholeFor(castKey, serial)
+        cast.whole.open = cast.whole.open + 1
+        open[key] = cast
+        return cast
+    end
+
+    local function Keys(i, nameId)
+        local castKey = s[i] * 65536 + nameId
+        return castKey * 65536 + d[i], castKey
+    end
+
+    -- The cast event i belongs to, opened if need be. The third return is true
+    -- for a melee swing, which the caller closes as soon as it is credited.
+    local function CastFor(i)
+        local now = t[i]
+        local spellIndex = sp[i]
+        if spellIndex == 0 then
+            local key = -(s[i] * 65536 + d[i]) - 1
+            CloseCast(key)
+            return OpenCast(key, 0, now, false, nil), key, true
+        end
+
+        local key, castKey = Keys(i, NameId(spellIndex))
+        local cast = open[key]
+        local serial
+        if cast then
+            local split
+            if cast.removedAt then
+                split = now - cast.removedAt > LINK_MS
+            elseif cast.aura then
+                split = false
+            elseif castLog[castKey] then
+                serial = FreshCast(castKey, claimed[key] or 0, now)
+                split = serial ~= nil and serial > cast.serial
+            else
+                split = now - cast.last > BURST_MS
+            end
+            if split then
+                CloseCast(key)
+                cast = nil
+            end
+        end
+
+        if not cast then
+            local log = castLog[castKey]
+            if log then
+                serial = serial or FreshCast(castKey, claimed[key] or 0, now) or log.n
+            end
+            cast = OpenCast(key, castKey, now, false, serial)
+        end
+        cast.last = now
+        return cast, key, false
+    end
+
+    -- One event's worth of a cast, credited to one unit's column. `whole` is what
+    -- the unit's own spell totals count it as: the cast across every target for
+    -- the unit that cast it, this target's share for the unit it landed on.
+    local function Credit(cast, whole, entry, col, other, value, spellId)
+        entry.cols[col] = entry.cols[col] + value
+
+        local slot, use = AddBreakdown(entry, col, other, value, 0, spellId, true)
+        if use then cast.uses[use] = (cast.uses[use] or 0) + value end
+        if slot then cast.slots[slot] = true end
+
+        local name = spellNames[spellId] or spellId
+        WholeOf(entry, col, name).ids[spellId] = true
+
+        local cols = whole.acc[entry]
+        if not cols then cols = {}; whole.acc[entry] = cols end
+        local byName = cols[col]
+        if not byName then byName = {}; cols[col] = byName end
+        byName[name] = (byName[name] or 0) + value
+    end
+
+    -- Aura boundaries. An application just after a direct hit under the same
+    -- name is that hit's own cast carrying on - Moonfire lands, then its DoT goes
+    -- up - so it is adopted rather than starting another.
+    local function AuraApplied(i)
+        local spellIndex = sp[i]
+        if spellIndex == 0 then return end
+        local key, castKey = Keys(i, NameId(spellIndex))
+        local now = t[i]
+        local cast = open[key]
+        if cast and not cast.aura and not cast.removedAt and now - cast.t0 <= LINK_MS then
+            cast.aura = true
+            return
+        end
+        CloseCast(key)
+        local serial = castLog[castKey] and FreshCast(castKey, claimed[key] or 0, now) or nil
+        cast = OpenCast(key, castKey, now, true, serial)
+
+        -- The caster's own copy of a spell that lands on several people is
+        -- written a moment BEFORE the cast itself: Wild Growth goes up on the
+        -- druid, then SPELL_CAST_SUCCESS, then everyone else. Held here so the
+        -- cast can claim it when it arrives, or it would stand as a cast of its
+        -- own and every Wild Growth would count twice.
+        --
+        -- Kept as one batch per source and spell, restarted once it is too old
+        -- for a cast to claim. Most applications with no cast behind them never
+        -- get one - every Atonement a discipline priest's damage puts up - and a
+        -- list that only grew would hold all of them to the end of the log.
+        if not serial then
+            local waiting = early[castKey]
+            if not waiting or now - waiting.t > LINK_MS then
+                waiting = { t = now }
+                early[castKey] = waiting
+            end
+            waiting[#waiting + 1] = cast
+        end
+    end
+
+    -- An application that went up just before its cast joins that cast: the
+    -- piece of it credited so far moves to the cast's shared whole.
+    local function Adopt(cast, castKey, serial)
+        local old, whole = cast.whole, WholeFor(castKey, serial)
+        for entry, cols in pairs(old.acc) do
+            local into = whole.acc[entry]
+            if not into then into = {}; whole.acc[entry] = into end
+            for col, byName in pairs(cols) do
+                local c = into[col]
+                if not c then c = {}; into[col] = c end
+                for name, value in pairs(byName) do c[name] = (c[name] or 0) + value end
+            end
+        end
+        -- The whole it leaves was its alone, and is dropped unsettled.
+        old.open = old.open - 1
+        whole.open = whole.open + 1
+        cast.whole, cast.serial = whole, serial
+        claimed[cast.key] = serial
+    end
+
+    local function AuraRemoved(i)
+        local spellIndex = sp[i]
+        if spellIndex == 0 then return end
+        local cast = open[(Keys(i, NameId(spellIndex)))]
+        if cast and cast.aura then cast.removedAt = t[i] end
+    end
+
+    local function CastSucceeded(i)
+        local spellIndex = sp[i]
+        if spellIndex == 0 then return end
+        local _, castKey = Keys(i, NameId(spellIndex))
+        local log = castLog[castKey]
+        if not log then log = { n = 0 }; castLog[castKey] = log end
+        log.n = log.n + 1
+        log[log.n] = t[i]
+        log[log.n - RECENT] = nil
+
+        local waiting = early[castKey]
+        if waiting then
+            for _, cast in ipairs(waiting) do
+                if open[cast.key] == cast and cast.serial == 0
+                   and t[i] - cast.t0 <= LINK_MS then
+                    Adopt(cast, castKey, log.n)
+                end
+            end
+            early[castKey] = nil
+        end
+    end
+
+    -- One table rather than six locals, for the event loop's sake. Lua 5.1 lets
+    -- a function reach at most sixty variables from outside itself, the loop
+    -- below was already close, and going over is not a warning: the whole file
+    -- fails to compile, the API is never created, and the viewer reports there
+    -- is nothing to view.
+    local Casts = {
+        For = CastFor, Credit = Credit, Close = CloseCast,
+        Applied = AuraApplied, Removed = AuraRemoved, Succeeded = CastSucceeded,
+    }
+
+    -- Whatever was still collecting when the log ran out is finished now.
+    -- Clearing a field during a traversal is allowed; CloseCast only ever
+    -- clears the one it was given.
+    function Casts.CloseAll()
+        for openKey in pairs(open) do CloseCast(openKey) end
+    end
+
+    -- Everything after the last event, in a function of its own. It runs once,
+    -- and written inside the loop it counted against the loop's upvalue limit
+    -- as though it ran for every slice.
+    local function Finish()
+        -- Counted before trimming drops the rows it would be counted into.
+        Casts.CloseAll()
+
+        BuildEventContext(stream, nameOf, UNITS, events, function()
+            TrimBreakdowns(UNITS)
+
+            local unitCount = 0
+            for _ in pairs(UNITS) do unitCount = unitCount + 1 end
+
+            local N, U, E = Compact(UNITS, events)
+
+            -- Only spells still referenced are worth keeping, since trimming
+            -- and compaction may have dropped the rest. Composites carry a
+            -- second entry pointing at the real spell they lead with, kept
+            -- on the same "only if still referenced" basis.
+            local usedSpells, usedComposites, usedSchools = {}, {}, {}
+            local function Keep(id)
+                usedSpells[id] = spellNames[id] or ("spell " .. id)
+                local school = spellSchools[id]
+                if compositeSpell[id] then
+                    usedComposites[id] = compositeSpell[id]
+                    -- A composite is a label over a pair, so it has no
+                    -- school of its own; it borrows the one belonging to
+                    -- the spell it leads with.
+                    school = school or spellSchools[compositeSpell[id]]
+                end
+                if school then usedSchools[id] = school end
+            end
+
+            for _, unit in pairs(U) do
+                for _, flat in pairs(unit.s or {}) do
+                    for i = 2, #flat, 6 do Keep(flat[i]) end
+                end
+            end
+            for _, event in ipairs(E) do
+                for i = 5, #event.c, 6 do
+                    if event.c[i] ~= 0 then Keep(event.c[i]) end
+                end
+            end
+
+            -- Short field names throughout: every one is written to disk
+            -- once per session, and the viewer is the only reader.
+            local cache = {
+                FORMAT = {
+                    version  = DEFINES_VERSION,
+                    taxonomy = ns.SPELL_TAXONOMY_VERSION,
+                    columns  = FORMAT_COLUMNS,
+                },
+                N  = N,           -- interned unit names
+                U  = U,           -- units, indexed into N
+                E  = E,           -- death events, flat context runs
+                SP = usedSpells,      -- [spellId] = name
+                SX = usedComposites,  -- [syntheticId] = the real spell
+                SS = usedSchools,     -- [spellId] = school mask
+                CI = CI,              -- [name] = combatant info, arena only
+                FA = factionOf,       -- [name] = "Alliance" or "Horde"
+                -- Highest dampening stack anyone reached, or nil outside an
+                -- arena where the debuff never exists.
+                dampening = maxDampening > 0 and maxDampening or nil,
+                -- The chunk is deleted by the application once consumed, so
+                -- everything the viewer needs has to be copied in here.
+                header     = stream.header,
+                key        = key,
+                eventCount = total,
+                unitCount  = unitCount,
+            }
+            if ns.db then
+                ns.db.cache = ns.db.cache or {}
+                ns.db.cache[key] = cache
+            end
+            -- Before anyone is told, so a listener asking where a live
+            -- session went already gets the answer.
+            SweepLive()
+            NotifyCacheChanged(key)
+            if onDone then onDone(cache) end
+        end)
     end
 
     local index = 1
@@ -1561,10 +2045,14 @@ function API:BuildCache(key, onDone, onProgress)
                     and (srcName == dstName
                          or rawReact[s[i]] == rawReact[d[i]])
 
+                local cast, castKey, single = Casts.For(i)
                 if srcName and not reflexive then
-                    Add(UnitEntry(srcName), dmgDone, dstName, amount, 1, spellId)
+                    Casts.Credit(cast, cast.whole, UnitEntry(srcName), dmgDone, dstName, amount, spellId)
                 end
-                if dstName then Add(UnitEntry(dstName), dmgTaken, srcName, amount, 1, spellId) end
+                if dstName then
+                    Casts.Credit(cast, cast, UnitEntry(dstName), dmgTaken, srcName, amount, spellId)
+                end
+                if single then Casts.Close(castKey) end
 
                 -- Overkill above zero marks the killing blow, and is the only
                 -- attribution available: UNIT_DIED carries no source, and
@@ -1591,17 +2079,19 @@ function API:BuildCache(key, onDone, onProgress)
                 -- Overhealing is included in amount, so effective healing is
                 -- the remainder.
                 local effective = amount - ov[i]
+                local cast, castKey, single = Casts.For(i)
                 if srcName then
-                    Add(UnitEntry(srcName), healDone, dstName, effective, 1, spellId)
-                    -- Counted only when there was overhealing, so the count is
+                    Casts.Credit(cast, cast.whole, UnitEntry(srcName), healDone, dstName, effective, spellId)
+                    -- Credited only when there was overhealing, so the count is
                     -- "casts that overhealed" rather than "casts".
                     if ov[i] > 0 then
-                        Add(UnitEntry(srcName), overCol, dstName, ov[i], 1, spellId)
+                        Casts.Credit(cast, cast.whole, UnitEntry(srcName), overCol, dstName, ov[i], spellId)
                     end
                 end
                 if dstName then
-                    Add(UnitEntry(dstName), healTaken, srcName, effective, 1, spellId)
+                    Casts.Credit(cast, cast, UnitEntry(dstName), healTaken, srcName, effective, spellId)
                 end
+                if single then Casts.Close(castKey) end
 
             elseif kind == K.SPELL_ABSORBED then
                 -- src is the ABSORBER, rewritten by the application; the
@@ -1618,8 +2108,14 @@ function API:BuildCache(key, onDone, onProgress)
                 -- included. Blizzard's healing figure is not a function of the
                 -- log; counting prevented damage as healing is at least a rule
                 -- that can be stated.
-                if srcName then Add(UnitEntry(srcName), healDone, dstName, amount, 1, spellId) end
-                if dstName then Add(UnitEntry(dstName), healTaken, srcName, amount, 1, spellId) end
+                local cast, castKey, single = Casts.For(i)
+                if srcName then
+                    Casts.Credit(cast, cast.whole, UnitEntry(srcName), healDone, dstName, amount, spellId)
+                end
+                if dstName then
+                    Casts.Credit(cast, cast, UnitEntry(dstName), healTaken, srcName, amount, spellId)
+                end
+                if single then Casts.Close(castKey) end
 
             elseif kind == K.INTERRUPT then
                 -- Named for the spell that was stopped, with the interrupt in
@@ -1651,7 +2147,14 @@ function API:BuildCache(key, onDone, onProgress)
                         CompositeSpell(am[i], spellId))
                 end
 
+            elseif kind == K.AURA_REFRESH then
+                -- Reapplied before it ran out: a DoT or HoT cast again, which is
+                -- a new cast of it.
+                Casts.Applied(i)
+
             elseif kind == K.AURA_APPLIED then
+                Casts.Applied(i)
+
                 local spellIndex = sp[i]
                 local spellId = spellIndex ~= 0 and spells[spellIndex]
                                 and spells[spellIndex][1] or nil
@@ -1666,6 +2169,8 @@ function API:BuildCache(key, onDone, onProgress)
                 end
 
             elseif kind == K.AURA_REMOVED then
+                Casts.Removed(i)
+
                 local spellIndex = sp[i]
                 local spellId = spellIndex ~= 0 and spells[spellIndex]
                                 and spells[spellIndex][1] or nil
@@ -1687,6 +2192,8 @@ function API:BuildCache(key, onDone, onProgress)
                 end
 
             elseif kind == K.CAST_SUCCESS then
+                Casts.Succeeded(i)
+
                 local spellIndex = sp[i]
                 local cast = spellIndex ~= 0 and spells[spellIndex]
                              and spells[spellIndex][1] or nil
@@ -1742,79 +2249,7 @@ function API:BuildCache(key, onDone, onProgress)
         if index <= total then
             C_Timer.After(0, Step)
         else
-            BuildEventContext(stream, nameOf, UNITS, events, function()
-                TrimBreakdowns(UNITS)
-
-                local unitCount = 0
-                for _ in pairs(UNITS) do unitCount = unitCount + 1 end
-
-                local N, U, E = Compact(UNITS, events)
-
-                -- Only spells still referenced are worth keeping, since trimming
-                -- and compaction may have dropped the rest. Composites carry a
-                -- second entry pointing at the real spell they lead with, kept
-                -- on the same "only if still referenced" basis.
-                local usedSpells, usedComposites, usedSchools = {}, {}, {}
-                local function Keep(id)
-                    usedSpells[id] = spellNames[id] or ("spell " .. id)
-                    local school = spellSchools[id]
-                    if compositeSpell[id] then
-                        usedComposites[id] = compositeSpell[id]
-                        -- A composite is a label over a pair, so it has no
-                        -- school of its own; it borrows the one belonging to
-                        -- the spell it leads with.
-                        school = school or spellSchools[compositeSpell[id]]
-                    end
-                    if school then usedSchools[id] = school end
-                end
-
-                for _, unit in pairs(U) do
-                    for _, flat in pairs(unit.s or {}) do
-                        for i = 2, #flat, 6 do Keep(flat[i]) end
-                    end
-                end
-                for _, event in ipairs(E) do
-                    for i = 5, #event.c, 6 do
-                        if event.c[i] ~= 0 then Keep(event.c[i]) end
-                    end
-                end
-
-                -- Short field names throughout: every one is written to disk
-                -- once per session, and the viewer is the only reader.
-                local cache = {
-                    FORMAT = {
-                        version  = DEFINES_VERSION,
-                        taxonomy = ns.SPELL_TAXONOMY_VERSION,
-                        columns  = FORMAT_COLUMNS,
-                    },
-                    N  = N,           -- interned unit names
-                    U  = U,           -- units, indexed into N
-                    E  = E,           -- death events, flat context runs
-                    SP = usedSpells,      -- [spellId] = name
-                    SX = usedComposites,  -- [syntheticId] = the real spell
-                    SS = usedSchools,     -- [spellId] = school mask
-                    CI = CI,              -- [name] = combatant info, arena only
-                    FA = factionOf,       -- [name] = "Alliance" or "Horde"
-                    -- Highest dampening stack anyone reached, or nil outside an
-                    -- arena where the debuff never exists.
-                    dampening = maxDampening > 0 and maxDampening or nil,
-                    -- The chunk is deleted by the application once consumed, so
-                    -- everything the viewer needs has to be copied in here.
-                    header     = stream.header,
-                    key        = key,
-                    eventCount = total,
-                    unitCount  = unitCount,
-                }
-                if ns.db then
-                    ns.db.cache = ns.db.cache or {}
-                    ns.db.cache[key] = cache
-                end
-                -- Before anyone is told, so a listener asking where a live
-                -- session went already gets the answer.
-                SweepLive()
-                NotifyCacheChanged(key)
-                if onDone then onDone(cache) end
-            end)
+            Finish()
         end
     end
 
