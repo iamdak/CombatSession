@@ -542,11 +542,17 @@ local function PruneCaches()
     db.oldestWanted = keys[#keys - limit + 1]
 end
 
--- Consumes the backlog. With more pending chunks than the cap, only the newest
--- `maxSessions` are built; PruneCaches then publishes the floor, which declines
+-- Consumes the backlog. Only sessions that will still be held once it is done are
+-- built: the newest `maxSessions` of everything, counting what is already cached
+-- alongside what is queued. PruneCaches then publishes the floor, which declines
 -- the rest for good - the application collects their chunks and they live on in
 -- the raw archive. Raising the cap lowers the floor and reopens whatever is
 -- still queued.
+--
+-- The queue used to be ranked on its own: the newest `maxSessions` of it were
+-- built whatever was already held, and PruneCaches then discarded every one that
+-- landed below sessions already cached. With 30 held and 400 queued, that was 40
+-- sessions parsed and up to 30 of them thrown away on the spot.
 function API:ProcessPending(onDone)
     local pending = self:GetPending()
     if #pending == 0 then
@@ -554,8 +560,32 @@ function API:ProcessPending(onDone)
         return
     end
 
-    local limit   = self:GetMaxSessions()
-    local take    = math.min(#pending, limit)
+    local limit = self:GetMaxSessions()
+
+    local ranked, seen = {}, {}
+    for key in pairs((ns.db and ns.db.cache) or {}) do
+        ranked[#ranked + 1] = key
+        seen[key] = true
+    end
+    for _, entry in ipairs(pending) do
+        if not seen[entry.key] then
+            ranked[#ranked + 1] = entry.key
+            seen[entry.key] = true
+        end
+    end
+    table.sort(ranked, function(a, b) return a > b end)
+
+    local kept = {}
+    for i = 1, math.min(#ranked, limit) do kept[ranked[i]] = true end
+
+    -- Still newest first, so the sessions most likely to be looked at arrive
+    -- first.
+    local build = {}
+    for _, entry in ipairs(pending) do
+        if kept[entry.key] then build[#build + 1] = entry end
+    end
+
+    local take    = #build
     local skipped = #pending - take
 
     local index = 1
@@ -566,7 +596,7 @@ function API:ProcessPending(onDone)
             return
         end
 
-        local key = pending[index].key
+        local key = build[index].key
         index = index + 1
 
         self:BuildCache(key, function(_, err)

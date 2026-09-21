@@ -30,10 +30,13 @@ local ADDON, ns = ...
 local Meter = {}
 ns.Meter = Meter
 
-local TITLE_H = 24
-local HEAD_H  = 15
-local PAD     = 6
-local INSET   = 4     -- text inset inside the list box
+local TITLE_H  = 24
+local HEAD_H   = 15
+local STATUS_H = 14   -- the strip along the bottom
+local PAD      = 6
+local INSET    = 4    -- text inset inside the list box
+local GAP      = 2    -- between the list box and the strips above and below it
+local GRIP     = 14   -- the resize grip, which sits in the status strip's corner
 
 -- The rows, and the text in them, against the size the list was first drawn at.
 -- One constant for both: a row scaled without its text is a row with more space
@@ -42,12 +45,12 @@ local ROW_BASE  = 18
 local ROW_SCALE = 1.4
 local ROW_H     = math.floor(ROW_BASE * ROW_SCALE + 0.5)
 
--- Everything between the top of the window and the first row: the title bar, the
--- gap under it, the list box's own two edges and its header. Named because the
--- peek works out how tall the window would have to be to hold every row, and
--- that sum has to match how the frame is actually built or the window opens to
--- slightly the wrong height.
-local CHROME_H = TITLE_H + 2 + 1 + HEAD_H + 1 + PAD
+-- Everything in the window's height that is not rows: the title bar, the gap
+-- under it, the list box's own two edges and its header, the gap under the box,
+-- and the status strip. Named because the peek works out how tall the window
+-- would have to be to hold every row, and that sum has to match how the frame is
+-- actually built or the window opens to slightly the wrong height.
+local CHROME_H = TITLE_H + GAP + 1 + HEAD_H + 1 + GAP + STATUS_H + 1
 
 -- Below these the list holds fewer than three rows and the title has nowhere to
 -- put a name, which is not a window any more.
@@ -733,12 +736,39 @@ local function BuildTitle(parent)
     return bar
 end
 
-local function BuildList(parent, title)
+-- The strip along the bottom: what this window is on the left, and which build
+-- of the viewer is drawing it on the right. The version stops short of the
+-- corner, where the resize grip sits whenever the window is unlocked; it stays
+-- there when the grip is hidden too, so locking does not move it.
+local function BuildStatus(parent)
+    local bar = CreateFrame("Frame", nil, parent)
+    bar:SetPoint("BOTTOMLEFT", 1, 1)
+    bar:SetPoint("BOTTOMRIGHT", -1, 1)
+    bar:SetHeight(STATUS_H)
+    ns.Fill(bar, ns.COLOR.header)
+
+    local version = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    version:SetPoint("RIGHT", -(GRIP + INSET), 0)
+    version:SetText(("|cff808080v%s|r"):format(ns.FormatVersion(ns.VERSION)))
+
+    -- Clipped by its own anchors rather than shortened, so at a narrow width it
+    -- gives way to the version instead of running under it.
+    local label = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    label:SetPoint("LEFT", PAD, 0)
+    label:SetPoint("RIGHT", version, "LEFT", -PAD, 0)
+    label:SetJustifyH("LEFT")
+    label:SetWordWrap(false)
+    label:SetText("|cff808080CombatSession -- Live Session|r")
+
+    return bar
+end
+
+local function BuildList(parent, title, status)
     list = { rows = {}, scroll = ns.NewScroller() }
 
     local box = CreateFrame("Frame", nil, parent)
-    box:SetPoint("TOPLEFT", title, "BOTTOMLEFT", PAD, -2)
-    box:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -PAD, PAD)
+    box:SetPoint("TOPLEFT", title, "BOTTOMLEFT", PAD, -GAP)
+    box:SetPoint("BOTTOMRIGHT", status, "TOPRIGHT", -(PAD - 1), GAP)
     ns.Fill(box, ns.COLOR.panel)
     ns.Border(box, ns.COLOR.line)
     list.box = box
@@ -820,12 +850,16 @@ function Meter:Create()
     ns.Fill(frame, { 0.03, 0.03, 0.04, 0.92 })
     ns.Border(frame, ns.COLOR.line)
 
-    frame.title = BuildTitle(frame)
-    BuildList(frame, frame.title)
+    frame.title  = BuildTitle(frame)
+    frame.status = BuildStatus(frame)
+    BuildList(frame, frame.title, frame.status)
 
     local grip = CreateFrame("Button", nil, frame)
-    grip:SetSize(14, 14)
+    grip:SetSize(GRIP, GRIP)
     grip:SetPoint("BOTTOMRIGHT", -1, 1)
+    -- Over the status strip it sits in, which is a sibling and would otherwise
+    -- be free to draw on top of it and take its clicks.
+    grip:SetFrameLevel(frame.status:GetFrameLevel() + 2)
     grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
     grip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
     grip:SetScript("OnMouseDown", function() frame:StartSizing("BOTTOMRIGHT") end)
@@ -870,12 +904,9 @@ end
 -- Show, hide, lock
 --------------------------------------------------------------------------------
 
+-- Opens whether or not there is anything to show, for the same reason the main
+-- window does: an empty meter is the meter, waiting for a match.
 function Meter:Show()
-    if not ns:API() then
-        ns:Print("CombatSession is not loaded - there is nothing to meter.")
-        return
-    end
-
     self:Create()
     ns.db.meterShown = true
     frame:Show()

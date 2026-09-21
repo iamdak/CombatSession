@@ -79,7 +79,10 @@ local DEFAULTS = {
     -- Flat keys rather than a nested table, like everything above: a nested
     -- default is copied by reference on first login and never revisited, so a
     -- field added later would never reach a database that already exists.
-    meterShown  = false,
+    -- Open and unlocked on first run, so it is found and can be put where it is
+    -- wanted. Closing it is remembered like any other choice; this only decides
+    -- what a new install starts with.
+    meterShown  = true,
     meterLocked = false,
     meterPoint  = "CENTER",
     meterX      = 0,

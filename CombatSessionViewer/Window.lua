@@ -2737,12 +2737,12 @@ end
 
 --------------------------------------------------------------------------------
 
+-- Opens whether or not there is anything to show. An empty window says "no
+-- sessions yet" more plainly than a line in chat does, and it is the window the
+-- user will be looking at once there are some. Everything drawn from the library
+-- already copes with it being absent; the one explanation for that case is the
+-- line printed at login.
 function UI:Show()
-    if not ns:API() then
-        ns:Print("CombatSession is not loaded - there is nothing to view.")
-        return
-    end
-
     self:Create()
     Model:RestoreSort()
 
