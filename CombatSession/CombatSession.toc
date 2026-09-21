@@ -1,7 +1,7 @@
 ## Interface: 120100
 ## Title: CombatSession
 ## Notes: Records PvP match metadata and processes combat log sessions.
-## Version: 0.12
+## Version: 1.0
 ## SavedVariables: CombatSessionDB
 ## X-Category: PvP
 ## X-CombatSession-App: 0.12

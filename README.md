@@ -40,7 +40,8 @@ macOS is supported in the source but there is no prebuilt binary — see
    Choose the flavor folder, the one containing `Logs` and `Interface`, usually
    named `_retail_`.
    
-3. Log into WoW and type **`/csv`** or click the minimap icon.
+3. Log into WoW and type **`/csv`** or click the minimap icon. The meter window
+   opens on its own the first time.
 
 
 You can tell the application to Start with Windows; if you move the application
@@ -61,8 +62,36 @@ there — carries the state.
 | <img src="icon-reload.png" width="24" alt=""> | **Red** | Sessions are waiting — **`/reload`** in game to pick them up. |
 
 Red is not an error. The addon can only load files that existed when the client
-started, so a match played just now needs one `/reload` before it appears. That
-is the whole reason the icon has colours, and the only thing it ever asks of you.
+started, so a match played just now needs one `/reload` before its full version
+appears. That is the whole reason the icon has colours, and the only thing it
+ever asks of you.
+
+---
+
+## Live sessions and the meter
+
+A match appears in the viewer while it is being played, marked **recording**,
+built from the game's own damage meter. Once it ends it reads **awaiting log**
+until the application has cut it from the combat log and you `/reload`; the full
+version then takes its place.
+
+Live figures cover damage done and taken, healing, interrupts and dispels, and
+move each time you leave combat — the game hides them while you are in it. The
+other columns arrive with the log. Enemy names the game withholds during a match
+are filled in where they can be worked out, and in full once it is over.
+
+The **meter window** keeps one of those measures on screen while you play. It
+opens on first run and can be closed; right-click its title bar to choose the
+measure, set its opacity or lock it, and click a player to open them in the
+viewer. While it is locked, dragging the title bar upward shows the rest of the
+list.
+
+### Counts are casts
+
+A count in the viewer is a count of casts, not of combat log lines. A shield that
+absorbed thirty hits, or a DoT that ticked twenty times, is one cast, and its
+average, largest and smallest describe what that cast did in total. The Spell
+Totals line counts a cast once, however many targets it hit.
 
 ---
 
@@ -73,12 +102,15 @@ is the whole reason the icon has colours, and the only thing it ever asks of you
 | Command | What it does |
 |---|---|
 | `/csv` | Open or close the viewer |
+| `/csv meter` | Open or close the meter window (`/csv meter on\|off` to set it) |
+| `/csv meter lock\|unlock` | Fix the meter in place, or free it to move and resize |
+| `/csv meter reset` | Put the meter back to its default size and position |
 | `/csv icon` | Show or hide the minimap button (`/csv icon on\|off` to set it) |
 | `/csv reset` | Put the window back to its default size and position |
 | `/csv status` | Version and how many sessions are viewable |
 
-Right-clicking the minimap button opens a short menu: hide the icon, toggle
-automatic combat logging, or print status.
+Right-clicking the minimap button opens a short menu: show or lock the meter
+window, hide the icon, toggle automatic combat logging, or print status.
 
 ### `/combatsession` — the recorder
 
@@ -124,7 +156,7 @@ logs.
 | Folder | What it is |
 |---|---|
 | `CombatSession/` | The recorder addon and the data library. No UI of its own. |
-| `CombatSessionViewer/` | The viewer. Read-only; owns no data. |
+| `CombatSessionViewer/` | The viewer and the meter window. Read-only; owns no data. |
 | `CombatSessionApp/` | The background application, C++20. |
 
 ### What it touches

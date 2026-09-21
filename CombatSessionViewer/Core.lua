@@ -13,15 +13,16 @@ local ADDON, ns = ...
 ns.VERSION = (C_AddOns and C_AddOns.GetAddOnMetadata
               and C_AddOns.GetAddOnMetadata(ADDON, "Version")) or "0.0.0"
 
--- The .toc is the one place a version is written, for both addons. Displayed
--- padded to two minor digits so the title keeps a fixed shape however the .toc
--- is worded: 0.1, 0.10 and 0.1.0 all read as 0.10. A version that is not two
--- numbers at all is shown verbatim rather than mangled into one.
+-- The .toc is the one place a version is written, for both addons, and it is
+-- the release version - so it is displayed as written: major and minor, 1.0 as
+-- 1.0 and 0.12 as 0.12. A trailing patch field is dropped; a version that is not
+-- two numbers at all is shown verbatim rather than mangled into one.
+--
+-- It used to pad the minor to two digits, so the title kept one shape through
+-- the 0.x series. That turned the 1.0 release into "1.00" in every window.
 function ns.FormatVersion(text)
-    local major, minor = tostring(text or ""):match("^(%d+)%.(%d+)")
-    if not major then return tostring(text or "?") end
-    if #minor < 2 then minor = minor .. string.rep("0", 2 - #minor) end
-    return major .. "." .. minor
+    local version = tostring(text or ""):match("^(%d+%.%d+)")
+    return version or tostring(text or "?")
 end
 
 -- Viewer version with the library's in parentheses. They are separate addons
