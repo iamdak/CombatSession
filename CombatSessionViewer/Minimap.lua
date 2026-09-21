@@ -120,6 +120,21 @@ local function ToggleAutoLog()
     ns:Print("auto logging " .. (on and "|cff33ff33on|r" or "|cffff5555off|r"))
 end
 
+-- The meter window: the one thing in this menu that gets toggled often enough
+-- to want the ring rather than a command. Checkboxes rather than buttons because
+-- both are states, and the menu is rebuilt on every click, so each reads the
+-- state as it is at that moment.
+local function MeterShown()  return ns.Meter and ns.Meter:IsShown() or false end
+local function MeterLocked() return (ns.db and ns.db.meterLocked) or false end
+
+local function ToggleMeter()
+    if ns.Meter then ns.Meter:Toggle() end
+end
+
+local function ToggleMeterLock()
+    if ns.Meter then ns.Meter:ToggleLock() end
+end
+
 -- The only way back is a command, so the message has to carry it. A hidden
 -- button with no way to find it again is how addons get uninstalled.
 local function HideIcon()
@@ -138,6 +153,9 @@ function ns:ShowMinimapMenu(owner)
 
     MenuUtil.CreateContextMenu(owner, function(_, root)
         root:CreateTitle("CombatSession Viewer")
+        root:CreateCheckbox("Meter Window", MeterShown, ToggleMeter)
+        root:CreateCheckbox("Lock Meter", MeterLocked, ToggleMeterLock)
+        root:CreateDivider()
         root:CreateButton("Hide Icon", HideIcon)
         root:CreateButton(AutoLogLabel(), ToggleAutoLog)
         root:CreateButton("Status", PrintStatus)

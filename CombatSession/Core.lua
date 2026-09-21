@@ -134,6 +134,7 @@ local DEFAULTS = {
     schema   = ns.DB_SCHEMA,
     matches  = {},   -- array of MATCH records written by Recorder.lua
     cache    = {},   -- [sessionKey] = parsed CACHE, written by the data library
+    live     = {},   -- [liveKey] = provisional session from the damage meter
     trace    = {},   -- instrumentation ring; see Recorder.lua
 
     -- The oldest chunk key this addon still wants. Anything older has been
@@ -165,6 +166,12 @@ local DEFAULTS = {
         -- from a backlog in one pass. Deliberately far below the application's
         -- archive limit: the archive is for reprocessing, this is for viewing.
         maxSessions = 40,
+
+        -- Live sessions built from the game's damage meter and kept until the
+        -- log-built cache supersedes them. Far fewer than maxSessions: each one
+        -- holds a provisional breakdown that the real data is about to replace,
+        -- and a backlog of stand-ins is of no use to anyone.
+        maxLive = 8,
     },
 }
 

@@ -157,6 +157,16 @@ local function UnitReaction(flags)
     return "neutral"
 end
 
+-- Declared here rather than beside GetMatch, which is where they are mostly
+-- used: the session list joins live sessions against built ones and needs both,
+-- and a local declared further down the file would be a nil global to it.
+local MATCH_TOLERANCE = 90   -- seconds of slack at each end of the range
+
+-- The log writes "Name-Realm", the client's UnitName writes "Name".
+local function BaseName(name)
+    return (tostring(name or ""):match("^([^-]+)") or "")
+end
+
 --------------------------------------------------------------------------------
 -- DEFINES
 --
@@ -208,6 +218,15 @@ function API:GetDefines()
     }
 end
 
+-- The columns that can move while a match is being played, as indices into
+-- FORMAT_COLUMNS. Everything else in the format is derived from the log and
+-- appears only once the application has delivered it, so a display that updates
+-- live has these and no others to choose from.
+function API:LiveColumns()
+    if not ns.Live then return {} end
+    return ns.Live:LiveColumns()
+end
+
 -- The application version handshake, for a viewer that has to say so.
 --
 -- Exposed through the API rather than read off the globals directly, so an
@@ -244,6 +263,13 @@ local function NotifyCacheChanged(key)
     end
 end
 
+-- A live session changing is the same event as a cache arriving, as far as
+-- anything drawing it is concerned: the session's contents moved and the row has
+-- to be redrawn. Live.lua calls this after every reading it takes.
+function ns:LiveChanged(key)
+    NotifyCacheChanged(key)
+end
+
 --------------------------------------------------------------------------------
 -- Session discovery
 --------------------------------------------------------------------------------
@@ -259,9 +285,81 @@ function API:GetSessions()
     return CombatSessionIndex or {}
 end
 
+-- Live sessions stand in until the log arrives. The same match is recognised the
+-- way the application recognises it: same instance, overlapping in time, same
+-- character. Compared on headers rather than through GetMatch so it stays cheap
+-- enough to run on every listing while a match is being recorded.
+local function LiveRanges()
+    local ranges = {}
+    if not ns.Live then return ranges end
+    for _, record in pairs((ns.db and ns.db.live) or {}) do
+        ranges[#ranges + 1] = {
+            key  = record.key,
+            from = record.startedAt or 0,
+            to   = record.endedAt or record.updatedAt or record.startedAt or 0,
+            map  = record.map,
+            who  = BaseName(record.character),
+        }
+    end
+    return ranges
+end
+
+-- `h` is anything carrying a session's instance, character and time span: a
+-- cache header, or an entry from the delivery queue.
+local function SameMatch(h, range)
+    return h.instanceId == range.map
+       and BaseName(h.character) == range.who
+       and (h.startTime or 0) <= range.to + MATCH_TOLERANCE
+       and (h.endTime or 0) >= range.from - MATCH_TOLERANCE
+end
+
+-- A built cache is the real thing, so the stand-in for its match goes - from the
+-- saved file, not only from the list.
+--
+-- Run wherever a cache can have arrived or a stand-in can be looked at: when one
+-- is built, at login, and on every listing. Only the listing used to do it, which
+-- left a replaced session saved for as long as nothing asked for the list - a
+-- login with the viewer closed kept it indefinitely.
+local function SweepLive()
+    if not (ns.Live and ns.db and ns.db.cache) then return end
+    local ranges = LiveRanges()
+    if #ranges == 0 then return end
+
+    for key, cache in pairs(ns.db.cache) do
+        local h = cache.header or {}
+        for _, range in ipairs(ranges) do
+            if not range.gone and SameMatch(h, range) then
+                range.gone = ns.Live:Supersede(range.key, key)
+            end
+        end
+    end
+end
+
+-- The built session that replaced a live one, or nil while it has not been
+-- replaced. For anything that remembered a live session by key - the viewer's
+-- selection across a reload - and needs to follow it to the real thing.
+function API:Successor(key)
+    if not ns.Live then return nil end
+    SweepLive()
+    return ns.Live:Successor(key)
+end
+
+-- The name the game is withholding for one row of a live session, as the secret
+-- value itself, or nil when the row has a readable name worth showing instead.
+--
+-- It cannot be compared, concatenated, formatted as a string or saved - each of
+-- those throws. What it can be is handed to FontString:SetText, which draws it.
+-- That is the only thing a caller should do with it.
+function API:SecretName(key, guid)
+    if not ns.Live then return nil end
+    return ns.Live:SecretName(key, guid)
+end
+
 -- Every session the user can look at: everything cached, plus anything still
 -- queued. Entries share one shape regardless of which side they came from.
 function API:GetViewable()
+    SweepLive()
+
     local out, seen = {}, {}
 
     if ns.db and ns.db.cache then
@@ -282,6 +380,14 @@ function API:GetViewable()
         end
     end
 
+    -- What is left after the sweep is only stand-ins with no built session yet.
+    local live = LiveRanges()
+    local function CoveringLive(entry)
+        for _, range in ipairs(live) do
+            if SameMatch(entry, range) then return range end
+        end
+    end
+
     -- Queued sessions the addon has not built yet are listed so a backlog does
     -- not look like missing data. Declined ones are not: below the floor the
     -- cache is full and these have lost their place to newer sessions, so they
@@ -291,10 +397,21 @@ function API:GetViewable()
     local floor = (ns.db and ns.db.oldestWanted) or ""
     for _, entry in ipairs(self:GetSessions()) do
         if not seen[entry.key] and (floor == "" or entry.key >= floor) then
-            local copy = {}
-            for k, v in pairs(entry) do copy[k] = v end
-            copy.cached = false
-            out[#out + 1] = copy
+            -- Unless a live session already stands for that match: it holds the
+            -- meter's account of it and says the log is still to come, which is
+            -- both of these rows in one and the only one that can be opened.
+            if not CoveringLive(entry) then
+                local copy = {}
+                for k, v in pairs(entry) do copy[k] = v end
+                copy.cached = false
+                out[#out + 1] = copy
+            end
+        end
+    end
+
+    if ns.Live then
+        for _, entry in ipairs(ns.Live:Viewable()) do
+            out[#out + 1] = entry
         end
     end
 
@@ -754,14 +871,12 @@ end
 -- six rounds legitimately map to the same record.
 --------------------------------------------------------------------------------
 
-local MATCH_TOLERANCE = 90   -- seconds of slack at each end of the range
-
--- The log writes "Name-Realm", the client's UnitName writes "Name".
-local function BaseName(name)
-    return (tostring(name or ""):match("^([^-]+)") or "")
-end
-
 function API:GetMatch(entry)
+    -- A live session knows its own record, and while the match is still being
+    -- played that record is not in db.matches yet - the recorder stores it on the
+    -- way out - so there is nothing here to search for.
+    if entry.live and ns.Live then return ns.Live:MatchFor(entry.key) end
+
     if not (ns.db and ns.db.matches) then return nil end
     if not entry.startTime then return nil end
 
@@ -1072,6 +1187,9 @@ function API:UnitList(cache)
             reaction = UnitReaction(u.f),
             cols     = u.c,
             counts   = u.n,
+            -- Live sessions only. A built cache names units and nothing more,
+            -- but a live row's GUID is what its withheld name is filed under.
+            guid     = u.guid,
         }
     end
     return out
@@ -1166,6 +1284,11 @@ end
 function API:GetCache(key)
     local cache = ns.db and ns.db.cache and ns.db.cache[key]
     if CacheIsCurrent(cache) then return cache end
+
+    -- A live session has no stored cache: it is presented in the same shape from
+    -- what the game's damage meter has reported so far, so everything that draws
+    -- a session draws this one with the code it already has.
+    if ns.Live then return ns.Live:Cache(key) end
     return nil
 end
 
@@ -1686,6 +1809,9 @@ function API:BuildCache(key, onDone, onProgress)
                     ns.db.cache = ns.db.cache or {}
                     ns.db.cache[key] = cache
                 end
+                -- Before anyone is told, so a listener asking where a live
+                -- session went already gets the answer.
+                SweepLive()
                 NotifyCacheChanged(key)
                 if onDone then onDone(cache) end
             end)
@@ -1725,6 +1851,9 @@ ns:RegisterEvent("PLAYER_LOGIN", function()
     end
 
     DropStaleCaches()
+    -- Stand-ins whose log was built in an earlier session, before anything here
+    -- asked for the list.
+    SweepLive()
     API:ProcessPending(function(processed, skipped)
         if processed == 0 then return end
         if skipped > 0 then

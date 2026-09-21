@@ -394,6 +394,13 @@ local function StyleSlider(slider, horizontal)
     slider:HookScript("OnLeave", function() thumb:SetColorTexture(0.44, 0.44, 0.50) end)
 end
 
+-- Published for the meter window, which is a second window in the same style
+-- and would otherwise carry its own copy of all five. The gutter width goes with
+-- them because the slider's knob is sized to it here.
+ns.Fill, ns.Line, ns.Border = Fill, Line, Border
+ns.StyleSlider, ns.NewScroller = StyleSlider, NewScroller
+ns.BAR_W = BAR_W
+
 --------------------------------------------------------------------------------
 -- Session list
 --------------------------------------------------------------------------------
@@ -1486,10 +1493,14 @@ local function Populate(row, data)
     -- longer be "this row highlights". It is carried by how brightly it does.
     row.nameHi:SetColorTexture(1, 1, 1, row.name.clickable and 0.11 or 0.05)
 
-    row.values:SetWidth(math.max(1, #columns * COL_W))
+    -- Cells are placed by slot and told which column they hold, since a live
+    -- session does not draw every column and the two stop lining up.
+    local shown = Model:ShownColumns()
+    row.values:SetWidth(math.max(1, #shown * COL_W))
 
-    for i = 1, #columns do
-        local cell = GridCell(row, i)
+    for slot, i in ipairs(shown) do
+        local cell = GridCell(row, slot)
+        cell.col  = i
         cell.data = data
         cell:Show()
 
@@ -1597,7 +1608,7 @@ local function Populate(row, data)
                          or (data.omitted ~= nil and data.omitted[i] ~= nil))
     end
 
-    for i = #columns + 1, #row.cells do row.cells[i]:Hide() end
+    for slot = #shown + 1, #row.cells do row.cells[slot]:Hide() end
 end
 
 --------------------------------------------------------------------------------
@@ -1633,12 +1644,15 @@ local function LayoutHeader()
     grid.nameHeader.text:SetText(nameLabel)
     SetSorted(grid.nameHeader, nameSorted)
 
-    for i = 1, #columns do
-        local button = grid.headers[i]
+    -- By slot, like the cells beneath: a live session leaves its empty columns
+    -- out, so a header's position and the column it names are set separately.
+    local shown = Model:ShownColumns()
+    for slot, i in ipairs(shown) do
+        local button = grid.headers[slot]
         if not button then
             button = CreateFrame("Button", nil, grid.headerTrack)
             button:SetSize(COL_W, HEADER_H)
-            button:SetPoint("TOPLEFT", (i - 1) * COL_W, 0)
+            button:SetPoint("TOPLEFT", (slot - 1) * COL_W, 0)
             button.bg = Fill(button, ns.COLOR.header)
 
             -- Lit by the cross-hair when the pointer is anywhere in this
@@ -1651,7 +1665,6 @@ local function LayoutHeader()
 
             button.text = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
             button.text:SetPoint("RIGHT", -8, 0)
-            button.col = i
             -- A header sorts either way. The left button also makes the column
             -- active, which is what is usually wanted - reading a measure and
             -- ranking by it are the same intent. The right button sorts and
@@ -1688,8 +1701,9 @@ local function LayoutHeader()
                 GameTooltip:Hide()
             end)
             button.outline = Outline(button, ns.COLOR.sortBox, MARKER_W)
-            grid.headers[i] = button
+            grid.headers[slot] = button
         end
+        button.col = i
 
         local label = ns.ColumnLabel(columns[i])
         local isSort   = (i == sortCol)
@@ -1712,8 +1726,8 @@ local function LayoutHeader()
         button:Show()
     end
 
-    for i = #columns + 1, #grid.headers do grid.headers[i]:Hide() end
-    grid.headerTrack:SetWidth(math.max(1, #columns * COL_W))
+    for slot = #shown + 1, #grid.headers do grid.headers[slot]:Hide() end
+    grid.headerTrack:SetWidth(math.max(1, #shown * COL_W))
 end
 
 -- The list actually drawn: the model's rows, with any breakdown that is still
@@ -1917,7 +1931,7 @@ local function LayoutGrid()
     -- be drawn once motion settles. Bounding by the shrinking height alone
     -- would pull the view up in a jump as a breakdown near the bottom closed.
     grid.vscroll:SetMax(math.max(total, #(grid.target or {}) * ROW_H) - viewH)
-    grid.hscroll:SetMax(#columns * COL_W - grid.valueClip:GetWidth())
+    grid.hscroll:SetMax(#Model:ShownColumns() * COL_W - grid.valueClip:GetWidth())
 
     -- Pool rows are handed out by identity: a row that showed this entry last
     -- frame shows it again. During an animation the set of visible rows shifts
@@ -1996,11 +2010,11 @@ local function LayoutGrid()
     -- header no longer carrying it this box is the only place it is shown.
     -- It lives inside the value pane and is clipped by it, rather than being
     -- hidden by hand when it scrolls out.
-    local activeCol = Model:ActiveColumn()
-    if Model:Cache() and activeCol <= #columns then
+    local activeSlot = Model:SlotOf(Model:ActiveColumn())
+    if Model:Cache() and activeSlot then
         grid.colBox:ClearAllPoints()
         grid.colBox:SetPoint("TOPLEFT", grid.valueClip, "TOPLEFT",
-                             (activeCol - 1) * COL_W - grid.hscroll.cur, 0)
+                             (activeSlot - 1) * COL_W - grid.hscroll.cur, 0)
         -- Stops at the last row, not at the bottom of the window. A box running
         -- on past the data implied there was more of it below.
         local filled = math.max(0, total - scroll)
@@ -2103,11 +2117,18 @@ local function LayoutSummary()
 
     if not teams then
         Blank()
-        grid.summaryNote:SetText(Model:Selected()
-            and "|cff886644This session has no cache built yet - /reload to consume it.|r"
-            or  "|cff888888Select a session on the left.|r")
+        -- A live session with nothing in it yet is waiting for combat to drop,
+        -- not missing its data: nothing can be read out of the meter until then.
+        local live = Model:IsLive()
+        grid.summaryNote:SetText(live
+            and "|cffdfa84fLive session - the meter cannot be read until combat drops.|r"
+            or (Model:Selected()
+                and "|cff886644This session has no cache built yet - /reload to consume it.|r"
+                or  "|cff888888Select a session on the left.|r"))
         return
     end
+    -- The note spans the whole strip and would sit on top of the team lines, so
+    -- a live session is marked in the right-hand slot instead - see below.
     grid.summaryNote:SetText("")
 
     -- Both sides losing is not two losses, it is a draw. The recorder reports a
@@ -2161,6 +2182,15 @@ local function LayoutSummary()
         if i == 1 then
             local span = ns.FormatDuration(Model:Duration())
             if span then extra = ("|cff888888Time|r %s"):format(span) end
+
+            -- Where a live session says so. This slot is for facts about the
+            -- match rather than about either side, and "these are the meter's
+            -- figures, the log has not arrived" is one of those.
+            local live = Model:IsLive()
+            if live then
+                if extra ~= "" then extra = extra .. "   " end
+                extra = extra .. ("|cffdfa84f%s|r"):format(live)
+            end
         elseif entry and entry.type == "arena" then
             local value = Model:Dampening()
             if value and value > 0 then
@@ -2199,6 +2229,9 @@ end
 -- window is capped at exactly what the columns need instead, so the grid always
 -- ends where the data does.
 local function ClampWidth()
+    -- Every column, not only the ones drawn. A live session draws fewer, and
+    -- since this only ever narrows the window, clamping to those would shrink it
+    -- each time a live session was clicked and leave it narrow for the next one.
     local columns = Model:Columns()
     -- Walked left to right so this can be checked against the frame
     -- construction rather than tuned by eye:
@@ -2250,6 +2283,13 @@ end
 function UI:Refresh(animate)
     if not frame or not frame:IsShown() then return end
     if animate == nil then animate = true end
+
+    -- A live session being looked at when its log was built is replaced by it
+    -- under a different key, and the selection has to go with it: left alone it
+    -- would point at a row that no longer exists and the grid would go blank.
+    local api = ns:API()
+    local successor = api and api.Successor and api:Successor(Model:Selected())
+    if successor then Model:Select(successor) end
 
     local key = Model:Selected()
     if key ~= grid.shownKey then
@@ -2366,10 +2406,23 @@ local function BuildGridPane(parent, sessionPane)
     -- Width is read off the field table rather than written down twice: the
     -- band has to stop short of whatever x the outcome sits at, and a second
     -- constant would be a second thing to remember to move.
+    -- The strip is columns at fixed offsets, which is the only thing that lines
+    -- them up under a proportional font - but the pane is only about 500 wide at
+    -- the narrow end of the resize range, and a field written at x=638 was drawn
+    -- past the edge of its own pane and off the window. Rather than move the
+    -- columns, which unpins them from the figures they label, everything in the
+    -- strip lives in a frame that clips: what does not fit is cut off at the
+    -- pane's edge and comes back when the window is widened.
+    grid.summaryClip = CreateFrame("Frame", nil, pane)
+    grid.summaryClip:SetPoint("TOPLEFT", PAD, -PAD)
+    grid.summaryClip:SetPoint("TOPRIGHT", -PAD, -PAD)
+    grid.summaryClip:SetHeight(SUMMARY_H)
+    grid.summaryClip:SetClipsChildren(true)
+
     grid.summaryBands = {}
     for line = 1, 2 do
-        local band = pane:CreateTexture(nil, "BORDER")
-        band:SetPoint("TOPLEFT", PAD, -(PAD + (line - 1) * 15) + 1)
+        local band = grid.summaryClip:CreateTexture(nil, "BORDER")
+        band:SetPoint("TOPLEFT", 0, -((line - 1) * 15) + 1)
         band:SetSize(grid.summaryFields[2] - SUMMARY_BAND_GAP, SUMMARY_BAND_H)
         band:Hide()
         grid.summaryBands[line] = band
@@ -2379,9 +2432,8 @@ local function BuildGridPane(parent, sessionPane)
     for line = 1, 2 do
         local row = {}
         for field = 1, #grid.summaryFields do
-            local text = pane:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            text:SetPoint("TOPLEFT", PAD + grid.summaryFields[field],
-                          -(PAD + (line - 1) * 15))
+            local text = grid.summaryClip:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            text:SetPoint("TOPLEFT", grid.summaryFields[field], -((line - 1) * 15))
             text:SetJustifyH("LEFT")
             row[field] = text
         end
@@ -2389,8 +2441,8 @@ local function BuildGridPane(parent, sessionPane)
     end
 
     -- Spans the whole strip, for messages that are not a team at all.
-    grid.summaryNote = pane:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    grid.summaryNote:SetPoint("TOPLEFT", PAD, -PAD)
+    grid.summaryNote = grid.summaryClip:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    grid.summaryNote:SetPoint("TOPLEFT", 0, 0)
     grid.summaryNote:SetJustifyH("LEFT")
 
     -- Header sits above the value columns only, and takes the horizontal offset
@@ -2701,6 +2753,12 @@ function UI:Show()
     if not Model:Selected() then
         local list = Model:Sessions()
         local wanted = ns.db.lastKey
+        -- The /reload that brings a match's log in is the moment its live
+        -- stand-in is replaced, so the remembered key is often one that has just
+        -- stopped existing. Followed to what replaced it, rather than falling
+        -- back to the newest session, which need not be the same match.
+        local api = ns:API()
+        wanted = (api and api.Successor and api:Successor(wanted)) or wanted
         local found
         for _, entry in ipairs(list) do
             if entry.key == wanted then found = entry.key break end
@@ -2719,4 +2777,72 @@ end
 
 function UI:Toggle()
     if frame and frame:IsShown() then self:Hide() else self:Show() end
+end
+
+-- Open the window on one player in one session, with their breakdown showing.
+--
+-- The meter window is a list of names with no room to break any of them down, so
+-- clicking one has to hand off to the window that can. Everything a click on the
+-- same row in the grid would do, done from outside: select the session, open the
+-- player, and bring both lists to where that row is.
+--
+-- `col` is the measure the click came from, and it arrives as both choices the
+-- grid keeps: the active column, which is what the bars are drawn against and
+-- what the breakdown is about, and the sort, which is what the rows are ranked
+-- by. A row clicked in a list of Healing Done has to open on healing and rank on
+-- healing, or the player the user just pointed at is somewhere down the page in
+-- a breakdown of something else.
+--
+-- Both lists are moved by their targets rather than by JumpTo, so the window
+-- travels to the row and the user can see which one it stopped on. The session
+-- list is included because the selection is otherwise announced by a highlight
+-- that may be a dozen rows out of sight.
+function UI:Reveal(key, name, col)
+    self:Show()
+    if not (frame and frame:IsShown()) then return end
+
+    if key and Model:Selected() ~= key then Model:Select(key) end
+
+    if col and col >= 1 and col <= #Model:Columns() then
+        Model:SetActiveColumn(col)
+        Model:SortBy(col)
+    end
+
+    -- The unit is what decides whether there is anything to open: a player the
+    -- meter knows about may have nothing in this session's cache at all, and
+    -- Open treats that as a click on an empty row.
+    local data = name and Model:PlayerData(name)
+    if data then Model:Open(data.name, data.unit) end
+
+    -- Not animated: this is a different session as often as not, and a grid
+    -- growing into place from another match's row positions is motion that says
+    -- nothing about what changed.
+    self:Refresh(false)
+
+    if key then
+        for i, entry in ipairs(sessions.list or {}) do
+            if entry.key == key then
+                local wanted = (i - 1) * SESSION_ROW_H
+                       - math.max(0, sessions.clip:GetHeight() - SESSION_ROW_H) / 2
+                sessions.scroll:Nudge(Clamp(wanted, 0, sessions.scroll.max)
+                                      - sessions.scroll.target)
+                break
+            end
+        end
+    end
+
+    if not data then return end
+
+    -- Only one block is ever open and it opens beneath this row, so everything
+    -- above it is a root row of one fixed height and the offset is exact.
+    for i, d in ipairs(grid.display or {}) do
+        if d.kind == "unit" and d.name == data.name then
+            -- Near the top rather than centred: what was just opened is
+            -- underneath, and that is the part worth having room for.
+            local wanted = math.max(0, (i - 1) * ROW_H - ROW_H)
+            grid.vscroll:Nudge(Clamp(wanted, 0, grid.vscroll.max)
+                               - grid.vscroll.target)
+            break
+        end
+    end
 end

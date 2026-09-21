@@ -70,6 +70,31 @@ local DEFAULTS = {
     -- resizes it.
     minimapAngle  = 198,
     minimapShown  = true,
+
+    -- The meter window: a small always-on list of one measure, standing in for
+    -- the damage meter it sits beside. Unlike the main window it does come back
+    -- on login, because that is the whole point of it - a window that has to be
+    -- opened by hand every session is not something anyone plays with on screen.
+    --
+    -- Flat keys rather than a nested table, like everything above: a nested
+    -- default is copied by reference on first login and never revisited, so a
+    -- field added later would never reach a database that already exists.
+    meterShown  = false,
+    meterLocked = false,
+    meterPoint  = "CENTER",
+    meterX      = 0,
+    meterY      = 0,
+    -- Blizzard's own meter window's footprint, which is what this one is meant
+    -- to sit beside or in place of.
+    meterW      = 260,
+    meterH      = 208,
+    -- Nil until chosen, then a column index. Resolved against the columns the
+    -- meter can actually fill at the moment it is read, so a format change
+    -- cannot leave this pointing at something that no longer moves.
+    meterCol    = nil,
+    -- How opaque the whole window is, text included: 0.90 is the 90% the slider
+    -- in its menu shows.
+    meterOpacity = 0.90,
 }
 
 local function ApplyDefaults(target, defaults)
@@ -82,6 +107,14 @@ end
 function ns:InitDB()
     CombatSessionViewerDB = ApplyDefaults(CombatSessionViewerDB or {}, DEFAULTS)
     self.db = CombatSessionViewerDB
+
+    -- The meter's first opacity setting stored the background's opacity under
+    -- a default that turned out to be backwards. It is replaced by meterOpacity
+    -- rather than reinterpreted: the value already saved is that wrong default
+    -- far more often than a choice, and applied to the whole window it would
+    -- leave a window that can barely be seen.
+    self.db.meterAlpha = nil
+
     return self.db
 end
 
@@ -589,6 +622,15 @@ end
 
 local loader = CreateFrame("Frame")
 loader:RegisterEvent("PLAYER_LOGIN")
+-- The remembered selection, moved on if it was a live session that a built one
+-- has since replaced. Kept up to date whether or not the window is open: the
+-- replacement is only known about in the session it happens, so waiting for the
+-- window to be opened could mean waiting until it has been forgotten.
+local function FollowSuccessor(api)
+    local successor = api.Successor and api:Successor(ns.db.lastKey)
+    if successor then ns.db.lastKey = successor end
+end
+
 loader:SetScript("OnEvent", function()
     ns:InitDB()
     if ns.CreateMinimapButton then ns:CreateMinimapButton() end
@@ -596,17 +638,24 @@ loader:SetScript("OnEvent", function()
     if not api then
         ns:Print("CombatSession is not loaded - there is nothing to view.")
     elseif api.OnCacheChanged then
+        -- The library sweeps at its own login, which runs before this one.
+        FollowSuccessor(api)
+
         -- Caches arrive one at a time over the first seconds after login, so a
         -- redraw per cache would be dozens of full layouts in a row. One redraw
         -- shortly after the last of a burst is all the window needs.
         local pending = false
         api:OnCacheChanged(function(key)
             if ns.Model then ns.Model:Invalidate(key) end
+            FollowSuccessor(api)
             if pending then return end
             pending = true
             C_Timer.After(0.2, function()
                 pending = false
                 if ns.UI then ns.UI:Refresh() end
+                -- The same signal carries a live reading, which is what the
+                -- meter window is drawing: it moves on every one of them.
+                if ns.Meter then ns.Meter:Refresh() end
             end)
         end)
     end
@@ -623,5 +672,14 @@ loader:SetScript("OnEvent", function()
         C_Timer.After(0, function()
             if ns.UI then ns.UI:Show() end
         end)
+    end
+
+    -- The meter window does come back, and for the same reason the main one
+    -- does not: it is meant to be left on screen, so a login that hid it would
+    -- be a setting the user has to set again every time they play. Deferred for
+    -- the same frame the main window is, so it opens on the sessions the library
+    -- has by then rather than on the ones it had at login.
+    if ns.db.meterShown and ns.Meter then
+        C_Timer.After(0, function() ns.Meter:Show() end)
     end
 end)

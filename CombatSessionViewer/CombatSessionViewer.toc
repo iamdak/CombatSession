@@ -8,5 +8,6 @@
 Core.lua
 Model.lua
 Window.lua
+Meter.lua
 Minimap.lua
 Commands.lua

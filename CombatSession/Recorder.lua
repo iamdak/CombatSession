@@ -267,6 +267,10 @@ local function ReadRoster()
         if type(info) == "table" then
             roster[i] = {
                 name    = info.name,
+                -- The one field that joins a scoreboard row to anything else
+                -- without going through a name: the live session's rows are keyed
+                -- by GUID, and so is the log.
+                guid    = info.guid,
                 class   = info.classToken,
                 spec    = info.talentSpec,
                 faction = info.faction,
@@ -555,6 +559,11 @@ local function BeginMatch(instanceName, instanceID, instanceType)
 
     Trace("BEGIN", instanceName)
 
+    -- The live session opens on the same event the log slice will start from, so
+    -- what the viewer shows now and what the application delivers later describe
+    -- the same match.
+    if ns.Live then ns.Live:Begin(current) end
+
     -- Cancels any pending stop from the previous match. This must happen even
     -- when logging is already running, or a timer queued on the way out of the
     -- last match would switch it off partway through this one.
@@ -615,12 +624,18 @@ local function CompleteMatch(attempt)
 
     Trace("COMPLETE", ("roster=%d winner=%s honorFaults=%d")
         :format(roster and #roster or 0, tostring(current.winner), honorFaults))
+
+    -- The meter's figures are final at completion; only the enemy names are
+    -- still withheld, and those arrive when the map is left.
+    if ns.Live then ns.Live:Complete() end
 end
 
 -- Called when leaving the instance. A match without a completion snapshot was
 -- abandoned: rated status and start time survive, outcome and roster do not.
 local function FinalizeMatch()
     if not current then return end
+
+    if ns.Live then ns.Live:Finish() end
 
     if not current.complete then
         current.endedAt   = ns:Now()
@@ -664,6 +679,10 @@ local function OnMatchStateChanged()
             duration = PvPFlag("GetActiveMatchDuration"),
         })
         Trace("ROUND", ("#%d"):format(#current.rounds))
+
+        -- One live session per round, matching how the application segments a
+        -- lobby: the round that just ended closes and the next one opens.
+        if ns.Live then ns.Live:Round(current, #current.rounds + 1) end
     end
 end
 
@@ -747,6 +766,13 @@ function Recorder:Init()
 
     -- Leaving by logout rather than by zoning still needs the record stored.
     ns:RegisterEvent("PLAYER_LOGOUT",           FinalizeMatch)
+
+    if ns.Live then
+        ns.Live:Init()
+        -- A reload mid-match leaves a session open with its figures but no
+        -- baseline; this picks it back up rather than starting a second one.
+        ns.Live:Restore()
+    end
 end
 
 --------------------------------------------------------------------------------

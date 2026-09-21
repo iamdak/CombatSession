@@ -76,7 +76,15 @@ function Model:SessionLabel(entry)
     local mark = self:OutcomeMark(entry)
     if mark then who = who .. "  " .. mark end
 
-    return name, ns.FormatTime(entry.startTime), who
+    -- A live session is standing in for data that has not arrived: it says so on
+    -- the row, because its numbers are the meter's approximation of six columns
+    -- and not the log's account of twelve.
+    local when = ns.FormatTime(entry.startTime)
+    if entry.pending then
+        when = ("%s  |cffdfa84f%s|r"):format(when, entry.pending)
+    end
+
+    return name, when, who
 end
 
 -- (W), (L) or (D) for the recording player, or nil when the match never
@@ -238,6 +246,7 @@ function Model:Select(key)
     -- list was last drawn now has an outcome where it had none.
     state.info         = nil
     state.factions     = nil
+    state.shown        = nil
 
     local api = ns:API()
     if not (api and key) then return end
@@ -354,6 +363,12 @@ end
 function Model:Selected()   return state.key end
 function Model:Cache()      return state.cache end
 function Model:Entry()      return state.entry end
+
+-- "recording" while the match is being played, "awaiting log" once it is over and
+-- the application has yet to deliver it, nil for a session built from the log.
+function Model:IsLive()
+    return state.entry and state.entry.pending or nil
+end
 function Model:Teams()      return state.teams end
 function Model:Match()      return state.match end
 
@@ -484,6 +499,47 @@ function Model:Columns()
     return (cs and cs.FORMAT_COLUMNS) or {}
 end
 
+local function ColumnHasData(cache, col)
+    for _, unit in ipairs(cache.U or {}) do
+        local value = unit.c and unit.c[col]
+        if value and value ~= 0 then return true end
+    end
+    return false
+end
+
+-- The columns the grid draws, as indices into Columns(), in order.
+--
+-- All of them for a session built from the log. A live session is stored with
+-- the full list as well, because a column is identified by its index everywhere -
+-- the active column, the sort, the meter window's measure are all kept as
+-- numbers, and they have to mean the same column in every session. But most of
+-- that list stays empty until the log arrives, so a live session draws only the
+-- columns that hold something; the rest reappear with the log's version.
+--
+-- Worked out once per cache: Select clears it, and a live reading arrives as a
+-- new cache and goes through Select.
+function Model:ShownColumns()
+    if state.shown then return state.shown end
+
+    local columns, cache = self:Columns(), state.cache
+    local shown = {}
+    for col = 1, #columns do
+        if not (cache and cache.live) or ColumnHasData(cache, col) then
+            shown[#shown + 1] = col
+        end
+    end
+    state.shown = shown
+    return shown
+end
+
+-- Where a column is drawn, counting from 1, or nil when it is not drawn.
+function Model:SlotOf(col)
+    for slot, shown in ipairs(self:ShownColumns()) do
+        if shown == col then return slot end
+    end
+    return nil
+end
+
 --------------------------------------------------------------------------------
 -- Sorting
 --------------------------------------------------------------------------------
@@ -499,15 +555,32 @@ ns.NAME_COL = NAME_COL
 -- while reading another, and meant a header click could silently change what a
 -- drill-down was about. A header now only sorts. The active column is chosen by
 -- clicking a value in it.
+-- Compared against the sort as drawn rather than as stored, so a click on the
+-- header showing the sort mark reverses it even when that sort is standing in for
+-- a column this session does not draw.
 function Model:SetSort(col)
-    if state.sortCol == col then
-        state.sortAsc = not state.sortAsc
-    else
-        state.sortCol = col
-        -- Largest-first for a measure; A to Z for a name, which is the only
-        -- direction anyone means by "sort by name".
-        state.sortAsc = (col == NAME_COL)
+    local sortCol, asc = self:Sort()
+    if sortCol == col then
+        state.sortCol, state.sortAsc = col, not asc
+        if ns.db then
+            ns.db.sortCol = state.sortCol
+            ns.db.sortAsc = state.sortAsc
+        end
+        return
     end
+    self:SortBy(col)
+end
+
+-- Sort by a column in its natural direction, with none of the toggle a header
+-- click carries. For a caller that means "rank by this", not "sort by this
+-- again": the meter window hands a column over and has no idea which way the
+-- grid happened to be sorted last, so a toggle there would land on ascending
+-- half the time and show the smallest figures first.
+function Model:SortBy(col)
+    state.sortCol = col
+    -- Largest-first for a measure; A to Z for a name, which is the only
+    -- direction anyone means by "sort by name".
+    state.sortAsc = (col == NAME_COL)
 
     if ns.db then
         ns.db.sortCol = state.sortCol
@@ -515,12 +588,27 @@ function Model:SetSort(col)
     end
 end
 
-function Model:Sort() return state.sortCol, state.sortAsc end
+-- The sort and the active column as they apply to this session.
+--
+-- A choice made in a column this session does not draw - Overhealing, on a live
+-- session - is not applied here but is not forgotten either: the stored value is
+-- left alone and comes back into force on the next session that has the column.
+-- Until then the active column falls back to the first one drawn, and the sort
+-- to the active column, largest first.
+function Model:Sort()
+    local col = state.sortCol
+    if col == NAME_COL or self:SlotOf(col) then return col, state.sortAsc end
+    return self:ActiveColumn(), false
+end
 
 -- The active column. Kept in the saved setting that used to hold the bar
 -- column, because it is the same choice under a better rule: what the bars are
 -- drawn against.
-function Model:ActiveColumn() return state.activeCol or 1 end
+function Model:ActiveColumn()
+    local col = state.activeCol or 1
+    if self:SlotOf(col) then return col end
+    return self:ShownColumns()[1] or col
+end
 function Model:BarColumn()    return self:ActiveColumn() end
 
 function Model:SetActiveColumn(col)
@@ -703,7 +791,7 @@ function Model:Rows()
 
     local api = ns:API()
     local columns = self:Columns()
-    local sortCol, asc = state.sortCol, state.sortAsc
+    local sortCol, asc = self:Sort()
 
     -- A saved active column from a build with more columns than this session
     -- carries would point past the end of the grid.
