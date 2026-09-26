@@ -33,7 +33,7 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0"
     CACHE STRING "Minimum macOS version")
 
 project(CombatSession
-        VERSION 0.12
+        VERSION 0.13
         DESCRIPTION "Turns World of Warcraft combat logs into per-session data"
         LANGUAGES C CXX)
 
