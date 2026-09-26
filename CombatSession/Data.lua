@@ -92,7 +92,20 @@ ns.API = API
 --     Cocoon that absorbed thirty hits had been thirty "casts" averaging a
 --     thirtieth of its real size. Units also carry each spell's casts taken
 --     whole across targets, for spell totals.
-local DEFINES_VERSION = 22
+-- 23: smallest and largest went back to being per HIT, while the count and the
+--     average stay per cast. 22 had made the range describe a cast as well,
+--     which left nothing anywhere saying what one tick of a DoT or one absorbed
+--     blow was worth - the count and the average already describe the cast. The
+--     layout is unchanged; the two numbers mean something different, which is
+--     the whole reason this is a version and not a silent correction.
+-- 24: a hit for the range is a damage line valued whole, absorbed part
+--     included - not every line. 23 ranged over lines, so the absorbed part of
+--     a hit, credited on a line of its own, counted as a hit of its own and
+--     dragged the smallest down to whatever scrap a shield had left; and Fel
+--     Armor's negative absorbs, which take back damage it released onto a later
+--     hit, showed up as negative smallest hits. Both still count in the totals,
+--     where they belong, and a cast that nets to nothing is not counted as one.
+local DEFINES_VERSION = 24
 
 --------------------------------------------------------------------------------
 -- Event kinds, mirroring EventKind in StreamWriter.h. Values are persisted in
@@ -637,6 +650,14 @@ local function DropStaleCaches()
         end
     end
     if dropped > 0 then
+        -- The floor has to come down with them, for the reason raising the
+        -- session cap does it: the floor says what a full cache declined for
+        -- good, and a cache that just emptied has declined nothing. Left set, a
+        -- format change dropped every session and then refused to ask for any of
+        -- them again - the application only re-reads its logs when the addon
+        -- holds nothing AND wants everything, so the upgrade quietly ended with
+        -- an empty viewer and no way back but `/combatsession reset`.
+        ns.db.oldestWanted = ""
         ns:Debug(("dropped %d cache entry(s) from an older format"):format(dropped))
     end
 end
@@ -1316,10 +1337,11 @@ function API:Breakdown(cache, index, col)
     return out, unit.m and unit.m[col]
 end
 
--- One unit's casts in one column, by spell name: { [name] = { n, mn, mx } },
--- each cast taken whole across every target it landed on. What a spell-totals
--- line should show for a count, smallest and largest; the per-counterpart rows
--- Breakdown returns count a cast once per target instead.
+-- One unit's casts in one column, by spell name: { [name] = { n, mn, mx } }. The
+-- count is casts, each taken whole across every target it landed on, which is
+-- what a spell-totals line should show - the per-counterpart rows Breakdown
+-- returns count a cast once per target instead. The range is per hit, as it is
+-- everywhere else.
 --
 -- Empty for a session built before these were recorded, and for a live one.
 function API:SpellCasts(cache, index, col)
@@ -1476,6 +1498,10 @@ function API:BuildCache(key, onDone, onProgress)
     local t, k   = stream.t,  stream.k
     local s, d   = stream.s,  stream.d
     local am, ov = stream.am, stream.ov
+    -- What a damage line's own hit had absorbed from it. The absorbed part is
+    -- also credited on lines of its own, so this is never added to a total - it
+    -- is only how a hit is valued whole, for the range.
+    local ab     = stream.ab or {}
     local sp     = stream.sp
     local spells = stream.spells
     local total  = #t
@@ -1564,10 +1590,11 @@ function API:BuildCache(key, onDone, onProgress)
     -- output and is listed by name like anyone else, so a self-healer's row can
     -- be opened to see how much of their healing was on themselves.
     -- `partial` marks a value that is one piece of a cast still being added up.
-    -- Its count, smallest and largest are left alone here and settled when the
-    -- cast closes, from the cast's own total; the pairing and spell it landed in
-    -- are returned so the cast can find them again.
-    local function AddBreakdown(entry, col, other, value, count, spellId, partial)
+    -- Its count is left alone here and settled when the cast closes; the pairing
+    -- and spell it landed in are returned so the cast can find them again. `hit`
+    -- is what the piece contributes to the range, and only a piece of a cast
+    -- passes one - nil when the piece is not a hit at all. See Credit.
+    local function AddBreakdown(entry, col, other, value, count, spellId, partial, hit)
         if not other then return end
 
         local map = entry.by[col]
@@ -1582,9 +1609,16 @@ function API:BuildCache(key, onDone, onProgress)
         --
         -- Smallest and largest are tracked alongside the sum because they cannot
         -- be recovered from it: an average says a spell hit for 40k, and only the
-        -- range says whether that was every cast or one crit carrying twenty
+        -- range says whether every hit was like that or one crit carried twenty
         -- glancing ticks. Two numbers per spell is the cheapest way to answer a
         -- question the totals genuinely cannot.
+        --
+        -- They are per HIT, including for a spell counted in casts: what one tick
+        -- of a DoT or one absorbed blow was worth is the question the range is
+        -- being asked, and the cast's own total is already the count and the
+        -- average. `partial` therefore withholds the count, which the cast
+        -- settles, and not the range, which is the hit's alone. Anything not
+        -- part of a cast is one event and is its own hit, as it always was.
         local use
         if spellId then
             local spells = slot.s
@@ -1597,8 +1631,11 @@ function API:BuildCache(key, onDone, onProgress)
             use.v = use.v + value
             if not partial then
                 use.n = use.n + count
-                if not use.mn or value < use.mn then use.mn = value end
-                if not use.mx or value > use.mx then use.mx = value end
+                hit = value
+            end
+            if hit then
+                if not use.mn or hit < use.mn then use.mn = hit end
+                if not use.mx or hit > use.mx then use.mx = hit end
             end
         end
         return slot, use
@@ -1618,8 +1655,12 @@ function API:BuildCache(key, onDone, onProgress)
     -- of a channel - a single Life Cocoon that soaked thirty hits was thirty
     -- lines, and was being shown as thirty casts averaging a thirtieth of what it
     -- actually absorbed. What anyone reading a breakdown wants is what one cast
-    -- did, so each line is assigned to the cast it came from and a cast's count,
-    -- average, smallest and largest are its whole total.
+    -- did, so each line is assigned to the cast it came from and a cast counts
+    -- once however many lines it wrote - which makes the average per cast too.
+    --
+    -- The smallest and largest stay per LINE. A cast's total is already described
+    -- by the count and the average, and what the range has to say that they
+    -- cannot is what a single tick or absorbed blow was worth.
     --
     -- The log never says which cast a line came from, so it is inferred, per
     -- source, target and spell NAME - by name because a spell's effect often
@@ -1701,10 +1742,10 @@ function API:BuildCache(key, onDone, onProgress)
         return whole
     end
 
-    -- The unit's running figures for one spell name in one column: casts,
-    -- smallest, largest, and every id the name was seen under. By name, because
-    -- that is how spell totals are drawn - Penance hits under one id and heals
-    -- under another, and one cast of it is still one cast.
+    -- The unit's running figures for one spell name in one column: casts, the
+    -- smallest and largest single hit, and every id the name was seen under. By
+    -- name, because that is how spell totals are drawn - Penance hits under one
+    -- id and heals under another, and one cast of it is still one cast.
     local function WholeOf(entry, col, name)
         entry.whole = entry.whole or {}
         local totals = entry.whole[col]
@@ -1715,17 +1756,24 @@ function API:BuildCache(key, onDone, onProgress)
     end
 
     -- A finished cast into the per-spell and per-column figures of every unit it
-    -- was credited to.
+    -- was credited to. The count only: the range is per hit and was taken as the
+    -- hits arrived, in Credit.
+    --
+    -- Only a cast that came to something counts. A piece that nets to nothing or
+    -- less was a correction to damage counted elsewhere - see Credit - and one
+    -- standing alone is not a cast anyone made.
     local function SettleWhole(whole)
         for entry, cols in pairs(whole.acc) do
             for col, byName in pairs(cols) do
-                entry.counts[col] = entry.counts[col] + 1
+                local net = 0
                 for name, total in pairs(byName) do
-                    local w = WholeOf(entry, col, name)
-                    w.n = w.n + 1
-                    if not w.mn or total < w.mn then w.mn = total end
-                    if not w.mx or total > w.mx then w.mx = total end
+                    net = net + total
+                    if total > 0 then
+                        local w = WholeOf(entry, col, name)
+                        w.n = w.n + 1
+                    end
                 end
+                if net > 0 then entry.counts[col] = entry.counts[col] + 1 end
             end
         end
     end
@@ -1735,12 +1783,14 @@ function API:BuildCache(key, onDone, onProgress)
         if not cast then return end
         open[key] = nil
 
+        -- The count is the cast's; the range was taken per hit as they arrived.
+        -- Counted where the cast came to something, for SettleWhole's reason.
         for use, total in pairs(cast.uses) do
-            use.n = use.n + 1
-            if not use.mn or total < use.mn then use.mn = total end
-            if not use.mx or total > use.mx then use.mx = total end
+            if total > 0 then use.n = use.n + 1 end
         end
-        for slot in pairs(cast.slots) do slot.n = slot.n + 1 end
+        for slot, total in pairs(cast.slots) do
+            if total > 0 then slot.n = slot.n + 1 end
+        end
 
         -- The target's side: this cast is all of it.
         SettleWhole(cast)
@@ -1829,15 +1879,39 @@ function API:BuildCache(key, onDone, onProgress)
     -- One event's worth of a cast, credited to one unit's column. `whole` is what
     -- the unit's own spell totals count it as: the cast across every target for
     -- the unit that cast it, this target's share for the unit it landed on.
-    local function Credit(cast, whole, entry, col, other, value, spellId)
+    --
+    -- `value` goes into every total. `hit` is what the event was worth as a hit,
+    -- for the range, and is nil when it was not one. Two kinds of line are not:
+    --
+    --   * The absorbed part of a hit. It is credited on a line of its own so the
+    --     totals include it, but it is a piece of the hit its damage line
+    --     describes - which is valued whole, absorbed part included. Taken as a
+    --     hit, every shield turned one blow into two small ones, and the smallest
+    --     "hit" was usually the scrap a shield happened to have left.
+    --
+    --   * A correction. Fel Armor absorbs part of a hit, then releases it onto a
+    --     later one - the later hit's damage line includes it - and writes a
+    --     NEGATIVE absorb against that hit to take it back out. Summed, the two
+    --     cancel exactly, which is why the totals are right with it in. As a hit
+    --     it was a negative smallest hit. Across four logs it was the only spell
+    --     that did this: 2,233 negative lines against 16,042 positive.
+    local function Credit(cast, whole, entry, col, other, value, spellId, hit)
         entry.cols[col] = entry.cols[col] + value
 
-        local slot, use = AddBreakdown(entry, col, other, value, 0, spellId, true)
+        local slot, use = AddBreakdown(entry, col, other, value, 0, spellId, true, hit)
+        -- Summed, so the count at close can tell a cast from a correction.
         if use then cast.uses[use] = (cast.uses[use] or 0) + value end
-        if slot then cast.slots[slot] = true end
+        if slot then cast.slots[slot] = (cast.slots[slot] or 0) + value end
 
+        -- Spell totals count casts and range over hits, so the count waits for
+        -- the cast to close and the range is taken here, where a hit is.
         local name = spellNames[spellId] or spellId
-        WholeOf(entry, col, name).ids[spellId] = true
+        local w = WholeOf(entry, col, name)
+        w.ids[spellId] = true
+        if hit then
+            if not w.mn or hit < w.mn then w.mn = hit end
+            if not w.mx or hit > w.mx then w.mx = hit end
+        end
 
         local cols = whole.acc[entry]
         if not cols then cols = {}; whole.acc[entry] = cols end
@@ -2075,12 +2149,22 @@ function API:BuildCache(key, onDone, onProgress)
                     and (srcName == dstName
                          or rawReact[s[i]] == rawReact[d[i]])
 
+                -- A damage line is a hit, valued at what it dealt plus what was
+                -- absorbed from it. The absorbed part arriving as a line of its
+                -- own is not - see Credit - and neither is anything that comes
+                -- to nothing.
+                local hit
+                if kind ~= K.DAMAGE_ABSORBED then
+                    hit = amount + (ab[i] or 0)
+                    if hit <= 0 then hit = nil end
+                end
+
                 local cast, castKey, single = Casts.For(i)
                 if srcName and not reflexive then
-                    Casts.Credit(cast, cast.whole, UnitEntry(srcName), dmgDone, dstName, amount, spellId)
+                    Casts.Credit(cast, cast.whole, UnitEntry(srcName), dmgDone, dstName, amount, spellId, hit)
                 end
                 if dstName then
-                    Casts.Credit(cast, cast, UnitEntry(dstName), dmgTaken, srcName, amount, spellId)
+                    Casts.Credit(cast, cast, UnitEntry(dstName), dmgTaken, srcName, amount, spellId, hit)
                 end
                 if single then Casts.Close(castKey) end
 
@@ -2109,17 +2193,20 @@ function API:BuildCache(key, onDone, onProgress)
                 -- Overhealing is included in amount, so effective healing is
                 -- the remainder.
                 local effective = amount - ov[i]
+                -- A tick that was all overhealing healed nothing, and is a hit
+                -- for the overhealing range rather than this one.
+                local hit = effective > 0 and effective or nil
                 local cast, castKey, single = Casts.For(i)
                 if srcName then
-                    Casts.Credit(cast, cast.whole, UnitEntry(srcName), healDone, dstName, effective, spellId)
+                    Casts.Credit(cast, cast.whole, UnitEntry(srcName), healDone, dstName, effective, spellId, hit)
                     -- Credited only when there was overhealing, so the count is
                     -- "casts that overhealed" rather than "casts".
                     if ov[i] > 0 then
-                        Casts.Credit(cast, cast.whole, UnitEntry(srcName), overCol, dstName, ov[i], spellId)
+                        Casts.Credit(cast, cast.whole, UnitEntry(srcName), overCol, dstName, ov[i], spellId, ov[i])
                     end
                 end
                 if dstName then
-                    Casts.Credit(cast, cast, UnitEntry(dstName), healTaken, srcName, effective, spellId)
+                    Casts.Credit(cast, cast, UnitEntry(dstName), healTaken, srcName, effective, spellId, hit)
                 end
                 if single then Casts.Close(castKey) end
 
@@ -2138,12 +2225,16 @@ function API:BuildCache(key, onDone, onProgress)
                 -- included. Blizzard's healing figure is not a function of the
                 -- log; counting prevented damage as healing is at least a rule
                 -- that can be stated.
+                -- Each absorb is the shield's hit. A negative one is Fel Armor
+                -- taking back what it released - see Credit - and is summed but
+                -- is not a hit.
+                local hit = amount > 0 and amount or nil
                 local cast, castKey, single = Casts.For(i)
                 if srcName then
-                    Casts.Credit(cast, cast.whole, UnitEntry(srcName), healDone, dstName, amount, spellId)
+                    Casts.Credit(cast, cast.whole, UnitEntry(srcName), healDone, dstName, amount, spellId, hit)
                 end
                 if dstName then
-                    Casts.Credit(cast, cast, UnitEntry(dstName), healTaken, srcName, amount, spellId)
+                    Casts.Credit(cast, cast, UnitEntry(dstName), healTaken, srcName, amount, spellId, hit)
                 end
                 if single then Casts.Close(castKey) end
 

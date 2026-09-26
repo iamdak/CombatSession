@@ -45,6 +45,16 @@ local ROW_BASE  = 18
 local ROW_SCALE = 1.4
 local ROW_H     = math.floor(ROW_BASE * ROW_SCALE + 0.5)
 
+-- The identity strip: honor, role, spec, at the grid's own size and spacing
+-- rather than scaled with the row, because these are the grid's icons and three
+-- of them taller would take a third of a window this narrow. Every slot is kept
+-- whether or not it has anything in it, for the grid's reason - a name that
+-- starts in a different place depending on what happened to resolve is harder to
+-- read down a list than a gap is.
+local ICON_W   = 16
+local ICON_GAP = 3
+local ICONS_W  = (3 * ICON_W) + (3 * ICON_GAP)
+
 -- Everything in the window's height that is not rows: the title bar, the gap
 -- under it, the list box's own two edges and its header, the gap under the box,
 -- and the status strip. Named because the peek works out how tall the window
@@ -53,8 +63,10 @@ local ROW_H     = math.floor(ROW_BASE * ROW_SCALE + 0.5)
 local CHROME_H = TITLE_H + GAP + 1 + HEAD_H + 1 + GAP + STATUS_H + 1
 
 -- Below these the list holds fewer than three rows and the title has nowhere to
--- put a name, which is not a window any more.
-local MIN_W, MIN_H = 180, CHROME_H + (3 * ROW_H)
+-- put a name, which is not a window any more. The width carries the identity
+-- strip on top of that: the icons do not shrink, so narrowing past this takes the
+-- room from the name instead.
+local MIN_W, MIN_H = 180 + ICONS_W, CHROME_H + (3 * ROW_H)
 
 local frame, list
 local view = { rows = {}, version = 0 }
@@ -173,9 +185,11 @@ local function Build()
         local unit  = player.unit
         local value = (unit and unit.cols and unit.cols[col]) or 0
         if value > 0 then
-            -- The log's spec id yields a class for a player the scoreboard
-            -- never listed, which in a live session is most of the other side.
-            local byId = ns.SpecById(player.specId)
+            -- Described by the model, exactly as the grid describes the same
+            -- player: class, spec and honor come from the recorder or the log by
+            -- the same rules, which in a live session is most of what is known
+            -- about the other side.
+            local data = ns.Model:UnitRow(player)
 
             -- Fetched with a plain `if`, not an `and ... or` chain: `or` would
             -- test the secret for truth, and testing a secret throws.
@@ -185,11 +199,14 @@ local function Build()
             end
 
             view.rows[#view.rows + 1] = {
-                name  = player.name,
-                class = player.class or (byId and byId.class) or nil,
-                team  = player.team or player.inferredTeam,
-                value = value,
-                count = (unit and unit.counts and unit.counts[col]) or 0,
+                name   = player.name,
+                class  = data.class,
+                spec   = data.spec,
+                specId = data.specId,
+                honor  = data.honor,
+                team   = player.team or player.inferredTeam,
+                value  = value,
+                count  = (unit and unit.counts and unit.counts[col]) or 0,
                 -- The game's own name for a row it will not name to us yet,
                 -- as a secret: drawn, never read. `name` stays the readable
                 -- label, which is what sorting and the hand-off to the grid use.
@@ -228,6 +245,38 @@ local function SetName(text, entry)
     text:SetTextColor(NameColor(entry))
     if isSecret(entry.secret) and pcall(text.SetText, text, entry.secret) then return end
     text:SetText(ns.ShortName(entry.name))
+end
+
+-- Honor, role and spec, from the same helpers and in the same order as the grid.
+-- A slot with nothing behind it is hidden rather than filled with a stand-in: an
+-- enemy the game has not named yet has no spec either, and a wrong icon says more
+-- than an empty one does.
+local function SetIcons(row, entry)
+    local badge = ns.HonorBadge(entry.honor)
+    if badge then
+        row.honorIcon:SetTexture(badge)
+        row.honorIcon:Show()
+    else
+        row.honorIcon:Hide()
+    end
+
+    local spec = ns.SpecById(entry.specId) or ns.SpecInfo(entry.class, entry.spec)
+
+    local roleAtlas = spec and ns.ROLE_ATLAS[spec.role]
+    if roleAtlas then
+        row.roleIcon:SetAtlas(roleAtlas)
+        row.roleIcon:Show()
+    else
+        row.roleIcon:Hide()
+    end
+
+    local texture = (spec and spec.icon) or ns.ClassIcon(entry.class)
+    if texture then
+        row.specIcon:SetTexture(texture)
+        row.specIcon:Show()
+    else
+        row.specIcon:Hide()
+    end
 end
 
 -- Track and bar for a side, from the same palette the main grid uses, so a
@@ -307,8 +356,26 @@ local function Row(index)
     row.value:SetJustifyH("RIGHT")
     ScaleFont(row.value)
 
+    -- Over the bar, like the name: the bar grows from the left edge underneath
+    -- the whole row, which is where the strip sits.
+    local function Icon(slot, trim)
+        local icon = row:CreateTexture(nil, "ARTWORK")
+        icon:SetSize(ICON_W, ICON_W)
+        icon:SetPoint("LEFT", INSET + (slot - 1) * (ICON_W + ICON_GAP), 0)
+        -- WoW icon art carries a border in its outer few percent. The honor
+        -- badge and the role atlas are drawn to their own edges and lose part of
+        -- the art if they are cropped the same way.
+        if trim then icon:SetTexCoord(0.08, 0.92, 0.08, 0.92) end
+        icon:Hide()
+        return icon
+    end
+
+    row.honorIcon = Icon(1)
+    row.roleIcon  = Icon(2)
+    row.specIcon  = Icon(3, true)
+
     row.name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    row.name:SetPoint("LEFT", INSET, 0)
+    row.name:SetPoint("LEFT", INSET + ICONS_W, 0)
     row.name:SetPoint("RIGHT", row.value, "LEFT", -INSET, 0)
     row.name:SetJustifyH("LEFT")
     row.name:SetWordWrap(false)
@@ -341,6 +408,7 @@ local function Populate(row, entry)
         row.bar:Hide()
     end
 
+    SetIcons(row, entry)
     SetName(row.name, entry)
     row.value:SetText(ns.FormatCell(view.column, entry.value, entry.count))
 end

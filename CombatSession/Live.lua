@@ -593,23 +593,37 @@ end
 -- application will cut the log.
 --------------------------------------------------------------------------------
 
+-- Two caps, because there are two kinds of record here.
+--
+-- A session waiting for its log is a stand-in, and a backlog of stand-ins is of
+-- no use to anyone: maxLive of them, and the rest go. A session played with
+-- logging off is not waiting for anything - it is the only account of that match
+-- there will ever be - so it is kept like a session, up to maxSessions.
+--
+-- Oldest first within each kind, keys being timestamps.
 local function Prune()
     local db = ns.db
     if not (db and db.live) then return end
-    local keys = {}
-    for key in pairs(db.live) do keys[#keys + 1] = key end
-    if #keys <= (db.settings.maxLive or 8) then return end
-    table.sort(keys)
-    for i = 1, #keys - (db.settings.maxLive or 8) do
-        db.live[keys[i]] = nil
-        cacheCache[keys[i]] = nil
-        matchRefs[keys[i]] = nil
-    end
-end
 
--- How long an open record stays adoptable. A reload takes seconds; anything
--- older than this was left open by a logout and belongs to a match that is over.
-local RESUME_WINDOW = 600
+    local standins, kept = {}, {}
+    for key, record in pairs(db.live) do
+        local into = (record.logged == false) and kept or standins
+        into[#into + 1] = key
+    end
+
+    local function Drop(keys, limit)
+        if #keys <= limit then return end
+        table.sort(keys)
+        for i = 1, #keys - limit do
+            db.live[keys[i]] = nil
+            cacheCache[keys[i]] = nil
+            matchRefs[keys[i]] = nil
+        end
+    end
+
+    Drop(standins, db.settings.maxLive or 8)
+    Drop(kept, db.settings.maxSessions or 40)
+end
 
 -- `round` opens a session for one round of a Solo Shuffle or Blitz lobby rather
 -- than for the whole match, which is how the application cuts the log for them.
@@ -630,14 +644,19 @@ function Live:Begin(match, round)
     sampleCount = 0
 
     -- A reload inside a match makes the recorder open the match again, and this
-    -- has to follow it without splitting the match in two: an open record for the
-    -- same instance is continued rather than replaced. Its stored figures become
-    -- the banked total and the next reading sets a fresh baseline.
+    -- has to follow it without splitting the match in two: a record for the same
+    -- instance is continued rather than replaced. Its stored figures become the
+    -- banked total and the next reading sets a fresh baseline.
+    --
+    -- Either still open or closed by the shutdown itself. The second case is the
+    -- one a reload actually produces - PLAYER_LOGOUT closes the session before
+    -- the reload, and without it the closed half stayed in the list saying
+    -- "awaiting log" beside the new one, which is the double entry.
     local resumed
     if not round then
         for _, record in pairs(db.live) do
-            if not record.closed and record.map == match.map
-               and (ns:Now() - (record.updatedAt or record.startedAt or 0)) < RESUME_WINDOW
+            if (not record.closed or record.interrupted) and record.map == match.map
+               and (ns:Now() - (record.updatedAt or record.startedAt or 0)) < ns.RESUME_WINDOW
                and (not resumed or (record.startedAt or 0) > (resumed.startedAt or 0)) then
                 resumed = record
             end
@@ -646,13 +665,19 @@ function Live:Begin(match, round)
 
     if resumed then
         current = resumed
+        current.closed      = nil
+        current.interrupted = nil
         Resume(resumed)
         ns:Debug("live session resumed", resumed.key)
     else
         -- Anything still open at this point was left that way by a logout, and
         -- saying "recording" about a match that ended hours ago is worse than
-        -- saying nothing.
-        for _, record in pairs(db.live) do record.closed = true end
+        -- saying nothing. The mark goes too: a new match starting settles the
+        -- question of whether the last one was coming back.
+        for _, record in pairs(db.live) do
+            record.closed      = true
+            record.interrupted = nil
+        end
 
         local key = ("%s_%s_live"):format(date("%Y%m%d_%H%M%S", ns:Now()), tostring(match.map or 0))
         current = {
@@ -677,6 +702,13 @@ function Live:Begin(match, round)
     matchRefs[current.key] = match
     match.live = current.key
     current.faction = match.playerFactionGroup or current.faction
+
+    -- Whether this match has a log coming, as the recorder decided it when the
+    -- match began - the session's own fact, never the flag as it stands now. A
+    -- resumed session keeps what it had. `logging`, which an earlier build set
+    -- from readings of the live flag and set wrongly, is ignored and cleared.
+    if current.logged == nil then current.logged = match.logged end
+    current.logging = nil
 
     -- The baseline read. Taken now rather than at the first fight, so anything
     -- done between the gates opening and the first reading still lands in this
@@ -722,11 +754,16 @@ function Live:Complete()
     ns:LiveChanged(current.key)
 end
 
-function Live:Finish()
+-- `interrupted` says the UI is shutting down rather than that the match ended.
+-- The session is closed either way - a logout has to leave nothing open - but
+-- marked, so that re-entering the same instance can reopen this one instead of
+-- listing a second session beside it.
+function Live:Finish(interrupted)
     if not current then return end
     self:Sample("finish")
     current.endedAt = current.endedAt or ns:Now()
     current.closed = true
+    current.interrupted = interrupted or nil
 
     local key = current.key
 
@@ -961,6 +998,23 @@ function Live:MatchFor(key)
     return nil
 end
 
+-- What a closed session is still waiting for, or is not going to get.
+--
+-- "awaiting log" is a promise: the application is going to cut this match out of
+-- the combat log and replace this with the real thing. A match that was not being
+-- logged has no log to cut, so the promise would never be kept and the row would
+-- say it forever. That session is all there will ever be of its match, and saying
+-- so is the difference between a stand-in and a record.
+--
+-- Only an explicit no. A session recorded before this was decided has no answer,
+-- and is treated as logged: a wrong "awaiting log" corrects itself when the log
+-- arrives, and a wrong "log disabled" never would.
+local function Waiting(record)
+    if not record.closed then return "recording" end
+    if record.logged == false then return "log disabled" end
+    return "awaiting log"
+end
+
 -- Live sessions the user can look at, in the shape GetViewable returns. Anything
 -- a built session has replaced is already gone by the time this is asked.
 function Live:Viewable()
@@ -971,7 +1025,7 @@ function Live:Viewable()
     for key, record in pairs(db.live) do
         out[#out + 1] = {
             key = key, cached = true, live = true,
-            pending = not record.closed and "recording" or "awaiting log",
+            pending = Waiting(record),
             startTime = record.startedAt,
             endTime = record.endedAt or record.updatedAt,
             type = record.type, mapName = record.mapName,
@@ -1065,18 +1119,22 @@ function Live:Init()
     end)
 end
 
--- At login. A record still open from a reload is left alone: the recorder opens
--- the match again a moment later and Begin adopts it. One left open by a logout
--- is closed, because nothing is going to add to it now.
+-- At login. A record the shutdown closed is left marked: the recorder opens the
+-- match again a moment later and Begin reopens it. One too old for that belongs
+-- to a match that is over, and saying "recording" about it would be a lie.
 function Live:Restore()
     local db = ns.db
     if not (db and db.live) then return end
 
     for _, record in pairs(db.live) do
-        if not record.closed
-           and (ns:Now() - (record.updatedAt or record.startedAt or 0)) >= RESUME_WINDOW then
-            record.closed = true
+        if (ns:Now() - (record.updatedAt or record.startedAt or 0)) >= ns.RESUME_WINDOW then
+            record.closed      = true
+            record.interrupted = nil
         end
+        -- Set by the build that read the live flag, and wrong on matches that
+        -- were logged. Those have no answer now, which reads as "awaiting log"
+        -- until their log replaces them - the right outcome for them.
+        record.logging = nil
     end
     self:FillNames()
 end

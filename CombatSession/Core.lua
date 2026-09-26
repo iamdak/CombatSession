@@ -171,6 +171,11 @@ local DEFAULTS = {
         -- log-built cache supersedes them. Far fewer than maxSessions: each one
         -- holds a provisional breakdown that the real data is about to replace,
         -- and a backlog of stand-ins is of no use to anyone.
+        --
+        -- This cap is for the ones still waiting. A match played with combat
+        -- logging off has no log coming and nothing to be replaced by, so its
+        -- live session is the only account of it there is and is kept under
+        -- maxSessions instead.
         maxLive = 8,
     },
 }

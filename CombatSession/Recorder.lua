@@ -20,9 +20,17 @@ ns.Recorder = Recorder
 
 -- The match currently being observed, or nil outside a PvP instance.
 local current = nil
--- True when we enabled combat logging ourselves, so that leaving does not
--- switch off logging the user had turned on manually.
-local loggingOwned = false
+
+-- How long a match interrupted by the UI shutting down stays adoptable.
+--
+-- A reload is indistinguishable from a logout at the moment it happens - both
+-- fire PLAYER_LOGOUT and nothing says which - so the match is stored either way
+-- and the next entry into the same instance decides. A reload takes seconds;
+-- anything older than this was a logout, and the match it belonged to is over.
+--
+-- Shared with the live session, which has to make the same decision about the
+-- same event and must not make it differently.
+ns.RESUME_WINDOW = 600
 
 --------------------------------------------------------------------------------
 -- Client API guards
@@ -478,45 +486,79 @@ local LOGGING_TAIL_SECONDS = 8
 -- off after the player has already re-entered a new match.
 local loggingEpoch = 0
 
+-- Whose log it is: the setting's, not this session's.
+--
+-- There used to be a flag saying whether this addon had switched logging on
+-- itself, so that leaving a match would not switch off a log the player had
+-- started by hand. It could not survive a reload - the flag is a local and the
+-- CVar is not - so a reload inside a match left logging running for good, and
+-- everything the character did afterwards went into the file.
+--
+-- Turning auto logging on is the authority: while it is on, logging is this
+-- addon's to switch on at a match and off after one, whoever last touched it.
+local function OwnsLogging()
+    return ns:AutoLogEnabled()
+end
+
 local function StopLoggingSoon()
-    if not loggingOwned then return end
+    if not OwnsLogging() then return end
 
     loggingEpoch = loggingEpoch + 1
     local epoch = loggingEpoch
 
     C_Timer.After(LOGGING_TAIL_SECONDS, function()
         if epoch ~= loggingEpoch then return end   -- re-entered; leave it running
-        if loggingOwned and LoggingCombat() then
+        -- Re-read rather than captured: auto logging may have been switched off
+        -- during the tail, and that already stopped the log.
+        if OwnsLogging() and LoggingCombat() then
             LoggingCombat(false)
             ns:Debug("combat logging disabled")
         end
-        loggingOwned = false
     end)
 end
 
 -- Exposed for the settings toggle, which has to know whether there is a match
--- under way before it starts logging, and whether the logging that is running
--- is this addon to stop. A log the player started by hand with /combatlog is
--- theirs, and turning auto logging off must not switch it off.
+-- under way before it starts logging.
 function ns:MatchInProgress()
     return current ~= nil
 end
 
+-- Called when auto logging is switched off, which is the moment the authority is
+-- handed back - so the log it was running stops, whoever started it.
 function ns:ReleaseLogging()
-    if not loggingOwned then return false end
-    loggingOwned = false
-    if LoggingCombat() then
-        LoggingCombat(false)
-        ns:Debug("combat logging disabled")
-    end
+    if not LoggingCombat() then return false end
+    LoggingCombat(false)
+    ns:Debug("combat logging disabled")
     return true
 end
 
-local function BeginMatch(instanceName, instanceID, instanceType)
-    local clientVersion, clientBuild = GetBuildInfo()
-    local uiMapID = CurrentUiMap()
+-- The record of a match this same instance was interrupted in, taken back out of
+-- the store so it can be carried on rather than stood beside a second one.
+--
+-- Searched from the newest end: nothing older than the first candidate can be a
+-- better one, and a full store would otherwise be walked on every entry.
+local function AdoptInterrupted(instanceID)
+    local db = ns.db
+    if not (db and db.matches) then return nil end
 
-    current = {
+    local now = ns:Now()
+    for i = #db.matches, 1, -1 do
+        local record = db.matches[i]
+        local age = now - (record.endedAt or record.startedAt or 0)
+        if age > ns.RESUME_WINDOW then return nil end
+        if record.interrupted and record.map == instanceID then
+            table.remove(db.matches, i)
+            return record
+        end
+    end
+    return nil
+end
+
+-- Everything about a match that can only be read on the way in.
+local function NewMatch(instanceName, instanceID, instanceType, uiMapID)
+    local clientVersion, clientBuild = GetBuildInfo()
+
+    return {
         startedAt    = ns:Now(),
         startedGT    = GetTime(),
         map          = instanceID,
@@ -556,13 +598,42 @@ local function BeginMatch(instanceName, instanceID, instanceType)
         clientBuild  = clientBuild,
         complete     = false,
     }
+end
 
-    Trace("BEGIN", instanceName)
+local function BeginMatch(instanceName, instanceID, instanceType)
+    local uiMapID = CurrentUiMap()
 
-    -- The live session opens on the same event the log slice will start from, so
-    -- what the viewer shows now and what the application delivers later describe
-    -- the same match.
-    if ns.Live then ns.Live:Begin(current) end
+    -- A reload inside a match stored the match on the way out and opened it
+    -- again on the way back in, which listed one match twice - once abandoned
+    -- and once for real. The stored half is carried on instead. It keeps the
+    -- start time and the rated status read at the gates, which are the two
+    -- things a record made now would have wrong.
+    local resumed = AdoptInterrupted(instanceID)
+    if resumed then
+        current = resumed
+        current.interrupted = nil
+        -- A match that had already completed keeps the outcome and the time it
+        -- ended; one that had not goes back to being in progress.
+        if not current.complete then
+            current.abandoned = nil
+            current.endedAt   = nil
+        end
+        -- GetTime restarts with the UI, so the observed duration is re-based on
+        -- how long ago the match really started rather than on this session.
+        current.startedGT = GetTime() - (ns:Now() - (current.startedAt or ns:Now()))
+        if uiMapID then
+            current.uiMapID = current.uiMapID or uiMapID
+            current.uiMaps  = current.uiMaps or {}
+            current.uiMaps[uiMapID] = true
+        end
+        -- Counted because a resumed match is the one case where the recorder's
+        -- own view of it has a hole in the middle.
+        current.reloads = (current.reloads or 0) + 1
+        Trace("RESUMED", current.mapName)
+    else
+        current = NewMatch(instanceName, instanceID, instanceType, uiMapID)
+        Trace("BEGIN", instanceName)
+    end
 
     -- Cancels any pending stop from the previous match. This must happen even
     -- when logging is already running, or a timer queued on the way out of the
@@ -573,14 +644,30 @@ local function BeginMatch(instanceName, instanceID, instanceType)
     -- switched on: a log that is already running without the advanced block is
     -- exactly the case worth correcting, and it costs nothing when it is
     -- already set.
-    if ns.db.settings.autoLog then
+    if OwnsLogging() then
         ns:EnsureAdvancedLogging()
         if not LoggingCombat() then
             LoggingCombat(true)
-            loggingOwned = true
             ns:Debug("combat logging enabled")
         end
     end
+
+    -- Whether this match is being logged, decided once, here, just after the one
+    -- place that decides it - and never read again. With auto logging on it is
+    -- always yes; with it off, it is whatever the player has running themselves.
+    -- It says whether a log of this match is coming, which is what the viewer
+    -- needs to know, and not what the flag happens to be at some later moment:
+    -- read at the wrong moment - the logging tail of the last match expiring, a
+    -- reading taken before the lines above had run - it marked logged matches as
+    -- having no log. A match resumed after a reload keeps its original answer.
+    if current.logged == nil then
+        current.logged = LoggingCombat() and true or false
+    end
+
+    -- The live session opens on the same event the log slice will start from, so
+    -- what the viewer shows now and what the application delivers later describe
+    -- the same match. After the logging decision, which it inherits.
+    if ns.Live then ns.Live:Begin(current) end
 
     -- Every match, not arenas only: dampening is arena-only but honor levels
     -- are worth taking wherever there are unit tokens to read them from.
@@ -632,12 +719,26 @@ end
 
 -- Called when leaving the instance. A match without a completion snapshot was
 -- abandoned: rated status and start time survive, outcome and roster do not.
-local function FinalizeMatch()
+--
+-- `interrupted` says the UI is shutting down rather than that the match ended.
+-- The record is stored either way, because a logout has to leave one behind, and
+-- is marked so that re-entering the same instance can carry it on instead of
+-- starting a second one.
+local function FinalizeMatch(interrupted)
     if not current then return end
 
-    if ns.Live then ns.Live:Finish() end
+    if ns.Live then ns.Live:Finish(interrupted) end
 
-    if not current.complete then
+    if interrupted then
+        -- Kept if completion already set it: that is when the match really
+        -- ended, and the UI going away afterwards does not change it.
+        current.endedAt     = current.endedAt or ns:Now()
+        current.interrupted = true
+        -- Abandoned unless it gets picked back up, which is what it looks like
+        -- from every other angle until it does.
+        if not current.complete then current.abandoned = true end
+        Trace("INTERRUPTED", current.mapName)
+    elseif not current.complete then
         current.endedAt   = ns:Now()
         current.abandoned = true
         Trace("ABANDONED", current.mapName)
@@ -764,8 +865,9 @@ function Recorder:Init()
     ns:RegisterEvent("ZONE_CHANGED",            OnUiMapMaybeChanged)
     ns:RegisterEvent("ZONE_CHANGED_INDOORS",    OnUiMapMaybeChanged)
 
-    -- Leaving by logout rather than by zoning still needs the record stored.
-    ns:RegisterEvent("PLAYER_LOGOUT",           FinalizeMatch)
+    -- Leaving by logout rather than by zoning still needs the record stored, and
+    -- marked: a reload fires this too, and the match is not over.
+    ns:RegisterEvent("PLAYER_LOGOUT",           function() FinalizeMatch(true) end)
 
     if ns.Live then
         ns.Live:Init()

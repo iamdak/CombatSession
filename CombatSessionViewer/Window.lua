@@ -586,8 +586,8 @@ local function CellTooltip(cell)
 
     -- Every figure the drill-down holds, labelled. The bare "111,202 (21)" left
     -- the second number to be guessed at, and a total plus a count still does not
-    -- say whether those casts were alike: an average of 40k is a different story
-    -- if the range is 38k-42k than if it is 2k-380k.
+    -- say how it was made up: 40k a cast is a different story when every hit was
+    -- 38k-42k than when one crit carried twenty glancing ticks.
     local function Detail(value, count, mn, mx)
         local isTime = _G.CombatSession and _G.CombatSession.COLUMN_IS_TIME
                    and _G.CombatSession.COLUMN_IS_TIME[col]
@@ -601,15 +601,21 @@ local function CellTooltip(cell)
         if (count or 0) > 0 then
             GameTooltip:AddDoubleLine(isTime and "Applications" or "Casts",
                                       ns.Commas(count), 0.7, 0.7, 0.7, 1, 1, 1)
-            GameTooltip:AddDoubleLine("Average", Amount(value / count),
-                                      0.7, 0.7, 0.7, 1, 1, 1)
+            GameTooltip:AddDoubleLine(isTime and "Average" or "Average per cast",
+                                      Amount(value / count), 0.7, 0.7, 0.7, 1, 1, 1)
         end
         -- Only meaningful once there is more than one, and only when the stored
         -- figures are real: a column that counts occurrences rather than amounts
         -- has a range of one to one, which says nothing.
+        --
+        -- Said to be per hit because it is, and because the line above it is per
+        -- cast: a DoT ticking for 8k twenty times a cast reads 160k average and
+        -- 8k largest, and without the two labels that looks like a contradiction.
         if mn and mx and (count or 0) > 1 and mx > mn then
-            GameTooltip:AddDoubleLine("Largest", Amount(mx), 0.7, 0.7, 0.7, 1, 1, 1)
-            GameTooltip:AddDoubleLine("Smallest", Amount(mn), 0.7, 0.7, 0.7, 1, 1, 1)
+            local largest  = isTime and "Largest"  or "Largest hit"
+            local smallest = isTime and "Smallest" or "Smallest hit"
+            GameTooltip:AddDoubleLine(largest, Amount(mx), 0.7, 0.7, 0.7, 1, 1, 1)
+            GameTooltip:AddDoubleLine(smallest, Amount(mn), 0.7, 0.7, 0.7, 1, 1, 1)
         end
     end
 
@@ -2185,7 +2191,8 @@ local function LayoutSummary()
 
             -- Where a live session says so. This slot is for facts about the
             -- match rather than about either side, and "these are the meter's
-            -- figures, the log has not arrived" is one of those.
+            -- figures, not the log's" is one of those - along with whether the
+            -- log is still coming.
             local live = Model:IsLive()
             if live then
                 if extra ~= "" then extra = extra .. "   " end

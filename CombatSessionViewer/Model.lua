@@ -333,6 +333,13 @@ local function UnitRowData(player)
     }
 end
 
+-- The same description, for a window that is not the grid. The meter draws the
+-- same three identity slots for the same player, and reading specId and the class
+-- fallbacks a second time over there would be a second chance to disagree.
+function Model:UnitRow(player)
+    return UnitRowData(player)
+end
+
 -- The same description for a name met somewhere other than the root - a
 -- counterpart in a breakdown - or nil when that name is not a player here.
 --
@@ -364,8 +371,10 @@ function Model:Selected()   return state.key end
 function Model:Cache()      return state.cache end
 function Model:Entry()      return state.entry end
 
--- "recording" while the match is being played, "awaiting log" once it is over and
--- the application has yet to deliver it, nil for a session built from the log.
+-- What a live session is: "recording" while the match is being played, "awaiting
+-- log" once it is over and the application has yet to deliver it, "log disabled"
+-- when no log was being written and this is all there will ever be of it. Nil for
+-- a session built from the log.
 function Model:IsLive()
     return state.entry and state.entry.pending or nil
 end
@@ -759,9 +768,11 @@ local function ColumnList(api, cache, unit, col)
         end
     end
 
-    -- Counts and extremes for the totals line come from the unit's own casts,
-    -- not from adding up the rows above: those count a Wild Growth once for
-    -- every ally it landed on, and a spell total is about the cast.
+    -- Counts for the totals line come from the unit's own casts, not from adding
+    -- up the rows above: those count a Wild Growth once for every ally it landed
+    -- on, and a spell total is about the cast. The extremes come with them and
+    -- agree either way - the largest hit on anyone is the largest hit - so they
+    -- are taken from the same place rather than left to match by coincidence.
     local casts = api.SpellCasts and api:SpellCasts(cache, unit.index, col) or {}
     for _, slot in ipairs(spellOrder) do
         local whole = casts[slot.name]

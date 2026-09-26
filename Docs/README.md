@@ -75,6 +75,11 @@ built from the game's own damage meter. Once it ends it reads **awaiting log**
 until the application has cut it from the combat log and you `/reload`; the full
 version then takes its place.
 
+A match played with combat logging off reads **log disabled** and stays in the
+list. There is no log to cut, so nothing is coming to replace it — the meter's
+account of it is the only one, and it is kept like any other session rather than
+dropped as a stand-in.
+
 Live figures cover damage done and taken, healing, interrupts and dispels, and
 move each time you leave combat — the game hides them while you are in it. The
 other columns arrive with the log. Enemy names the game withholds during a match
@@ -89,9 +94,15 @@ list.
 ### Counts are casts
 
 A count in the viewer is a count of casts, not of combat log lines. A shield that
-absorbed thirty hits, or a DoT that ticked twenty times, is one cast, and its
-average, largest and smallest describe what that cast did in total. The Spell
-Totals line counts a cast once, however many targets it hit.
+absorbed thirty hits, or a DoT that ticked twenty times, is one cast, and the
+average is what one cast was worth. The Spell Totals line counts a cast once,
+however many targets it hit.
+
+Largest and smallest are per hit, and say so on the tooltip. A DoT ticking for 8k
+twenty times a cast reads 160k average and 8k largest: the count and the average
+already describe the cast, so what the range is there to add is what one tick, or
+one absorbed blow, was worth. A hit is counted whole, including any part of it a
+shield absorbed.
 
 ---
 
@@ -121,7 +132,7 @@ own.
 |---|---|
 | `/combatsession` | Status: sessions held, sessions queued, zone, settings |
 | `/combatsession inspect` | The built-in text inspector |
-| `/combatsession autolog on\|off` | Start combat logging automatically in PvP instances |
+| `/combatsession autolog on\|off` | Start and stop combat logging around PvP instances |
 | `/combatsession sessions <n>` | How many sessions to keep cached (default 40) |
 | `/combatsession trace [n]` | Recent recorder events, for diagnosing a missed match |
 | `/combatsession debug` | Verbose logging to chat |
@@ -130,7 +141,11 @@ own.
 
 `autolog` is on by default and also forces `advancedCombatLogging`, which the
 data depends on: without it the log omits the fields that say who did what to
-whom. `wipe` destroys recorded results and rosters, which cannot be rebuilt from
+whom. While it is on, combat logging is the addon's to switch on entering a match
+and off shortly after leaving one — including a log you started yourself with
+`/combatlog`. Turning `autolog` off hands it back, and stops the log.
+
+`wipe` destroys recorded results and rosters, which cannot be rebuilt from
 logs — `reset` is almost always the one you want.
 
 ---
