@@ -1,7 +1,7 @@
 ## Interface: 120105
 ## Title: CombatSession Viewer
 ## Notes: Read-only viewer shell for data captured by CombatSession.
-## Version: 1.1
+## Version: 1.2
 ## Dependencies: CombatSession
 ## SavedVariables: CombatSessionViewerDB
 
