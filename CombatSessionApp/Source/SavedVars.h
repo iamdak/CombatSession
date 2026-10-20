@@ -44,6 +44,10 @@ inline constexpr const char* kCacheField = "cache";
 // in both programs anyway.
 inline constexpr const char* kAppExpectedField = "appExpected";
 
+// How many sessions the addon keeps, as text for the same reason, e.g.
+//   ["sessionCap"] = "40"
+inline constexpr const char* kSessionCapField = "sessionCap";
+
 struct AddonState {
     // Session keys the addon currently holds a parsed cache for.
     std::set<std::string> cached;
@@ -58,6 +62,11 @@ struct AddonState {
     // collectable even though they were never cached. Empty means nothing has
     // been declined, and therefore nothing may be collected on this basis.
     std::string oldestWanted;
+
+    // How many sessions the addon keeps: it ranks what it holds and what is
+    // queued together and keeps the newest this many. Zero when the addon has
+    // not said, which means no limit - the behaviour before it could say.
+    int sessionCap = 0;
 };
 
 // Combines the state of every account folder under `wtfRoot` (.../WTF/Account):

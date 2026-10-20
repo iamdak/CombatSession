@@ -101,6 +101,8 @@ if(WIN32)
     list(APPEND CS_SOURCES Source/CombatSession.rc)
 elseif(APPLE)
     list(APPEND CS_SOURCES Source/Platform_Mac.mm Source/Shell_Mac.mm)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND CS_SOURCES Source/Platform_Linux.cpp Source/Shell_Linux.cpp)
 else()
     # Said plainly rather than left to fail at link time with undefined symbols
     # that do not name the problem.
@@ -200,6 +202,37 @@ if(APPLE)
     target_link_libraries(CombatSession PRIVATE
         "-framework Cocoa"
         "-framework UniformTypeIdentifiers")
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # GTK 3 for the dialogs and the event loop, and GIO - which comes with it -
+    # for opening folders and pages. On Debian and Ubuntu:
+    #
+    #   sudo apt install build-essential cmake pkg-config libgtk-3-dev \
+    #                    libayatana-appindicator3-dev
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
+    target_link_libraries(CombatSession PRIVATE PkgConfig::GTK3)
+
+    # The status icon. Ayatana AppIndicator is what nearly every desktop shows
+    # now, under Wayland as well as X11; without it the build falls back to
+    # GtkStatusIcon, which is X11 only and which GNOME does not show at all.
+    #
+    # CS_APPINDICATOR=OFF builds the GtkStatusIcon one regardless, for a plain
+    # X11 tray such as stalonetray.
+    option(CS_APPINDICATOR "Use Ayatana AppIndicator for the status icon when found" ON)
+    if(CS_APPINDICATOR)
+        pkg_check_modules(APPINDICATOR IMPORTED_TARGET ayatana-appindicator3-0.1)
+    endif()
+    if(APPINDICATOR_FOUND)
+        target_link_libraries(CombatSession PRIVATE PkgConfig::APPINDICATOR)
+        target_compile_definitions(CombatSession PRIVATE CS_HAVE_APPINDICATOR=1)
+    elseif(CS_APPINDICATOR)
+        message(WARNING
+            "ayatana-appindicator3-0.1 not found: the status icon falls back to "
+            "GtkStatusIcon, which only X11 desktops with a system tray show. "
+            "Install libayatana-appindicator3-dev for the usual one.")
+    endif()
 endif()
 
 #-------------------------------------------------------------------------------

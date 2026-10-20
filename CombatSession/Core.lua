@@ -177,6 +177,11 @@ local DEFAULTS = {
         -- live session is the only account of it there is and is kept under
         -- maxSessions instead.
         maxLive = 8,
+
+        -- Bouts - fights at a PvP training dummy, duels, world PvP - listed
+        -- together as one session, consecutive ones of a kind at a time, up to
+        -- this many. A group counts once toward maxSessions.
+        groupCap = 20,
     },
 }
 
@@ -225,6 +230,13 @@ end
 function ns:RecordAppVersion()
     if not self.db then return end
     self.db.appExpected = ns.APP_EXPECTED
+
+    -- How many sessions this addon keeps, so the application can stop queueing
+    -- the ones it would only throw away. After a reset or a format change the
+    -- application wrote a chunk for every match in every log - 192 of them, all
+    -- loaded at the next login - and this addon then kept the newest forty.
+    -- Written as text because that is what the application's reader takes.
+    self.db.sessionCap = tostring(self.db.settings.maxSessions or 40)
 
     -- Only overwritten when the application has actually said something. An
     -- empty data folder means no sessions are queued, not that the application

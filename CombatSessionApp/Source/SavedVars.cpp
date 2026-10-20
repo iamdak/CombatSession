@@ -2,6 +2,7 @@
 
 #include "Version.h"
 
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -50,6 +51,7 @@ AddonState ScanFile(const fs::path& path) {
             if (depth == 1 && haveLast) {
                 if (last == kFloorField)       state.oldestWanted = value;
                 if (last == kAppExpectedField) state.appExpected  = value;
+                if (last == kSessionCapField)  state.sessionCap   = std::atoi(value.c_str());
             }
             last = value;
             haveLast = true;
@@ -120,6 +122,14 @@ AddonState ReadAddonState(const fs::path& wtfRoot) {
         if (combined.appExpected.empty()
             || ParseVersion(found[i].appExpected) > ParseVersion(combined.appExpected)) {
             combined.appExpected = found[i].appExpected;
+        }
+
+        // The most any account keeps, so nothing one of them wants goes
+        // unqueued; and none at all if any account has not said.
+        if (found[i].sessionCap == 0 || combined.sessionCap == 0) {
+            combined.sessionCap = 0;
+        } else if (found[i].sessionCap > combined.sessionCap) {
+            combined.sessionCap = found[i].sessionCap;
         }
     }
     return combined;

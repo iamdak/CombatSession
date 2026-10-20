@@ -50,6 +50,32 @@
 //     the match itself land in that window - thirteen seconds of them in a
 //     Gilneas capture. Cutting on those took real figures out of the match.
 //     See Inspect and cutPending_.
+//
+// Outside arenas and battlegrounds the log is also cut into BOUTS: one fight at a
+// PvP training dummy, or against players - a duel or world PvP. The log has no
+// combat start or end, so a bout is the run of lines in which the recording
+// player (or their pet) and an opponent act on each other, closed once neither
+// has acted directly for kBoutQuietMs. The addon groups consecutive bouts of one
+// kind into a single session; here each is cut on its own. See TrackBout.
+//
+//   * Damage over time is part of a fight while it lasts but does not keep one
+//     going, nor start one. The client drops combat with a dummy while the
+//     player's own damage over time is still ticking on it: a warrior's Rend
+//     ran on for fourteen seconds after combat ended, and with every tick
+//     counted, two pulls eighteen seconds apart were cut as one fight.
+//
+//   * PvP training dummies are recognised by creature id. A census of sixty-two
+//     logs found five, all named "PvP Training Dummy": 243211 and 243212 in
+//     Silvermoon City, 255824 and 255825 in Quel'Thalas, 219250 in Khaz Algar.
+//     The name is not used - it is localised - and the dummies beside them
+//     ("Training Dummy", "Cleave Training Dummy") are PvE ones and stay out.
+//
+//   * Players are opponents when they are player-controlled and not friendly.
+//     The same census held no duel, so whether the client logs a duel opponent
+//     as hostile or as neutral is unknown, and both are taken. Neutral is also
+//     what an opponent's damage over time logs as after a battleground has been
+//     left, so a bout needs the recording player to have acted on the opponent
+//     as well, and kBoutMinActions such lines in all.
 
 #pragma once
 
@@ -63,11 +89,18 @@
 
 namespace cs {
 
+// Stored as a number in records.tsv, so new kinds go on the end.
 enum class SessionType {
     Unknown,
     Arena,
     Battleground,
+    Dummy,              // a bout at a PvP training dummy
+    World,              // a bout against players outside arenas and battlegrounds
 };
+
+inline bool IsBout(SessionType type) {
+    return type == SessionType::Dummy || type == SessionType::World;
+}
 
 enum class Termination {
     CleanEnd,           // ARENA_MATCH_END - the only clean case
@@ -75,6 +108,7 @@ enum class Termination {
     LeftInstance,       // ZONE_CHANGE away; the only battleground terminator
     LoggingReset,       // COMBAT_LOG_VERSION mid-session: restart or /combatlog
     EndOfData,          // log ran out while the session was still open
+    Quiet,              // a bout's fighting stopped
 };
 
 struct Session {
@@ -111,6 +145,13 @@ struct Session {
     // always zero in battlegrounds. The 3v2 skirmish in the sample produced 5.
     int32_t combatantCount = 0;
 
+    // A bout's opponents, by GUID. The bout's byte range also holds everyone
+    // else's fighting nearby - a capital city's other duels and dummies - so its
+    // chunk keeps only the lines that involve the recording player, their group
+    // or one of these. Empty for a dummy bout, which keeps the player's own lines
+    // only: a dummy is shared, and whoever else is hitting it is not part of it.
+    std::vector<std::string> participants;
+
     // "Truncated" means data is missing, not merely that no end event was seen.
     // A Solo Shuffle round legitimately ends when the next round starts, and
     // LeftInstance is the ONLY terminator a battleground can ever have, so
@@ -119,11 +160,14 @@ struct Session {
     // A battleground abandoned in progress is indistinguishable from one played
     // to the end in the log itself; the recorder's MATCH record supplies that,
     // which is the same split as rated status.
+    //
+    // A bout ends cleanly by going quiet or by the zone changing under it.
     bool IsClean() const {
         switch (termination) {
         case Termination::CleanEnd:          return true;
         case Termination::SupersededByStart: return true;
-        case Termination::LeftInstance:      return type == SessionType::Battleground;
+        case Termination::Quiet:             return true;
+        case Termination::LeftInstance:      return type != SessionType::Arena;
         default:                             return false;   // reset, end of data
         }
     }
@@ -142,11 +186,14 @@ public:
     // byteLength includes the line terminator.
     void Feed(const LogLine& line, uint64_t byteOffset, uint64_t byteLength);
 
-    // True when a session is still open, meaning the log ends mid-match.
-    bool HasOpenSession() const { return open_; }
+    // True when a session is still open, meaning the log ends mid-match - or a
+    // bout is, or bouts are being held until the instance they were fought in is
+    // known not to be a battleground.
+    bool HasOpenSession() const { return open_ || boutOpen_ || !heldBouts_.empty(); }
 
     // Call once the log has no more data. Any still-open session is emitted
-    // with Termination::EndOfData.
+    // with Termination::EndOfData; an open bout ends as quiet, since nothing more
+    // of it is coming.
     void Finish();
 
     // Distinct grouped teammates a battleground must show before it is believed
@@ -155,6 +202,17 @@ public:
     // floor of the smaller side: losing a battleground would be worse than
     // keeping a duel, and the smallest bracket still fills a raid of eight.
     static constexpr size_t kMinGroupedPlayers = 5;
+
+    // How long a bout can go without either side acting directly on the other -
+    // damage over time ticking does not count - before it is over. The client
+    // drops combat about five seconds after the last hostile action, and the
+    // recorder's own bout ends there; a little over that keeps one fight with a
+    // pause in it from being cut in two.
+    static constexpr Timestamp kBoutQuietMs = 8000;
+
+    // Lines between the two sides a bout needs before it is one. Keeps a single
+    // stray hit - an area effect clipping a passer-by - from becoming a session.
+    static constexpr int kBoutMinActions = 3;
 
 private:
     void OpenSession(const LogLine& line, uint64_t byteOffset);
@@ -166,6 +224,14 @@ private:
     // the line extends the session, so the range it remembers is the range as it
     // stood BEFORE the line being looked at.
     void Inspect(const LogLine& line);
+
+    // Bouts. TrackBout looks at one combat line; CloseBout ends the open bout and
+    // hands it on - to the sink, or to heldBouts_ while a provisional
+    // battleground is open, since a battleground is full of exactly the lines a
+    // bout is made of and only its close says whether it was one.
+    void TrackBout(const LogLine& line, uint64_t byteOffset, uint64_t lineEnd);
+    void CloseBout(Termination why);
+    void ReleaseHeldBouts(bool discard);
 
     Sink sink_;
 
@@ -204,6 +270,31 @@ private:
 
     int32_t nextLobbyIndex_ = 1;
     int32_t lobbyRoundCount_ = 0;
+
+    // The bout being fought, if any. Its range runs from the first line between
+    // the two sides to the last; actions counts those lines, and mine says one of
+    // them was the recording player acting rather than only being acted on.
+    bool    boutOpen_ = false;
+    Session bout_{};
+    int     boutActions_ = 0;
+    bool    boutMine_ = false;
+    // A hostile player acted directly on the recording player.
+    bool    boutAttacked_ = false;
+    // The last direct action between the two sides, which is what the quiet
+    // window runs from.
+    Timestamp boutLastDirect_ = 0;
+    std::set<std::string> boutWho_;
+    std::vector<Session>  heldBouts_;
+
+    // The last MAP_CHANGE seen anywhere, open session or not, which is where a
+    // bout in the open world takes its uiMapID from.
+    int32_t lastUiMap_ = 0;
+
+    // Set once a match ends inside its own instance and cleared on leaving it.
+    // ARENA_MATCH_END comes before the fighting stops - a last kill, damage over
+    // time still ticking - and in a capture of nine arenas that tail was cut as
+    // a world bout after six of them.
+    bool    matchOver_ = false;
 };
 
 } // namespace cs

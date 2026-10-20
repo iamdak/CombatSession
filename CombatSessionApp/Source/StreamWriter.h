@@ -79,7 +79,10 @@ enum class EventKind : uint8_t {
     SpellPurge,
 };
 
-inline constexpr int kStreamVersion = 6;
+// 7: `t` holds the step from the previous event rather than the offset from the
+//    start of the session - a line's seven digits become one or two. The addon
+//    turns it back into offsets when it loads the chunk.
+inline constexpr int kStreamVersion = 7;
 
 EventKind ClassifyEventKind(std::string_view event);
 

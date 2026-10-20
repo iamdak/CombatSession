@@ -99,6 +99,12 @@ local DEFAULTS = {
     -- How opaque the whole window is, text included: 0.90 is the 90% the slider
     -- in its menu shows.
     meterOpacity = 0.90,
+
+    -- The report window's last choices, so a second report goes where the first
+    -- did. Lines is how many entries to send, 0 meaning all of them.
+    reportTo      = "PARTY",
+    reportLines   = 5,
+    reportWhisper = "",
 }
 
 local function ApplyDefaults(target, defaults)
@@ -656,10 +662,18 @@ loader:SetScript("OnEvent", function()
             pending = true
             C_Timer.After(0.2, function()
                 pending = false
-                if ns.UI then ns.UI:Refresh() end
+                -- Each window on its own: a fault drawing one used to stop the
+                -- other from being drawn at all, every time.
+                if ns.UI then
+                    local ok, err = pcall(ns.UI.Refresh, ns.UI)
+                    if not ok then geterrorhandler()(err) end
+                end
                 -- The same signal carries a live reading, which is what the
                 -- meter window is drawing: it moves on every one of them.
-                if ns.Meter then ns.Meter:Refresh() end
+                if ns.Meter then
+                    local ok, err = pcall(ns.Meter.Refresh, ns.Meter)
+                    if not ok then geterrorhandler()(err) end
+                end
             end)
         end)
     end

@@ -213,5 +213,5 @@ should ever write to the game folder.
 
 ## Requirements
 
-World of Warcraft *Midnight* (interface 120100). Windows 10 or later, or
+World of Warcraft *Midnight* (interface 120105). Windows 10 or later, or
 macOS 11 or later.

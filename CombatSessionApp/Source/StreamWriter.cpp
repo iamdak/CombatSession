@@ -559,10 +559,28 @@ void WriteColumn(std::ofstream& out, const char* name, const std::vector<T>& v) 
     out << "},\n";
 }
 
+// The same, as the step from each value to the next - for a column that only
+// ever climbs, which turns seven-digit offsets into one or two digits each.
+template <typename T>
+void WriteDeltaColumn(std::ofstream& out, const char* name, const std::vector<T>& v) {
+    out << "  " << name << "={";
+    int64_t previous = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) out << ',';
+        if ((i & 0x3F) == 0x3F) out << '\n';
+        const int64_t value = static_cast<int64_t>(v[i]);
+        out << (value - previous);
+        previous = value;
+    }
+    out << "},\n";
+}
+
 const char* TypeName(SessionType t) {
     switch (t) {
     case SessionType::Arena:        return "arena";
     case SessionType::Battleground: return "battleground";
+    case SessionType::Dummy:        return "dummy";
+    case SessionType::World:        return "world";
     default:                        return "unknown";
     }
 }
@@ -642,7 +660,7 @@ bool StreamWriter::Write(const std::string& path, const std::string& key,
     }
     out << "  },\n";
 
-    WriteColumn(out, "t",   t_);
+    WriteDeltaColumn(out, "t", t_);
     WriteColumn(out, "k",   kind_);
     WriteColumn(out, "s",   src_);
     WriteColumn(out, "d",   dst_);

@@ -1,4 +1,4 @@
-## Interface: 120100
+## Interface: 120105
 ## Title: CombatSession
 ## Notes: Records PvP match metadata and processes combat log sessions.
 ## Version: 1.1

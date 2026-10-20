@@ -1,6 +1,7 @@
 # Build output. CMake generates Build/ and the linker writes Binary/; both are
 # reproducible from source and neither belongs in history.
 Build/
+Build-linux/
 Binary/
 out/
 .vs/

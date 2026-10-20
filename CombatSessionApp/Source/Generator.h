@@ -99,6 +99,7 @@ private:
     bool WriteToc() const;
     bool WriteRecords() const;
     void CollectConsumed();
+    void PruneUnwanted();
     void PruneRaw();
     void PrunePending();
     void LoadExistingRecords();
@@ -107,6 +108,10 @@ private:
     // True when the addon is finished with a session: it holds the cache, or it
     // has declined everything that old. Either way its chunk has no reader left.
     bool Consumed(const std::string& key) const;
+
+    // True when the addon would decline the session if it were queued: it has
+    // its session cap's worth of newer ones held or queued already.
+    bool Unwanted(const std::string& key) const;
 
     GeneratorOptions opt_;
     bool   loaded_ = false;
@@ -130,7 +135,12 @@ private:
     // that ends mid-match, as one does after a crash, would otherwise be
     // re-parsed from that point on every pass for as long as the application
     // ran, and every later match would pay for it.
-    struct LogState { uint64_t offset = 0; uint64_t size = 0; bool settled = false; };
+    //
+    // `through` is the time of the latest line read from the log, in
+    // milliseconds. The newest of them is published to the addon as
+    // CombatSessionLogThrough: a live session that ended well before it and
+    // has no chunk is not going to get one.
+    struct LogState { uint64_t offset = 0; uint64_t size = 0; bool settled = false; int64_t through = 0; };
     std::map<std::string, LogState> logs_;
 
     std::vector<SessionRecord> records_;
@@ -149,6 +159,9 @@ private:
 // Stable per-session identity: start time plus instance and round, unchanged if
 // the same log is reprocessed.
 std::string MakeSessionKey(const Session& session);
+
+// The session's kind as the addon reads it from Index.lua and the chunk header.
+const char* SessionTypeName(SessionType type);
 
 // True when a log has not been written to for `settleSeconds`, which is taken to
 // mean the client has stopped appending to it.

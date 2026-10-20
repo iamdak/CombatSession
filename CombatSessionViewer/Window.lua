@@ -196,7 +196,7 @@ end
 -- The fraction a root row's bar is drawn at: where it is, not where it is going.
 local function BarFraction(data)
     if data.kind ~= "unit" then return data.frac or 0 end
-    local a = barAnim[data.name]
+    local a = barAnim[data.openKey or data.name]
     if a then return a.cur end
     return data.frac or 0
 end
@@ -578,7 +578,7 @@ end
 
 local function CellTooltip(cell)
     local data, col = cell.data, cell.col
-    if not (data and col) or data.ghost then return end
+    if not (data and col) or data.ghost or data.kind == "section" then return end
 
     local columns = Model:Columns()
     GameTooltip:SetOwner(cell, "ANCHOR_RIGHT")
@@ -628,7 +628,7 @@ local function CellTooltip(cell)
     if data.kind == "unit" and data.unit then
         Detail(data.unit.cols[col] or 0,
                data.unit.counts and data.unit.counts[col] or 0)
-        if Model:IsExpanded(data.name) then
+        if Model:IsExpanded(data.openKey or data.name) then
             Hint(isActive and "Click to close this breakdown."
                           or  "Click to break this column down instead.")
         else
@@ -683,6 +683,23 @@ local function CellTooltip(cell)
     GameTooltip:Show()
 end
 
+-- Whether a section's session can hold a figure in this column. Always, for one
+-- built from the log. A live one fills only the meter's columns; a group draws
+-- every column once any of its bouts has its log, and the others' figures there
+-- are still to come.
+local liveColumns
+local function HasColumn(section, col)
+    local cache = section and section.cache
+    if not (cache and cache.live) then return true end
+    if not liveColumns then
+        local api = ns:API()
+        if not (api and api.LiveColumns) then return true end
+        liveColumns = {}
+        for _, c in ipairs(api:LiveColumns()) do liveColumns[c] = true end
+    end
+    return liveColumns[col] == true
+end
+
 local function GridCell(row, index)
     local cell = row.cells[index]
     if cell then return cell end
@@ -730,11 +747,20 @@ local function GridCell(row, index)
     -- active: the breakdown is already open, and carries on under the new
     -- column. A click in the active column opens or closes whatever the row
     -- belongs to.
-    cell:SetScript("OnClick", function(self)
+    -- A right click offers to report the column it landed in, from wherever in
+    -- the grid it landed.
+    cell:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    cell:SetScript("OnClick", function(self, button)
         local data = self.data
         -- A closing breakdown is still drawn for a moment after the model has
         -- dropped it; its rows describe a state that no longer exists.
-        if not data or data.ghost then return end
+        -- A bout's heading holds no figures.
+        if not data or data.ghost or data.kind == "section" then return end
+
+        if button == "RightButton" then
+            if ns.Report then ns.Report:CellMenu(self, data, self.col) end
+            return
+        end
 
         -- A note only takes a click when it stands in for an empty block, and
         -- only to change column: there is nothing under it to open.
@@ -747,9 +773,9 @@ local function GridCell(row, index)
         if data.kind == "unit" then
             if elsewhere then
                 Model:SetActiveColumn(self.col)
-                Model:Open(data.name, data.unit)
+                Model:Open(data.openKey or data.name, data.unit)
             else
-                Model:ToggleExpand(data.name, data.unit)
+                Model:ToggleExpand(data.openKey or data.name, data.unit)
             end
         elseif elsewhere then
             Model:SetActiveColumn(self.col)
@@ -949,7 +975,7 @@ local function GridRow(index)
         -- A name always stands for its row's entry in the active column, so a
         -- click here is the same as a click on that column's cell.
         if data.kind == "unit" then
-            Model:ToggleExpand(data.name, data.unit)
+            Model:ToggleExpand(data.openKey or data.name, data.unit)
         elseif HasSpells(data) then
             Model:ToggleSource(data.name)
         else
@@ -1050,6 +1076,43 @@ function UI:UnitTooltip(owner, data)
     if data.unit and data.unit.level and data.unit.level > 0 then
         GameTooltip:AddDoubleLine("Item level", tostring(data.unit.level),
                                   0.6, 0.6, 0.6, 1, 1, 1)
+    end
+
+    -- Rated play only, and only a real figure: an unrated match reports zero.
+    -- The scoreboard's rating is the one the player came INTO the match with -
+    -- it equals the arena log's own pre-match figure for the same player - and
+    -- the change is what the match did to it, so both ends are shown. With no
+    -- scoreboard, an arena log still says where they started.
+    local before = scoreboard and scoreboard.rating
+    local change = scoreboard and scoreboard.ratingChange
+    if not (before and before > 0) then
+        before, change = data.player and data.player.rating, nil
+    end
+    if before and before > 0 then
+        local text = tostring(before)
+        if change and change ~= 0 then
+            text = ("%d -> %d  %s"):format(before, before + change, (change > 0)
+                and ("|cff66ff66+%d|r"):format(change)
+                or  ("|cffff6666%d|r"):format(change))
+        elseif not change then
+            text = text .. " |cff888888before the match|r"
+        end
+        GameTooltip:AddDoubleLine("Rating", text, 0.6, 0.6, 0.6, 1, 1, 1)
+    end
+
+    -- Individual MMR is in the scoreboard's shape but this client leaves it at
+    -- zero for everyone (1,555 rows checked, none set), so this only appears if a
+    -- later one starts filling it in.
+    local mmr = scoreboard and scoreboard.prematchMMR
+    if mmr and mmr > 0 then
+        local text = tostring(mmr)
+        local moved = scoreboard.mmrChange
+        if moved and moved ~= 0 then
+            text = ("%s  %s"):format(text, (moved > 0)
+                and ("|cff66ff66+%d|r"):format(moved)
+                or  ("|cffff6666%d|r"):format(moved))
+        end
+        GameTooltip:AddDoubleLine("MMR", text, 0.6, 0.6, 0.6, 1, 1, 1)
     end
 
     if scoreboard then
@@ -1342,6 +1405,10 @@ local function RowColors(data, expanded)
                         anyOpen and ns.SHADE.sourceOpen or ns.SHADE.source)
     elseif data.kind == "spell" then
         return ns.COLOR.spell, ns.Shade(ns.ClassColor(data.class), ns.SHADE.spell)
+    elseif data.kind == "section" then
+        -- A bout's heading, in the column header's colour: it labels the rows
+        -- beneath it the way the header labels the columns.
+        return ns.COLOR.header, nil
     end
 
     return ns.COLOR.spell, nil
@@ -1349,7 +1416,7 @@ end
 
 local function Populate(row, data)
     local columns = Model:Columns()
-    local expanded = (data.kind == "unit") and Model:IsExpanded(data.name)
+    local expanded = (data.kind == "unit") and Model:IsExpanded(data.openKey or data.name)
     local activeCol = Model:ActiveColumn()
     local open = Model:IsOpen()
 
@@ -1378,7 +1445,7 @@ local function Populate(row, data)
     row.nameBg:SetColorTexture(track[1], track[2], track[3])
     row.valueBg:SetColorTexture(track[1], track[2], track[3])
 
-    local rule = (data.kind == "unit")
+    local rule = (data.kind == "unit") or (data.kind == "section")
     if rule then
         local l = ns.COLOR.line
         row.nameSep:SetColorTexture(l[1], l[2], l[3])
@@ -1439,6 +1506,9 @@ local function Populate(row, data)
         text = "|cffaaaaaa" .. text .. "|r"
         icon = SpellIcon(data.id)
         school = ns.SchoolInfo(data.use and data.use.school)
+    elseif data.kind == "section" then
+        -- Drawn as written: it carries its own colour for what it is waiting on.
+        text = "|cffffd100" .. (data.name or "") .. "|r"
     else
         indent = 18
         text = "|cff777777" .. text .. "|r"
@@ -1514,7 +1584,12 @@ local function Populate(row, data)
         -- a counterpart or spell row shows its own figure in the active column
         -- and, in every other column, that column's entry at the same rank.
         local value, alpha, entry, more = "", 1, nil, nil
-        if data.kind == "unit" and data.unit then
+        if data.kind == "unit" and data.unit and (data.unit.cols[i] or 0) == 0
+           and not HasColumn(data.section, i) then
+            -- A bout of a group still waiting for its log, in a column only the
+            -- log fills: not known yet, which is not the same as nothing.
+            value = "--"
+        elseif data.kind == "unit" and data.unit then
             value = ns.FormatCell(i, data.unit.cols[i] or 0,
                                   data.unit.counts and data.unit.counts[i] or 0)
         elseif data.kind == "unit" then
@@ -1609,9 +1684,9 @@ local function Populate(row, data)
         -- A note's cells take the mouse only where there is something to say:
         -- another column's entry, which can be clicked to, or a dropped count,
         -- which has a tooltip explaining it.
-        cell:EnableMouse(data.kind ~= "note"
+        cell:EnableMouse(data.kind ~= "section" and (data.kind ~= "note"
                          or (data.lists ~= nil and i ~= data.col)
-                         or (data.omitted ~= nil and data.omitted[i] ~= nil))
+                         or (data.omitted ~= nil and data.omitted[i] ~= nil)))
     end
 
     for slot = #shown + 1, #row.cells do row.cells[slot]:Hide() end
@@ -1835,9 +1910,9 @@ local function SetBarTargets(animate)
     for _, d in ipairs(grid.target or {}) do
         if d.kind == "unit" then
             local frac = d.frac or 0
-            local a = barAnim[d.name]
+            local a = barAnim[d.openKey or d.name]
             if not a or not animate then
-                barAnim[d.name] = { cur = frac, target = frac }
+                barAnim[d.openKey or d.name] = { cur = frac, target = frac }
             elseif a.target ~= frac then
                 a.target = frac
                 motion.active = true
@@ -2119,6 +2194,20 @@ local function LayoutSummary()
             for _, text in ipairs(row) do text:SetText("") end
         end
         for i = 1, #grid.summaryBands do UI:SetSummaryBand(i, nil) end
+    end
+
+    -- A group of bouts has no two sides to total. It says what it is instead:
+    -- how many bouts, how long the fighting lasted all told, and whether any of
+    -- them is still waiting for its log. Each bout's own time is on its heading.
+    if Model:IsGroup() and entry then
+        Blank()
+        local fields = { ("%s  |cff888888%d bout(s)|r"):format(entry.mapName or "",
+                                                               #(entry.bouts or {})) }
+        local span = ns.FormatDuration(Model:Duration())
+        if span then fields[#fields + 1] = ("|cff888888Combat|r %s"):format(span) end
+        if entry.pending then fields[#fields + 1] = ("|cffdfa84f%s|r"):format(entry.pending) end
+        grid.summaryNote:SetText(table.concat(fields, "    "))
+        return
     end
 
     if not teams then
@@ -2818,8 +2907,10 @@ function UI:Reveal(key, name, col)
     -- The unit is what decides whether there is anything to open: a player the
     -- meter knows about may have nothing in this session's cache at all, and
     -- Open treats that as a click on an empty row.
+    -- In a group of bouts, the newest bout's row: the players are listed newest
+    -- bout first, and that is the fight the meter window was showing.
     local data = name and Model:PlayerData(name)
-    if data then Model:Open(data.name, data.unit) end
+    if data then Model:Open(data.openKey or data.name, data.unit) end
 
     -- Not animated: this is a different session as often as not, and a grid
     -- growing into place from another match's row positions is motion that says
@@ -2843,7 +2934,7 @@ function UI:Reveal(key, name, col)
     -- Only one block is ever open and it opens beneath this row, so everything
     -- above it is a root row of one fixed height and the offset is exact.
     for i, d in ipairs(grid.display or {}) do
-        if d.kind == "unit" and d.name == data.name then
+        if d.kind == "unit" and (d.openKey or d.name) == (data.openKey or data.name) then
             -- Near the top rather than centred: what was just opened is
             -- underneath, and that is the part worth having room for.
             local wanted = math.max(0, (i - 1) * ROW_H - ROW_H)

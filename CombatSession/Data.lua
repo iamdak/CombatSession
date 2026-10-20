@@ -105,7 +105,14 @@ ns.API = API
 --     Armor's negative absorbs, which take back damage it released onto a later
 --     hit, showed up as negative smallest hits. Both still count in the totals,
 --     where they belong, and a cast that nets to nothing is not counted as one.
-local DEFINES_VERSION = 24
+-- 25: crowd control fixed three ways. A single application is counted for at
+--     most CC_MAX_MS: a removal logged out of range used to leave it open until
+--     the victim's next one, which counted a Leg Sweep at 241 seconds. A second
+--     application while one is open settles the first instead of extending it.
+--     A death settles everything open on the victim. And only a player being
+--     controlled counts, as with deaths: a pet rolls up to its owner, so a
+--     trapped pet had been its hunter's CC Taken.
+local DEFINES_VERSION = 25
 
 --------------------------------------------------------------------------------
 -- Event kinds, mirroring EventKind in StreamWriter.h. Values are persisted in
@@ -276,8 +283,12 @@ end
 
 local function NotifyCacheChanged(key)
     for _, fn in ipairs(cacheListeners) do
-        -- A listener belongs to another addon; its fault is not ours to raise.
-        pcall(fn, key)
+        -- A listener belongs to another addon; its fault is not ours to raise
+        -- here, where it would stop the listeners after it. It is still reported:
+        -- swallowed, a viewer that failed to redraw simply stayed as it was,
+        -- with nothing anywhere saying why.
+        local ok, err = pcall(fn, key)
+        if not ok then geterrorhandler()(err) end
     end
 end
 
@@ -317,14 +328,62 @@ local function LiveRanges()
             to   = record.endedAt or record.updatedAt or record.startedAt or 0,
             map  = record.map,
             who  = BaseName(record.character),
+            bout = record.bout,
         }
     end
     return ranges
 end
 
+-- A bout: one fight at a PvP training dummy ("dummy"), or with players outside
+-- arenas and battlegrounds - a duel, world PvP ("world"). See "Bout groups".
+local BOUT_NAME = { dummy = "PvP Target Dummies", world = "World PvP" }
+ns.BOUT_NAME = BOUT_NAME
+
+local function IsBout(h)
+    return h ~= nil and BOUT_NAME[h.type] ~= nil
+end
+
+-- Slack when joining a bout's meter reading to its log, in seconds: the two start
+-- the fight a moment apart - the recorder when combat begins, the log at the
+-- first blow - and each rounds to its own second. Bouts follow each other by
+-- seconds, where the minutes MATCH_TOLERANCE allows a match would join one bout
+-- to the next.
+local BOUT_SLACK = 3
+
+-- The groups the last listing drew, by key, for the lookups that follow one: the
+-- cache a group shows, and the group a remembered key has moved into. See "Bout
+-- groups".
+local groupsByKey, groupOfMember = {}, {}
+
+-- A group is keyed by its oldest bout's key with this on the end, so it sorts
+-- among the sessions by when it began, as every other key does.
+local GROUP_SUFFIX = "_group"
+
+local function IsGroupKey(key)
+    return type(key) == "string" and key:sub(-#GROUP_SUFFIX) == GROUP_SUFFIX
+end
+
 -- `h` is anything carrying a session's instance, character and time span: a
 -- cache header, or an entry from the delivery queue.
+--
+-- A bout joins only a bout, and on time and character alone: the recorder and
+-- the log can disagree about which kind of fight it was - a player joining a
+-- fight at a dummy - and about the instance id of the open world.
+--
+-- And on where the meter's bout STARTS: at the start of the log's, or inside it.
+-- Overlap with slack at both ends joined the log of one pull to the next pull,
+-- started four seconds after the first one's last blow, and deleted that pull's
+-- reading at login with nothing to show for it. Started inside the log's span is
+-- the other case that matters: the log cutting two pulls as one fight, which then
+-- stands for both.
 local function SameMatch(h, range)
+    if range.bout or IsBout(h) then
+        local from, to = h.startTime or 0, h.endTime or 0
+        return range.bout ~= nil and IsBout(h)
+           and BaseName(h.character) == range.who
+           and (math.abs(range.from - from) <= BOUT_SLACK
+                or (range.from > from and range.from < to))
+    end
     return h.instanceId == range.map
        and BaseName(h.character) == range.who
        and (h.startTime or 0) <= range.to + MATCH_TOLERANCE
@@ -356,7 +415,22 @@ end
 -- The built session that replaced a live one, or nil while it has not been
 -- replaced. For anything that remembered a live session by key - the viewer's
 -- selection across a reload - and needs to follow it to the real thing.
+--
+-- A group's key is its oldest bout's, so it moves when that bout is replaced by
+-- its log, or the bouts are regrouped: followed through the bout it was named
+-- after.
 function API:Successor(key)
+    if IsGroupKey(key) then
+        self:GetViewable()
+        if groupsByKey[key] then return nil end
+        local member = key:sub(1, -#GROUP_SUFFIX - 1)
+        local moved = groupOfMember[member]
+        if not moved and ns.Live then
+            local successor = ns.Live:Successor(member)
+            moved = successor and groupOfMember[successor]
+        end
+        return moved
+    end
     if not ns.Live then return nil end
     SweepLive()
     return ns.Live:Successor(key)
@@ -371,6 +445,109 @@ end
 function API:SecretName(key, guid)
     if not ns.Live then return nil end
     return ns.Live:SecretName(key, guid)
+end
+
+--------------------------------------------------------------------------------
+-- Bout groups
+--
+-- Bouts listed one to a row would bury the matches - an evening at a dummy is a
+-- hundred of them - so consecutive bouts of one kind share a row. The next match,
+-- or a bout of the other kind, starts a new one, and so does reaching the group
+-- cap. Per character, since the list holds every character's sessions.
+--
+-- Worked out afresh from what is held whenever it is asked rather than stored: a
+-- bout arrives first from the meter and later from the log, under a different key
+-- each time, and the log may cut one fight in two or two in one. A stored group
+-- would have to follow all of that; a derived one cannot fall out of step.
+--------------------------------------------------------------------------------
+
+-- Bouts in one row. A setting, so it can change without a format change.
+local function GroupCap()
+    local settings = ns.db and ns.db.settings
+    return (settings and tonumber(settings.groupCap)) or 20
+end
+
+-- Matches the recorder saw, as separators between runs of bouts. Most have a
+-- session in the list as well, but not every one: one played with logging off
+-- whose live session has since been pruned is only here.
+local function RecordedMatches()
+    local out = {}
+    for _, record in ipairs((ns.db and ns.db.matches) or {}) do
+        out[#out + 1] = { key = "", startTime = record.startedAt, character = record.character }
+    end
+    return out
+end
+
+-- items: anything with key, type, startTime and character. Returns bout key ->
+-- group key, the group being named after its oldest bout.
+local function GroupBouts(items, separators)
+    local all = {}
+    for _, item in ipairs(items) do all[#all + 1] = item end
+    for _, item in ipairs(separators or {}) do all[#all + 1] = item end
+    table.sort(all, function(a, b)
+        local at, bt = a.startTime or 0, b.startTime or 0
+        if at ~= bt then return at < bt end
+        return (a.key or "") < (b.key or "")
+    end)
+
+    local cap = GroupCap()
+    local groupOf, run = {}, {}
+    for _, item in ipairs(all) do
+        local who = BaseName(item.character)
+        if IsBout(item) then
+            local open = run[who]
+            if not (open and open.type == item.type and open.count < cap) then
+                open = { type = item.type, key = item.key .. GROUP_SUFFIX, count = 0 }
+                run[who] = open
+            end
+            open.count = open.count + 1
+            groupOf[item.key] = open.key
+        else
+            run[who] = nil
+        end
+    end
+    return groupOf
+end
+
+-- What the session cap counts: a match is one slot, a group of bouts is one. Each
+-- slot is named by its oldest key, so slots sort by when they began. Returns key
+-- -> slot and the slots, newest first.
+local function Slots(items)
+    local groupOf = GroupBouts(items, RecordedMatches())
+    local slotOf, first = {}, {}
+    for _, item in ipairs(items) do
+        local slot = groupOf[item.key] or item.key
+        slotOf[item.key] = slot
+        if not first[slot] or item.key < first[slot] then first[slot] = item.key end
+    end
+    local slots = {}
+    for slot in pairs(first) do slots[#slots + 1] = slot end
+    table.sort(slots, function(a, b) return first[a] > first[b] end)
+    return slotOf, slots
+end
+
+-- Whether the recorder's record says a session was rated, for the sessions the
+-- log alone cannot answer for: a battleground's log has no bracket line, so only
+-- the recorder can tell a rated one, and every record before it learned to ask
+-- late enough says unrated. Its scoreboard still settles it - a rating that moved
+-- is a rated match. Remembered per session; a built session never changes.
+local ratedByRecord = {}
+local function RecordSaysRated(api, entry)
+    local hit = ratedByRecord[entry.key]
+    if hit ~= nil then return hit end
+    local match = api:GetMatch(entry)
+    local rated = false
+    if match then
+        if match.isRated then rated = true end
+        for _, row in ipairs(match.roster or {}) do
+            if type(row.ratingChange) == "number" and row.ratingChange ~= 0 then
+                rated = true
+                break
+            end
+        end
+    end
+    ratedByRecord[entry.key] = rated
+    return rated
 end
 
 -- Every session the user can look at: everything cached, plus anything still
@@ -395,6 +572,8 @@ function API:GetViewable()
                 events = cache.eventCount or 0,
                 units  = cache.unitCount or 0,
             }
+            local entry = out[#out]
+            if not entry.rated then entry.rated = RecordSaysRated(self, entry) end
         end
     end
 
@@ -433,8 +612,78 @@ function API:GetViewable()
         end
     end
 
+    out = self:GroupViewable(out)
     table.sort(out, function(a, b) return a.key < b.key end)
     return out
+end
+
+-- Replaces the bouts in a listing with the groups they make, one row each. A
+-- group's row carries its bouts, newest first, each in the shape any other row
+-- has - so whatever draws a session can draw each of them - with the group's
+-- span, its combat time, and what its bouts are still waiting for.
+function API:GroupViewable(list)
+    local rows, bouts = {}, {}
+    for _, entry in ipairs(list) do
+        if IsBout(entry) then bouts[#bouts + 1] = entry else rows[#rows + 1] = entry end
+    end
+    groupsByKey, groupOfMember = {}, {}
+    if #bouts == 0 then return rows end
+
+    local groupOf = GroupBouts(list, RecordedMatches())
+    for _, entry in ipairs(bouts) do
+        local key = groupOf[entry.key]
+        local group = groupsByKey[key]
+        if not group then
+            group = {
+                key = key, group = true, cached = true,
+                type = entry.type, mapName = BOUT_NAME[entry.type],
+                character = entry.character, characterGuid = entry.characterGuid,
+                bouts = {}, units = 0, events = 0, combat = 0,
+            }
+            groupsByKey[key] = group
+            rows[#rows + 1] = group
+        end
+        group.bouts[#group.bouts + 1] = entry
+        groupOfMember[entry.key] = key
+    end
+
+    for _, group in pairs(groupsByKey) do
+        table.sort(group.bouts, function(a, b) return a.key > b.key end)
+        local recording, awaiting, unlogged, disabled = false, 0, 0, 0
+        for _, bout in ipairs(group.bouts) do
+            local from, to = bout.startTime or 0, bout.endTime or bout.startTime or 0
+            if not group.startTime or from < group.startTime then group.startTime = from end
+            if not group.endTime or to > group.endTime then group.endTime = to end
+            group.combat = group.combat + math.max(0, to - from)
+            group.events = group.events + (bout.events or 0)
+            if (bout.units or 0) > group.units then group.units = bout.units end
+            if bout.pending == "recording" then recording = true
+            elseif bout.pending == "awaiting log" then awaiting = awaiting + 1
+            elseif bout.pending == "log disabled" then unlogged, disabled = unlogged + 1, disabled + 1
+            elseif bout.pending == "no log recorded" then unlogged = unlogged + 1 end
+        end
+        -- The row says what the group is still waiting for, as a session's row
+        -- does; a bout that will never have a log says so on its own section.
+        if recording then
+            group.pending = "recording"
+        elseif awaiting > 0 then
+            group.pending = (awaiting == #group.bouts) and "awaiting log"
+                or ("%d awaiting log"):format(awaiting)
+        elseif unlogged == #group.bouts then
+            group.pending = (disabled == unlogged) and "log disabled" or "no log recorded"
+        end
+    end
+    return rows
+end
+
+-- The bouts behind a group's row, newest first, or nil for anything else.
+function API:GroupBouts(key)
+    local group = groupsByKey[key]
+    if not group and IsGroupKey(key) then
+        self:GetViewable()
+        group = groupsByKey[key]
+    end
+    return group and group.bouts or nil
 end
 
 function API:GetSession(key)
@@ -452,6 +701,19 @@ function API:LoadStream(key)
         -- Either never delivered, or already consumed and collected. Sessions
         -- in the latter state are served from CACHE and need no stream.
         return nil, "no pending chunk for this session"
+    end
+
+    -- From chunk version 7 an event's time is written as the step from the one
+    -- before it: seven digits a line become one or two, about a ninth of a chunk.
+    -- Turned back into offsets once, here, so nothing downstream knows. A chunk
+    -- written by an older application has no version 7 and is read as it is.
+    if (stream.version or 0) >= 7 and not stream.timesDecoded then
+        local t, at = stream.t, 0
+        for i = 1, #t do
+            at = at + t[i]
+            t[i] = at
+        end
+        stream.timesDecoded = true
     end
     return stream
 end
@@ -485,6 +747,8 @@ function API:SetMaxSessions(count)
     if ns.db.settings.maxSessions > previous then
         ns.db.oldestWanted = ""
     end
+    -- And the application is told, so it queues to the new cap.
+    ns.db.sessionCap = tostring(ns.db.settings.maxSessions)
     return true
 end
 
@@ -537,22 +801,42 @@ end
 -- can fall out for being stale, and a floor left above what is actually held
 -- would decline sessions still wanted - which the application reads as
 -- permission to delete their chunks.
+--
+-- The cap is in rows of the list, so a group of bouts counts once and goes - or
+-- stays - whole. The floor is then the oldest key of anything kept.
+local function CacheItems()
+    local items = {}
+    for key, cache in pairs(ns.db.cache) do
+        local h = cache.header or {}
+        items[#items + 1] = { key = key, type = h.type, startTime = h.startTime,
+                              character = h.character }
+    end
+    return items
+end
+
 local function PruneCaches()
     local db = ns.db
     if not db or not db.cache then return end
 
-    local keys = {}
-    for key in pairs(db.cache) do keys[#keys + 1] = key end
     local limit = (db.settings and db.settings.maxSessions) or 40
+    local slotOf, slots = Slots(CacheItems())
 
-    if #keys < limit then
+    if #slots < limit then
         db.oldestWanted = ""
         return
     end
 
-    table.sort(keys)
-    for i = 1, #keys - limit do db.cache[keys[i]] = nil end
-    db.oldestWanted = keys[#keys - limit + 1]
+    local kept = {}
+    for i = 1, limit do kept[slots[i]] = true end
+    local floor
+    for key in pairs(db.cache) do
+        if not kept[slotOf[key]] then
+            db.cache[key] = nil
+        elseif not floor or key < floor then
+            floor = key
+        end
+    end
+    db.oldestWanted = floor or ""
 end
 
 -- Consumes the backlog. Only sessions that will still be held once it is done are
@@ -575,27 +859,27 @@ function API:ProcessPending(onDone)
 
     local limit = self:GetMaxSessions()
 
-    local ranked, seen = {}, {}
-    for key in pairs((ns.db and ns.db.cache) or {}) do
-        ranked[#ranked + 1] = key
-        seen[key] = true
-    end
+    -- Ranked in rows of the list, as PruneCaches counts them: a group of bouts is
+    -- one, whichever of its bouts are held and which are queued.
+    local items = (ns.db and ns.db.cache) and CacheItems() or {}
+    local seen = {}
+    for _, item in ipairs(items) do seen[item.key] = true end
     for _, entry in ipairs(pending) do
         if not seen[entry.key] then
-            ranked[#ranked + 1] = entry.key
+            items[#items + 1] = entry
             seen[entry.key] = true
         end
     end
-    table.sort(ranked, function(a, b) return a > b end)
+    local slotOf, slots = Slots(items)
 
     local kept = {}
-    for i = 1, math.min(#ranked, limit) do kept[ranked[i]] = true end
+    for i = 1, math.min(#slots, limit) do kept[slots[i]] = true end
 
     -- Still newest first, so the sessions most likely to be looked at arrive
     -- first.
     local build = {}
     for _, entry in ipairs(pending) do
-        if kept[entry.key] then build[#build + 1] = entry end
+        if kept[slotOf[entry.key]] then build[#build + 1] = entry end
     end
 
     local take    = #build
@@ -955,6 +1239,10 @@ end
 --------------------------------------------------------------------------------
 
 function API:GetMatch(entry)
+    -- A bout has no match record, and the tolerance below would hand it the
+    -- battleground that ended a minute before it.
+    if entry.group or IsBout(entry) then return nil end
+
     -- A live session knows its own record, and while the match is still being
     -- played that record is not in db.matches yet - the recorder stores it on the
     -- way out - so there is nothing here to search for.
@@ -1158,10 +1446,16 @@ function API:Roster(entry, cache, match)
     else
         -- Neither, so fall back to reaction flags. Activity is required here,
         -- since nothing else keeps the aura burst out.
+        --
+        -- In a fight with players outside a match, anyone not friendly is the
+        -- other side: whether a duel opponent is logged hostile or neutral is not
+        -- something any log so far has shown, and either way they fought.
+        local bout = entry and entry.type == "world"
         for _, unit in ipairs(units) do
             if unit.kind == "player" and HasActivity(unit) then
                 local team = (unit.reaction == "friendly") and 1
-                          or (unit.reaction == "hostile") and 2 or nil
+                          or (unit.reaction == "hostile") and 2
+                          or (bout and 2) or nil
                 if team then
                     players[#players + 1] =
                         { name = unit.name, unit = unit, team = team }
@@ -1170,9 +1464,38 @@ function API:Roster(entry, cache, match)
         end
     end
 
+    if haveRoster then
+        -- A live row the meter would not name is one of the scoreboard's rows
+        -- that found no unit. Where exactly one row of a class is left without
+        -- one and exactly one withheld row of that class is left over, they are
+        -- the same player. Anything less certain stays apart - and is not listed
+        -- again below as someone who left, which it is not.
+        local open, spare = {}, {}
+        for _, row in ipairs(players) do
+            if not row.unit and row.class then
+                open[row.class] = open[row.class] or {}
+                table.insert(open[row.class], row)
+            end
+        end
+        for _, unit in ipairs(units) do
+            if unit.withheld and unit.class and unit.kind == "player" and not claimed[unit.name] then
+                spare[unit.class] = spare[unit.class] or {}
+                table.insert(spare[unit.class], unit)
+            end
+        end
+        for class, rows in pairs(open) do
+            local left = spare[class]
+            if #rows == 1 and left and #left == 1 then
+                rows[1].unit = left[1]
+                claimed[left[1].name] = true
+            end
+        end
+    end
+
     if haveRoster or haveCombatants then
         for _, unit in ipairs(units) do
-            if unit.kind == "player" and not claimed[unit.name] and HasActivity(unit) then
+            if unit.kind == "player" and not claimed[unit.name] and not unit.withheld
+               and HasActivity(unit) then
                 -- Fought but absent from the scoreboard: left early, or was
                 -- backfilled out. They are deliberately not counted in a team's
                 -- totals, since the scoreboard defines who played - but which
@@ -1222,10 +1545,16 @@ function API:Roster(entry, cache, match)
                      and match.teams[teams[i].side + 1]
             if info then
                 teams[i].teamName = info.name
-                teams[i].rating   = info.newRating
                 teams[i].mmr      = info.mmr
-                if info.newRating and info.oldRating then
-                    teams[i].ratingChange = info.newRating - info.oldRating
+                -- Only a real rating. This client returns -1 and -13 for the
+                -- two, which hid the figure - it is not above zero - and also
+                -- kept the log's own ratings below from ever being used, since
+                -- the slot was no longer empty.
+                if (info.newRating or 0) > 0 then
+                    teams[i].rating = info.newRating
+                    if (info.oldRating or 0) > 0 then
+                        teams[i].ratingChange = info.newRating - info.oldRating
+                    end
                 end
             end
         end
@@ -1273,6 +1602,10 @@ function API:UnitList(cache)
             -- Live sessions only. A built cache names units and nothing more,
             -- but a live row's GUID is what its withheld name is filed under.
             guid     = u.guid,
+            -- Live rows the meter would not name, by the class they showed; see
+            -- Roster.
+            withheld = u.wh or nil,
+            class    = u.cl,
         }
     end
     return out
@@ -1389,6 +1722,17 @@ function API:EventList(cache)
 end
 
 function API:GetCache(key)
+    -- A group shows its newest bout wherever one session is drawn - the meter
+    -- window, the list row's outcome - which is the fight just had. The viewer's
+    -- grid asks for each bout itself.
+    if IsGroupKey(key) then
+        for _, bout in ipairs(self:GroupBouts(key) or {}) do
+            local cache = self:GetCache(bout.key)
+            if cache then return cache end
+        end
+        return nil
+    end
+
     local cache = ns.db and ns.db.cache and ns.db.cache[key]
     if CacheIsCurrent(cache) then return cache end
 
@@ -1522,6 +1866,18 @@ function API:BuildCache(key, onDone, onProgress)
     -- Open crowd control, so a duration can be closed out on aura removal.
     -- Keyed by victim name then spell id.
     local openCC = {}
+
+    -- The longest one application of crowd control is counted for.
+    --
+    -- A battleground's log only covers what happens near the recording player, so
+    -- a CC that ends out of range ends unseen - and it used to stay open until the
+    -- same victim was next hit by the same spell within range, whose removal then
+    -- closed it. One Leg Sweep was counted at 241 seconds and one Psychic Scream
+    -- at 195, which is how a player came to be "crowd controlled" for 38% of a
+    -- battleground. In arenas, where nothing is ever out of range, the longest
+    -- single application of any of 39 CC spells across 40 sessions was 7.7s
+    -- (Sleep Walk), so this sits a little above that.
+    local CC_MAX_MS = 10000
 
     -- Dampening is an ordinary stacking debuff, one stack per point, so the
     -- largest dose anyone reached is the figure the match ended on. That makes
@@ -2105,6 +2461,20 @@ function API:BuildCache(key, onDone, onProgress)
         end)
     end
 
+    -- One application of crowd control, ended at `endT` and counted for no longer
+    -- than one can last. Attributed to the spell that opened the effect, which is
+    -- the key it was stored under, so a counterpart can be opened to see which
+    -- fears and stuns made up the time rather than only the total.
+    local function SettleCC(victim, spellId, opened, endT)
+        local ms = endT - opened.t
+        if ms > CC_MAX_MS then ms = CC_MAX_MS end
+        if ms <= 0 then return end
+        if opened.src then
+            Add(UnitEntry(opened.src), ccDone, victim, ms, 1, spellId)
+        end
+        Add(UnitEntry(victim), ccTaken, opened.src, ms, 1, spellId)
+    end
+
     local index = 1
     local CHUNK = 20000   -- ~4-8ms per slice on the reference battleground
 
@@ -2279,14 +2649,22 @@ function API:BuildCache(key, onDone, onProgress)
                 local spellIndex = sp[i]
                 local spellId = spellIndex ~= 0 and spells[spellIndex]
                                 and spells[spellIndex][1] or nil
-                if spellId and categoryOf[spellId] == CC and dstName then
+                -- Only a player being controlled. A pet rolls up to its owner,
+                -- so a trapped pet was counted as its hunter's CC Taken - the
+                -- mistake deaths already guard against, the same way.
+                if spellId and categoryOf[spellId] == CC and dstName
+                   and rawKind[d[i]] == "player" then
                     local perVictim = openCC[dstName]
                     if not perVictim then perVictim = {}; openCC[dstName] = perVictim end
-                    -- A re-application while still active keeps the original
-                    -- start, so overlapping refreshes do not double count.
-                    if not perVictim[spellId] then
-                        perVictim[spellId] = { t = t[i], src = srcName }
-                    end
+                    -- Applied again while ours is still open: a refresh arrives
+                    -- as AURA_REFRESH, so this one either came from another
+                    -- caster or followed a removal that was never logged. Either
+                    -- way the open one is settled here and this one starts, so the
+                    -- time counted is the span the victim was controlled and not
+                    -- everything since the first application.
+                    local open = perVictim[spellId]
+                    if open then SettleCC(dstName, spellId, open, t[i]) end
+                    perVictim[spellId] = { t = t[i], src = srcName }
                 end
 
             elseif kind == K.AURA_REMOVED then
@@ -2299,17 +2677,7 @@ function API:BuildCache(key, onDone, onProgress)
                 local opened = perVictim and spellId and perVictim[spellId]
                 if opened then
                     perVictim[spellId] = nil
-                    local ms = t[i] - opened.t
-                    if ms > 0 then
-                        -- Attributed to the spell that opened the effect, which
-                        -- is the key this was stored under, so a counterpart can
-                        -- be opened to see which fears and stuns made up the
-                        -- time rather than only the total.
-                        if opened.src then
-                            Add(UnitEntry(opened.src), ccDone, dstName, ms, 1, spellId)
-                        end
-                        Add(UnitEntry(dstName), ccTaken, opened.src, ms, 1, spellId)
-                    end
+                    SettleCC(dstName, spellId, opened, t[i])
                 end
 
             elseif kind == K.CAST_SUCCESS then
@@ -2356,6 +2724,15 @@ function API:BuildCache(key, onDone, onProgress)
                 -- did before.
                 local unconscious = am[i] == 1
                 if dstName and rawKind[d[i]] == "player" and not unconscious then
+                    -- Dying ends every control effect on the victim, and the
+                    -- removals are not always logged when it does.
+                    local perVictim = openCC[dstName]
+                    if perVictim then
+                        for spellId, opened in pairs(perVictim) do
+                            SettleCC(dstName, spellId, opened, t[i])
+                        end
+                        openCC[dstName] = nil
+                    end
                     Add(UnitEntry(dstName), deathCol, nil, 1, 1)
                     events[#events + 1] = {
                         name = "death", t = t[i], unit = dstName, at = i,

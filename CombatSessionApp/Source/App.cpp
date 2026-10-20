@@ -16,6 +16,7 @@
 #include "Shell.h"
 #include "Version.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -351,14 +352,28 @@ void App::RunGenerator() {
     size_t added = 0;
     bool   anyOpen = false;
     std::error_code ec;
+
+    // Newest first. The generator queues only what the addon will keep - the
+    // newest of everything it holds and everything queued - and in this order
+    // the sessions it keeps are the first ones written, so a rebuild stops
+    // writing chunks once the cap is reached instead of writing every match in
+    // every log and deleting most of them at the end.
+    std::vector<std::pair<fs::file_time_type, fs::path>> logs;
     for (const auto& entry : fs::directory_iterator(config_.LogsDir(), ec)) {
         const std::string name = entry.path().filename().string();
-        if (quitting_) break;   // do not start another log when quitting
         if (name.rfind("WoWCombatLog", 0) == 0 && entry.path().extension() == ".txt") {
-            added += generator.ProcessLog(entry.path(), 0,
-                                          LogLooksClosed(entry.path(), config_.closedAfterSeconds));
-            if (!generator.LastLogComplete()) anyOpen = true;
+            std::error_code timeEc;
+            logs.emplace_back(fs::last_write_time(entry.path(), timeEc), entry.path());
         }
+    }
+    std::sort(logs.begin(), logs.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    for (const auto& [modified, path] : logs) {
+        if (quitting_) break;   // do not start another log when quitting
+        added += generator.ProcessLog(path, 0,
+                                      LogLooksClosed(path, config_.closedAfterSeconds));
+        if (!generator.LastLogComplete()) anyOpen = true;
     }
     openSession_ = anyOpen;
     generator.Commit();

@@ -8,8 +8,8 @@ normalized event stream.
 
 | | |
 |---|---|
-| Client | 12.1.0.69587 (Midnight) |
-| Interface | `120100` |
+| Client | 12.1.5.70391 (Midnight) |
+| Interface | `120105` |
 | `COMBAT_LOG_VERSION` | `22`, `ADVANCED_LOG_ENABLED 1`, `PROJECT_ID 1` |
 | `advancedCombatLogging` | already `"1"` in `Config.wtf` — required; addon must verify |
 | Install root | `C:\Games\World of Warcraft` (flavors: `_retail_`, `_ptr_`, `_beta_`, `_xptr_`) |

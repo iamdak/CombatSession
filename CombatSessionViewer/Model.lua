@@ -64,6 +64,9 @@ end
 function Model:SessionLabel(entry)
     local name = entry.mapName or "Unknown"
     if entry.rated then name = "|cffffd100Rated|r " .. name end
+    if entry.group then
+        name = ("%s  |cff888888(%d)|r"):format(name, #(entry.bouts or {}))
+    end
     if entry.round and entry.round > 0 then
         name = ("%s  |cff888888round %d|r"):format(name, entry.round)
     end
@@ -117,9 +120,18 @@ local function SessionInfo(entry)
 
     -- Roster is nil-safe about the match record and falls back to the log's own
     -- ARENA_MATCH_END, so this runs on the cache alone.
+    --
+    -- Contained, because this is asked for the first row of the list before
+    -- anything else is drawn: one session whose cache Roster cannot read took the
+    -- whole list and the grid with it, on every refresh, until the session was
+    -- replaced. The fault is still reported, once - the result is remembered
+    -- below like any other, and forgotten when the cache changes.
     if cache then
-        local _, teams = api:Roster(entry, cache, match)
-        if teams[1].won ~= nil or teams[2].won ~= nil then
+        local ok, _, teams = pcall(api.Roster, api, entry, cache, match)
+        if not ok then
+            info.failed = true
+            geterrorhandler()(teams)
+        elseif teams[1].won ~= nil or teams[2].won ~= nil then
             if teams[1].won == false and teams[2].won == false then
                 info.mark = "|cffcccc66(D)|r"
             elseif teams[1].won then
@@ -189,6 +201,17 @@ function Model:Invalidate(key)
         -- Select clears the expansion, which is right: the rows it pointed at
         -- belong to the old cache and may not exist in the new one.
         self:Select(key)
+    elseif key and state.sections and state.key
+           and (key:find("_dummy", 1, true) or key:find("_world", 1, true)) then
+        -- A group is drawn from its bouts, and any bout changing can change it:
+        -- one of its own read or replaced by its log, or a new one joining it.
+        -- Its own key never arrives here, and every bout's key names its kind.
+        -- What was open stays open, since a new bout does not move the one being
+        -- looked at.
+        local selected, name, source = state.key, state.activeName, state.activeSource
+        state.key = nil
+        self:Select(selected)
+        state.activeName, state.activeSource = name, source
     end
 end
 
@@ -228,6 +251,65 @@ function Model:SessionCharacter(entry)
     return info.class or nil, info.faction or nil
 end
 
+-- A breakdown names counterparts as strings, so the only way back to a class is
+-- the scoreboard. Both the full and the base name are indexed: the scoreboard
+-- drops the realm for your own realm's players, while the log keeps it, and a
+-- counterpart can arrive in either form.
+local function AddClasses(players)
+    for _, player in ipairs(players) do
+        -- The log's spec id yields a class too, so a session with no scoreboard
+        -- behind it still colours its counterpart rows.
+        local byId = ns.SpecById(player.specId)
+        local class = player.class or (byId and byId.class)
+        if class then
+            state.classByName[player.name] = class
+            state.classByName[BaseName(player.name)] = class
+            if player.unit then state.classByName[player.unit.name] = class end
+        end
+    end
+end
+
+-- Contained for the same reason SessionInfo contains it: a session Roster cannot
+-- read should show an empty grid for that session, not stop the click and leave
+-- the last one's grid on screen.
+local function ReadRoster(api, entry, cache, match)
+    local ok, players, teams = pcall(api.Roster, api, entry, cache, match)
+    if not ok then
+        geterrorhandler()(players)
+        return {}, nil
+    end
+    return players, teams
+end
+
+-- A group of bouts is drawn as one grid in sections, a bout to a section, newest
+-- first - each the bout's own session, read as any session is. Section is the
+-- unit of everything the grid does to rows: sorting reorders within one, and a
+-- breakdown opens under one player in one bout.
+--
+-- The grid's other questions - which columns, what they are called - are asked of
+-- one cache, the newest bout built from the log, failing that the newest at all.
+local function SelectGroup(api)
+    state.sections, state.players = {}, {}
+    for _, bout in ipairs(state.entry.bouts) do
+        local section = { entry = bout }
+        section.cache = api:GetCache(bout.key)
+        if section.cache then
+            section.players = ReadRoster(api, bout, section.cache, nil)
+            AddClasses(section.players)
+            for _, player in ipairs(section.players) do
+                player.openKey = bout.key .. "|" .. player.name
+                state.players[#state.players + 1] = player
+            end
+            if not state.cache or (state.cache.live and not section.cache.live) then
+                state.cache = section.cache
+            end
+        else
+            section.players = {}
+        end
+        state.sections[#state.sections + 1] = section
+    end
+end
+
 function Model:Select(key)
     if state.key == key then return end
 
@@ -242,11 +324,14 @@ function Model:Select(key)
     state.match        = nil
     state.players      = nil
     state.teams        = nil
+    state.sections     = nil
     -- Dropped rather than kept: a session whose chunk was consumed since the
     -- list was last drawn now has an outcome where it had none.
     state.info         = nil
     state.factions     = nil
     state.shown        = nil
+    state.classByName  = {}
+    state.honorByName  = {}
 
     local api = ns:API()
     if not (api and key) then return end
@@ -255,28 +340,18 @@ function Model:Select(key)
         if entry.key == key then state.entry = entry break end
     end
 
+    if state.entry and state.entry.group then
+        SelectGroup(api)
+        if ns.db then ns.db.lastKey = key end
+        return
+    end
+
     state.cache = api:GetCache(key)
     if not (state.entry and state.cache) then return end
 
     state.match = api:GetMatch(state.entry)
-    state.players, state.teams = api:Roster(state.entry, state.cache, state.match)
-
-    -- A breakdown names counterparts as strings, so the only way back to a
-    -- class is the scoreboard. Both the full and the base name are indexed: the
-    -- scoreboard drops the realm for your own realm's players, while the log
-    -- keeps it, and a counterpart can arrive in either form.
-    state.classByName = {}
-    for _, player in ipairs(state.players) do
-        -- The log's spec id yields a class too, so a session with no scoreboard
-        -- behind it still colours its counterpart rows.
-        local byId = ns.SpecById(player.specId)
-        local class = player.class or (byId and byId.class)
-        if class then
-            state.classByName[player.name] = class
-            state.classByName[BaseName(player.name)] = class
-            if player.unit then state.classByName[player.unit.name] = class end
-        end
-    end
+    state.players, state.teams = ReadRoster(api, state.entry, state.cache, state.match)
+    AddClasses(state.players)
 
     -- Honor levels, joined the same way and for the same reason: the recorder
     -- writes whatever name the client gave it, which drops the realm for your
@@ -330,6 +405,9 @@ local function UnitRowData(player)
         departed = (player.team == nil) and player.inferredTeam or nil,
         unit     = player.unit,
         player   = player,
+        -- What opens them, where that is not simply their name: a group's
+        -- bouts each hold the same player.
+        openKey  = player.openKey,
     }
 end
 
@@ -371,6 +449,11 @@ function Model:Selected()   return state.key end
 function Model:Cache()      return state.cache end
 function Model:Entry()      return state.entry end
 
+-- A group of bouts: its sections, newest first, each { entry, cache, players }.
+-- Nil for a single session.
+function Model:Sections()   return state.sections end
+function Model:IsGroup()    return state.sections ~= nil end
+
 -- What a live session is: "recording" while the match is being played, "awaiting
 -- log" once it is over and the application has yet to deliver it, "log disabled"
 -- when no log was being written and this is all there will ever be of it. Nil for
@@ -379,6 +462,7 @@ function Model:IsLive()
     return state.entry and state.entry.pending or nil
 end
 function Model:Teams()      return state.teams end
+function Model:Players()    return state.players or {} end
 function Model:Match()      return state.match end
 
 -- Recorder first, then the log's own account: the recorder sampled the aura
@@ -394,6 +478,10 @@ function Model:Match()      return state.match end
 -- both, the span the session covers, which includes the gates opening and is
 -- therefore the loosest of the three.
 function Model:Duration()
+    -- A group's time is its combat: the bouts added up, not the evening between
+    -- the first and the last.
+    if state.sections then return state.entry and state.entry.combat end
+
     local match = state.match
     if match and match.duration and match.duration > 0 then
         return match.duration
@@ -527,15 +615,35 @@ end
 --
 -- Worked out once per cache: Select clears it, and a live reading arrives as a
 -- new cache and goes through Select.
+--
+-- A group draws them all once any of its bouts has its log, and otherwise the
+-- columns any of its bouts holds something in.
 function Model:ShownColumns()
     if state.shown then return state.shown end
 
-    local columns, cache = self:Columns(), state.cache
+    local columns = self:Columns()
+    local caches = {}
+    if state.sections then
+        for _, section in ipairs(state.sections) do
+            if section.cache then caches[#caches + 1] = section.cache end
+        end
+    elseif state.cache then
+        caches[1] = state.cache
+    end
+
+    local live = #caches > 0
+    for _, cache in ipairs(caches) do
+        if not cache.live then live = false break end
+    end
+
     local shown = {}
     for col = 1, #columns do
-        if not (cache and cache.live) or ColumnHasData(cache, col) then
-            shown[#shown + 1] = col
+        local keep = not live
+        for _, cache in ipairs(caches) do
+            if keep then break end
+            keep = ColumnHasData(cache, col)
         end
+        if keep then shown[#shown + 1] = col end
     end
     state.shown = shown
     return shown
@@ -805,78 +913,44 @@ local function FindEntry(list, name)
     return nil
 end
 
-function Model:Rows()
-    local rows = {}
-    local cache = state.cache
-    state.openRange, state.sourceRange = nil, nil
-    if not (cache and state.players) then return rows end
+local function Fraction(value, max)
+    if not max or max <= 0 then return 0 end
+    return math.min(1, (value or 0) / max)
+end
 
-    local api = ns:API()
-    local columns = self:Columns()
-    local sortCol, asc = self:Sort()
+-- One section's rows: its players in order, and the breakdown open under one of
+-- them. `prefix` keeps a group's bouts apart - the same player is in every one -
+-- and is empty for a single session. `ctx` carries what every section shares.
+--
+-- Every row carries three things the window animates by, because the row
+-- tables themselves are rebuilt on every refresh and cannot be what an
+-- animation is keyed on:
+--
+--   key    a stable identity - the same player, counterpart or spell gets
+--          the same key in the next rebuild
+--   block  the open unit's block this row belongs to; `sub` likewise for
+--          the open counterpart's spell list inside it
+--   opens  the block a row reveals beneath itself when it is open
+--
+-- A player's `openKey` is what opens them: their name, prefixed like the keys.
+local function AppendSection(self, rows, section, order, prefix, ctx)
+    local api, cache, columns = ctx.api, section.cache, ctx.columns
+    local activeCol, activeMax = ctx.activeCol, ctx.activeMax
 
-    -- A saved active column from a build with more columns than this session
-    -- carries would point past the end of the grid.
-    if (state.activeCol or 1) > #columns then state.activeCol = 1 end
-    local activeCol = self:ActiveColumn()
-
-    -- Realm-stripped and case-folded, so an alphabetical sort reads the way the
-    -- names are drawn rather than the way they are stored: "aiden-Ravencrest"
-    -- belongs beside "Aiden", not before every capital letter in the list.
-    local function NameKey(player)
-        return (ns.ShortName(player.name or "") or ""):lower()
-    end
-
-    local order = {}
-    for _, player in ipairs(state.players) do order[#order + 1] = player end
-    table.sort(order, function(a, b)
-        if sortCol == ns.NAME_COL then
-            local an, bn = NameKey(a), NameKey(b)
-            if an == bn then return (a.name or "") < (b.name or "") end
-            if asc then return an < bn end
-            return an > bn
-        end
-
-        local av, bv = SortValue(a, sortCol), SortValue(b, sortCol)
-        if av == bv then return (a.name or "") < (b.name or "") end
-        if asc then return av < bv end
-        return av > bv
-    end)
-
-    -- Bars are scaled so the largest value in the active column fills the name
-    -- cell, and every deeper level rescales against its own siblings. A single
-    -- global scale would make every drill-down bar a sliver, which is the
-    -- opposite of what the level is for: comparing that level's entries.
-    local activeMax = 0
-    for _, player in ipairs(order) do
-        local value = SortValue(player, activeCol)
-        if value > activeMax then activeMax = value end
-    end
-    local function Fraction(value, max)
-        if not max or max <= 0 then return 0 end
-        return math.min(1, (value or 0) / max)
-    end
-
-    -- Every row carries three things the window animates by, because the row
-    -- tables themselves are rebuilt on every refresh and cannot be what an
-    -- animation is keyed on:
-    --
-    --   key    a stable identity - the same player, counterpart or spell gets
-    --          the same key in the next rebuild
-    --   block  the open unit's block this row belongs to; `sub` likewise for
-    --          the open counterpart's spell list inside it
-    --   opens  the block a row reveals beneath itself when it is open
     for _, player in ipairs(order) do
         local root = player.name
-        local block = "b:" .. root
+        local id = prefix .. root
+        local block = "b:" .. id
 
         local unitRow = UnitRowData(player)
-        unitRow.frac  = Fraction(SortValue(player, activeCol), activeMax)
-        unitRow.key   = "u:" .. root
-        unitRow.opens = block
+        unitRow.frac    = Fraction(SortValue(player, activeCol), activeMax)
+        unitRow.key     = "u:" .. id
+        unitRow.opens   = block
+        unitRow.openKey = id
+        unitRow.section = section
         rows[#rows + 1] = unitRow
 
-        if state.activeName == player.name and player.unit then
+        if state.activeName == id and player.unit then
             local blockFirst = #rows
 
             local lists, omittedBy, partMax = {}, {}, 0
@@ -913,10 +987,10 @@ function Model:Rows()
 
             for rank, part in ipairs(parts) do
                 local class = self:ClassOf(part.name)
-                local sub = "sb:" .. root .. ":" .. part.name
+                local sub = "sb:" .. id .. ":" .. part.name
                 rows[#rows + 1] = {
                     kind    = "source",
-                    key     = "s:" .. root .. ":" .. part.name,
+                    key     = "s:" .. id .. ":" .. part.name,
                     block   = block,
                     opens   = sub,
                     name    = part.name,
@@ -930,6 +1004,10 @@ function Model:Rows()
                     rank    = rank,
                     count   = depth,
                     lists   = lists,
+                    -- Whose breakdown this is, and in which bout of a group,
+                    -- for a report taken from inside it.
+                    root    = root,
+                    section = section,
                     -- The player behind a counterpart, for the same tooltip and
                     -- menu a root row gets. Nil for pets, NPCs and the summary.
                     playerData = (not part.summary) and self:PlayerData(part.name) or nil,
@@ -957,7 +1035,7 @@ function Model:Rows()
                     for spellRank, use in ipairs(part.spells) do
                         rows[#rows + 1] = {
                             kind  = "spell",
-                            key   = "p:" .. root .. ":" .. part.name .. ":" .. use.name,
+                            key   = "p:" .. id .. ":" .. part.name .. ":" .. use.name,
                             block = block,
                             sub   = sub,
                             name  = use.name,
@@ -971,6 +1049,14 @@ function Model:Rows()
                             count = #part.spells,
                             lists = spellLists,
                             frac  = Fraction(use.v, spellMax),
+                            -- Whose breakdown and which counterpart in it, and
+                            -- the counterpart lists one level up, for a report
+                            -- taken from here.
+                            root        = root,
+                            section     = section,
+                            source      = part.name,
+                            summary     = part.summary,
+                            parentLists = lists,
                         }
                     end
 
@@ -997,13 +1083,15 @@ function Model:Rows()
             for rank = #parts + 1, math.max(depth, 1) do
                 rows[#rows + 1] = {
                     kind  = "note",
-                    key   = "n:" .. root .. ":rank" .. rank,
+                    key   = "n:" .. id .. ":rank" .. rank,
                     block = block,
                     name  = (rank == 1) and empty or "",
                     col   = activeCol,
                     rank  = rank,
                     count = math.max(depth, 1),
                     lists = lists,
+                    root  = root,
+                    section = section,
                 }
             end
 
@@ -1014,7 +1102,7 @@ function Model:Rows()
             if next(omittedBy) then
                 rows[#rows + 1] = {
                     kind     = "note",
-                    key      = "n:" .. root .. ":omitted",
+                    key      = "n:" .. id .. ":omitted",
                     block    = block,
                     name     = "... smaller contributors not stored",
                     col      = activeCol,
@@ -1025,6 +1113,102 @@ function Model:Rows()
             state.openRange = { first = blockFirst, count = #rows - blockFirst + 1 }
         end
     end
+end
 
+-- The row heading one bout of a group: when it started, how long the fighting
+-- lasted, and what it is still waiting for.
+local function SectionRow(section)
+    local bout = section.entry
+    local fields = {}
+    if bout.startTime then fields[#fields + 1] = date("%m/%d %H:%M:%S", bout.startTime) end
+    local span = ns.FormatDuration((bout.endTime or 0) - (bout.startTime or 0))
+    fields[#fields + 1] = (span or "0:00") .. " combat"
+    if bout.pending then
+        fields[#fields + 1] = ("|cffdfa84f%s|r"):format(bout.pending)
+    elseif not section.cache then
+        fields[#fields + 1] = "|cff886644not built yet|r"
+    end
+    return {
+        kind    = "section",
+        key     = "x:" .. bout.key,
+        name    = table.concat(fields, "   "),
+        section = section,
+    }
+end
+
+function Model:Rows()
+    local rows = {}
+    state.openRange, state.sourceRange = nil, nil
+
+    -- One section for a session; one per bout, newest first, for a group.
+    local sections = state.sections
+    if not sections then
+        if not (state.cache and state.players) then return rows end
+        sections = { { cache = state.cache, players = state.players } }
+    end
+
+    local api = ns:API()
+    local columns = self:Columns()
+    local sortCol, asc = self:Sort()
+
+    -- A saved active column from a build with more columns than this session
+    -- carries would point past the end of the grid.
+    if (state.activeCol or 1) > #columns then state.activeCol = 1 end
+    local activeCol = self:ActiveColumn()
+
+    -- Realm-stripped and case-folded, so an alphabetical sort reads the way the
+    -- names are drawn rather than the way they are stored: "aiden-Ravencrest"
+    -- belongs beside "Aiden", not before every capital letter in the list.
+    local function NameKey(player)
+        return (ns.ShortName(player.name or "") or ""):lower()
+    end
+
+    -- Sorting reorders the players within a section and never the sections,
+    -- which stay newest first.
+    local function Ordered(players)
+        local order = {}
+        for _, player in ipairs(players) do order[#order + 1] = player end
+        table.sort(order, function(a, b)
+            if sortCol == ns.NAME_COL then
+                local an, bn = NameKey(a), NameKey(b)
+                if an == bn then return (a.name or "") < (b.name or "") end
+                if asc then return an < bn end
+                return an > bn
+            end
+
+            local av, bv = SortValue(a, sortCol), SortValue(b, sortCol)
+            if av == bv then return (a.name or "") < (b.name or "") end
+            if asc then return av < bv end
+            return av > bv
+        end)
+        return order
+    end
+
+    -- Bars are scaled so the largest value in the active column fills the name
+    -- cell, and every deeper level rescales against its own siblings. A single
+    -- global scale would make every drill-down bar a sliver, which is the
+    -- opposite of what the level is for: comparing that level's entries.
+    --
+    -- In a group the root level is scaled across every bout, so one player's bar
+    -- is the same length for the same figure in any of them.
+    local activeMax = 0
+    for _, section in ipairs(sections) do
+        for _, player in ipairs(section.players or {}) do
+            local value = SortValue(player, activeCol)
+            if value > activeMax then activeMax = value end
+        end
+    end
+
+    local ctx = { api = api, columns = columns, activeCol = activeCol, activeMax = activeMax }
+    for _, section in ipairs(sections) do
+        local prefix = ""
+        if section.entry then
+            prefix = section.entry.key .. "|"
+            rows[#rows + 1] = SectionRow(section)
+        end
+        if section.cache then
+            AppendSection(self, rows, section, Ordered(section.players or {}), prefix, ctx)
+        end
+    end
     return rows
 end

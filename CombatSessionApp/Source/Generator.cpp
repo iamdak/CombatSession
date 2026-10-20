@@ -8,11 +8,15 @@
 
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <chrono>
+#include <cstring>
 #include <fstream>
+#include <set>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
@@ -21,8 +25,37 @@ namespace {
 
 constexpr const char* kDataAddon  = "CombatSession_Data";
 constexpr const char* kIndexFile  = "Index.lua";
-constexpr const char* kInterface  = "120100";
 constexpr const char* kArchiveExt = ".log.gz";
+
+// Used only when the recorder's own .toc cannot be read. See RecorderInterface.
+constexpr const char* kFallbackInterface = "120105";
+
+// The interface number the data addon declares, copied from the recorder addon
+// it depends on.
+//
+// It used to be a constant here, which meant every client patch marked the data
+// folder out of date until a new application shipped - while the addons, updated
+// on their own schedule, had already moved on. The recorder's .toc is what the
+// user installs alongside the client, so whatever it says the client accepts is
+// what this one should say too.
+std::string RecorderInterface(const fs::path& addonsRoot) {
+    std::ifstream in(addonsRoot / "CombatSession" / "CombatSession.toc");
+    if (!in) return kFallbackInterface;
+
+    constexpr const char* kKey = "## Interface:";
+    const size_t keyLength = std::strlen(kKey);
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.compare(0, keyLength, kKey) != 0) continue;
+        std::string value = line.substr(keyLength);
+        const size_t first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) break;
+        const size_t last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    }
+    return kFallbackInterface;
+}
 
 // App state, kept beside the archive. Never read by the client.
 constexpr const char* kRecordsFile = "records.tsv";
@@ -34,7 +67,13 @@ constexpr const char* kLogStateFile = "logs.tsv";
 std::tm LocalTime(Timestamp ms) {
     const std::time_t s = static_cast<std::time_t>(ms / 1000);
     std::tm tm{};
+    // The same thread-safe call under its two names, with the arguments the
+    // other way round.
+#ifdef _WIN32
     localtime_s(&tm, &s);
+#else
+    localtime_r(&s, &tm);
+#endif
     return tm;
 }
 
@@ -67,16 +106,82 @@ std::string QuoteLua(const std::string& text) {
     return out + "\"";
 }
 
+// Bout keys end in their kind, which is how anything holding only a key - the
+// queue caps below, the addon's own - tells a bout from a match.
+constexpr const char* kDummySuffix = "_dummy";
+constexpr const char* kWorldSuffix = "_world";
+
+bool IsBoutKey(const std::string& key) {
+    auto ends = [&](const char* tail) {
+        const size_t n = std::strlen(tail);
+        return key.size() >= n && key.compare(key.size() - n, n, tail) == 0;
+    };
+    return ends(kDummySuffix) || ends(kWorldSuffix);
+}
+
+// How many bouts the addon groups into one session. The addon decides the groups;
+// this only has to be sure never to think there are more of them than it does.
+constexpr int kBoutsPerGroup = 20;
+
+// Bouts queued at once, apart from the pending limit, which they would otherwise
+// take over: an evening at a dummy is a few hundred of them, each a small chunk.
+constexpr int kBoutPendingLimit = 400;
+
+// A bout's byte range holds everyone's fighting nearby, so its chunk keeps only
+// the lines that are the recording player's: the player, their pets, their
+// group, and - in a fight with players - the opponents. A dummy is shared, so
+// for one of those only the player's own lines stay. Lines without the unit
+// fields are kept; the writer decides what they are.
+bool KeepBoutLine(const LogLine& line, const Session& session,
+                  const std::set<std::string_view>& who,
+                  std::vector<std::string_view>& fields) {
+    SplitFields(line.payload, fields);
+    if (fields.size() < 8) return true;
+
+    auto flags = [&](size_t at) -> uint32_t {
+        const std::string_view text = fields[at];
+        if (text.size() < 3 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X')) return 0;
+        uint32_t value = 0;
+        std::from_chars(text.data() + 2, text.data() + text.size(), value, 16);
+        return value;
+    };
+    const uint32_t src = flags(2), dst = flags(6);
+    constexpr uint32_t kMine = 0x1, kGroup = 0x2 | 0x4, kControlPlayer = 0x100;
+
+    if ((src & kMine) || (dst & kMine)) return true;
+    if (session.type != SessionType::World) return false;
+    if (who.count(fields[0]) || who.count(fields[4])) return true;
+    auto grouped = [&](uint32_t f) { return (f & kGroup) && (f & kControlPlayer); };
+    return grouped(src) || grouped(dst);
+}
+
 } // namespace
 
 std::string MakeSessionKey(const Session& session) {
     const std::tm tm = LocalTime(session.startTime);
     char buf[64];
+    if (IsBout(session.type)) {
+        std::snprintf(buf, sizeof buf, "%04d%02d%02d_%02d%02d%02d_%d%s",
+                      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                      tm.tm_hour, tm.tm_min, tm.tm_sec, session.instanceId,
+                      session.type == SessionType::Dummy ? kDummySuffix : kWorldSuffix);
+        return buf;
+    }
     std::snprintf(buf, sizeof buf, "%04d%02d%02d_%02d%02d%02d_%d_%d",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                   tm.tm_hour, tm.tm_min, tm.tm_sec,
                   session.instanceId, session.roundIndex);
     return buf;
+}
+
+const char* SessionTypeName(SessionType type) {
+    switch (type) {
+    case SessionType::Arena:        return "arena";
+    case SessionType::Battleground: return "battleground";
+    case SessionType::Dummy:        return "dummy";
+    case SessionType::World:        return "world";
+    default:                        return "unknown";
+    }
 }
 
 bool LogLooksClosed(const fs::path& logPath, int settleSeconds) {
@@ -153,6 +258,7 @@ size_t Generator::ProcessLog(const fs::path& logPath, uint64_t fromOffset,
     }
 
     std::vector<Session> found;
+    Timestamp lastLineTime = 0;
     {
         std::ifstream in(logPath, std::ios::binary);
         if (!in) return 0;
@@ -164,7 +270,10 @@ size_t Generator::ProcessLog(const fs::path& logPath, uint64_t fromOffset,
         LogLine parsed;
         while (std::getline(in, line)) {
             const uint64_t len = line.size() + 1;
-            if (ParseLine(line, parsed)) seg.Feed(parsed, offset, len);
+            if (ParseLine(line, parsed)) {
+                seg.Feed(parsed, offset, len);
+                if (parsed.time > lastLineTime) lastLineTime = parsed.time;
+            }
             offset += len;
         }
         // While the log may still grow, a session open at end-of-data is
@@ -227,6 +336,7 @@ size_t Generator::ProcessLog(const fs::path& logPath, uint64_t fromOffset,
         // moved past but does not hold is one it wants back, and re-emitting
         // the chunk is how a cache that failed to save gets rebuilt.
         if (Consumed(key)) continue;
+        if (Unwanted(key)) continue;
 
         StreamWriter writer;
         {
@@ -236,9 +346,15 @@ size_t Generator::ProcessLog(const fs::path& logPath, uint64_t fromOffset,
             std::string line;
             LogLine parsed;
             uint64_t consumed = 0;
+            const bool bout = IsBout(session.type);
+            const std::set<std::string_view> who(session.participants.begin(),
+                                                 session.participants.end());
+            std::vector<std::string_view> fields;
             while (consumed < rawLen && std::getline(in, line)) {
                 consumed += line.size() + 1;
-                if (ParseLine(line, parsed)) writer.Feed(parsed);
+                if (!ParseLine(line, parsed)) continue;
+                if (bout && !KeepBoutLine(parsed, session, who, fields)) continue;
+                writer.Feed(parsed);
             }
         }
 
@@ -287,6 +403,7 @@ size_t Generator::ProcessLog(const fs::path& logPath, uint64_t fromOffset,
     // Set only once the log has been treated as finished at this size. Until
     // then a later pass may still have something to add.
     state.settled = logClosed;
+    if (lastLineTime > state.through) state.through = lastLineTime;
 
     return written;
 }
@@ -318,7 +435,12 @@ void Generator::LoadExistingRecords() {
                 state.size = std::strtoull(line.substr(b + 1).c_str(), nullptr, 10);
             } else {
                 state.size    = std::strtoull(line.substr(b + 1, c - b - 1).c_str(), nullptr, 10);
-                state.settled = (line.substr(c + 1) == "1");
+                // The time read through is later still: a fourth tab, or none.
+                const size_t d = line.find('\t', c + 1);
+                state.settled = (line.substr(c + 1, d == std::string::npos ? std::string::npos : d - c - 1) == "1");
+                if (d != std::string::npos) {
+                    state.through = std::strtoll(line.substr(d + 1).c_str(), nullptr, 10);
+                }
             }
             logs_[line.substr(0, a)] = state;
         }
@@ -406,6 +528,52 @@ bool Generator::Consumed(const std::string& key) const {
     return !state_.oldestWanted.empty() && key < state_.oldestWanted;
 }
 
+// Whether the addon would decline this session if it were queued: it ranks what
+// it holds and what is queued together and keeps the newest sessionCap of them,
+// so a session with that many newer ones already held or queued is never going
+// to be built. Writing it anyway is what made a rebuild queue every match in
+// every log - 192 chunks, ~0.74 GB, and every one of them loaded into the client
+// at the next login - for an addon that then kept forty.
+//
+// Bouts are the exception. The addon counts a group of up to kBoutsPerGroup of
+// them as one session, and how it draws the groups is its business, so here a
+// bout never counts toward the cap at all - which can only ever keep more than
+// the addon wants, never less. A bout is itself unwanted once the cap's worth of
+// matches is newer than it, or enough bouts to fill the cap even grouped.
+bool Generator::Unwanted(const std::string& key) const {
+    const int cap = state_.sessionCap;
+    if (cap <= 0) return false;
+
+    int newer = 0, newerBouts = 0;
+    auto count = [&](const std::string& other) {
+        if (other <= key) return;
+        if (IsBoutKey(other)) ++newerBouts; else ++newer;
+    };
+    for (const auto& held : state_.cached) count(held);
+    for (const auto& r : records_) {
+        if (!state_.cached.count(r.key)) count(r.key);
+    }
+    if (!IsBoutKey(key)) return newer >= cap;
+    return newer >= cap || newerBouts >= cap * kBoutsPerGroup;
+}
+
+void Generator::PruneUnwanted() {
+    if (state_.sessionCap <= 0) return;
+
+    // Decided against the queue as it stands, before anything leaves it.
+    std::set<std::string> drop;
+    for (const auto& r : records_) {
+        if (Unwanted(r.key)) drop.insert(r.key);
+    }
+    if (drop.empty()) return;
+
+    std::error_code ec;
+    for (const auto& key : drop) fs::remove(DataAddonDir() / (key + ".lua"), ec);
+    records_.erase(std::remove_if(records_.begin(), records_.end(),
+                                  [&](const SessionRecord& r) { return drop.count(r.key) != 0; }),
+                   records_.end());
+}
+
 void Generator::CollectConsumed() {
     lastCollected_ = 0;
 
@@ -422,36 +590,54 @@ void Generator::CollectConsumed() {
                    records_.end());
 }
 
+// Matches and bouts under limits of their own, oldest first within each, so an
+// evening of bouts cannot push a match out of the queue or the archive.
 void Generator::PrunePending() {
-    if (static_cast<int>(records_.size()) <= opt_.pendingLimit) return;
-
     std::sort(records_.begin(), records_.end(),
               [](const SessionRecord& a, const SessionRecord& b) {
                   return a.key < b.key;   // keys lead with the timestamp
               });
 
-    const size_t excess = records_.size() - static_cast<size_t>(opt_.pendingLimit);
-    std::error_code ec;
-    for (size_t i = 0; i < excess; ++i) {
-        fs::remove(DataAddonDir() / (records_[i].key + ".lua"), ec);
+    int matches = 0, bouts = 0;
+    for (const auto& r : records_) {
+        if (IsBout(r.session.type) || IsBoutKey(r.key)) ++bouts; else ++matches;
     }
-    records_.erase(records_.begin(), records_.begin() + static_cast<long>(excess));
+
+    std::set<std::string> drop;
+    for (const auto& r : records_) {
+        const bool bout = IsBout(r.session.type) || IsBoutKey(r.key);
+        int& left = bout ? bouts : matches;
+        const int limit = bout ? kBoutPendingLimit : opt_.pendingLimit;
+        if (left > limit) {
+            drop.insert(r.key);
+            --left;
+        }
+    }
+    if (drop.empty()) return;
+
+    std::error_code ec;
+    for (const auto& key : drop) fs::remove(DataAddonDir() / (key + ".lua"), ec);
+    records_.erase(std::remove_if(records_.begin(), records_.end(),
+                                  [&](const SessionRecord& r) { return drop.count(r.key) != 0; }),
+                   records_.end());
 }
 
 void Generator::PruneRaw() {
     std::error_code ec;
-    std::vector<fs::path> archives;
+    std::vector<fs::path> matches, bouts;
     for (const auto& file : fs::directory_iterator(opt_.rawDir, ec)) {
         const std::string name = file.path().filename().string();
         if (name.size() > 7 && name.compare(name.size() - 7, 7, kArchiveExt) == 0) {
-            archives.push_back(file.path());
+            const std::string key = name.substr(0, name.size() - 7);
+            (IsBoutKey(key) ? bouts : matches).push_back(file.path());
         }
     }
-    if (static_cast<int>(archives.size()) <= opt_.rawLimit) return;
-
-    std::sort(archives.begin(), archives.end());
-    const size_t excess = archives.size() - static_cast<size_t>(opt_.rawLimit);
-    for (size_t i = 0; i < excess; ++i) fs::remove(archives[i], ec);
+    for (auto* archives : { &matches, &bouts }) {
+        if (static_cast<int>(archives->size()) <= opt_.rawLimit) continue;
+        std::sort(archives->begin(), archives->end());
+        const size_t excess = archives->size() - static_cast<size_t>(opt_.rawLimit);
+        for (size_t i = 0; i < excess; ++i) fs::remove((*archives)[i], ec);
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -490,6 +676,8 @@ bool Generator::WriteLogState() const {
         body += std::to_string(state.size);
         body += '\t';
         body += (state.settled ? '1' : '0');
+        body += '\t';
+        body += std::to_string(state.through);
         body += '\n';
     }
     return WriteAtomic(opt_.rawDir / kLogStateFile, body);
@@ -498,7 +686,7 @@ bool Generator::WriteLogState() const {
 bool Generator::WriteToc() const {
     std::string toc;
     toc += "## Interface: ";
-    toc += kInterface;
+    toc += RecorderInterface(opt_.addonsRoot);
     toc += "\n## Title: CombatSession Data\n";
     toc += "## Notes: Generated session queue. Do not edit.\n";
     toc += "## Dependencies: CombatSession\n\n";
@@ -541,6 +729,17 @@ bool Generator::WriteIndex() const {
           + ", text = " + QuoteLua(CS_VERSION_SHORT)
           + ", full = " + QuoteLua(CS_VERSION_FULL) + " }\n";
 
+    // How far the logs have been read: the time of the latest line, in seconds.
+    // A live session that ended well before this and has no chunk below is not
+    // going to get one, and the addon says so instead of waiting for it.
+    Timestamp through = 0;
+    for (const auto& [name, state] : logs_) {
+        if (state.through > through) through = state.through;
+    }
+    if (through > 0) {
+        body += "CombatSessionLogThrough = " + std::to_string(through / 1000) + "\n";
+    }
+
     body += "CombatSessionIndex = {\n";
     for (const auto& r : sorted) {
         const Session& s = r.session;
@@ -550,8 +749,7 @@ bool Generator::WriteIndex() const {
               + ", archived=" + (r.archived ? "true" : "false")
               + ", startTime=" + std::to_string(s.startTime / 1000)
               + ", endTime=" + std::to_string(s.endTime / 1000)
-              + ", type=" + (s.type == SessionType::Arena ? "\"arena\""
-                                                          : "\"battleground\"")
+              + ", type=" + QuoteLua(SessionTypeName(s.type))
               + ", instanceId=" + std::to_string(s.instanceId)
               + ", uiMapId=" + std::to_string(s.uiMapId)
               + ", rated=" + (s.rated ? "true" : "false")
@@ -579,6 +777,7 @@ bool Generator::Commit() {
     fs::create_directories(DataAddonDir(), ec);
 
     CollectConsumed();
+    PruneUnwanted();
     PrunePending();
     PruneRaw();
 

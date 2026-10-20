@@ -15,6 +15,9 @@ constexpr uint32_t kFlagHostile  = 0x40;
 constexpr uint32_t kFlagFriendly = 0x10;
 constexpr uint32_t kFlagParty    = 0x2;
 constexpr uint32_t kFlagRaid     = 0x4;
+constexpr uint32_t kFlagMine     = 0x1;
+// CONTROL_PLAYER: a player, or a pet or guardian a player commands.
+constexpr uint32_t kFlagControlPlayer = 0x100;
 
 // Zero rather than an error for anything that is not a flag field: a payload
 // field holding something else simply has none of the bits being asked about.
@@ -75,6 +78,54 @@ bool LooksLikeGuid(std::string_view text) {
             || text.find_first_not_of('0') == std::string_view::npos);
 }
 
+// A PvP training dummy, by the creature id in its GUID:
+//   Creature-0-<server>-<instance>-<zone>-<id>-<spawn>
+// See the header note for where these five come from.
+bool IsPvPDummy(std::string_view guid) {
+    if (guid.rfind("Creature-", 0) != 0) return false;
+    size_t at = 0;
+    for (int i = 0; i < 5; ++i) {
+        at = guid.find('-', at);
+        if (at == std::string_view::npos) return false;
+        ++at;
+    }
+    const size_t end = guid.find('-', at);
+    if (end == std::string_view::npos) return false;
+
+    int32_t id = 0;
+    const auto parsed = std::from_chars(guid.data() + at, guid.data() + end, id);
+    if (parsed.ec != std::errc{} || parsed.ptr != guid.data() + end) return false;
+    switch (id) {
+    case 243211: case 243212:   // Silvermoon City
+    case 255824: case 255825:   // Quel'Thalas
+    case 219250:                // Khaz Algar
+        return true;
+    default:
+        return false;
+    }
+}
+
+// A player - or their pet - the recording player can be fighting: player
+// controlled, not friendly, and not their own.
+bool IsOpposingPlayer(uint32_t flags) {
+    return (flags & kFlagControlPlayer) && !(flags & kFlagFriendly) && !(flags & kFlagMine);
+}
+
+bool EndsWith(std::string_view text, std::string_view tail) {
+    return text.size() >= tail.size()
+        && text.compare(text.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+// The events that are two sides fighting: damage and misses, debuffs, interrupts.
+// Not heals or buffs - a PvP dummy is logged as friendly and takes the
+// recording player's area heals, which is not a fight with it.
+bool IsBoutAction(std::string_view event) {
+    return EndsWith(event, "_DAMAGE") || EndsWith(event, "_MISSED")
+        || EndsWith(event, "_DAMAGE_LANDED") || event == "SPELL_AURA_APPLIED"
+        || event == "SPELL_INTERRUPT" || event == "SPELL_DRAIN"
+        || event == "SPELL_LEECH";
+}
+
 } // namespace
 
 void Segmenter::OpenSession(const LogLine& line, uint64_t byteOffset) {
@@ -125,8 +176,114 @@ void Segmenter::CloseSession(Termination why, Timestamp endTime, uint64_t endOff
     const bool emit = !isPvE_ && looksPvP;
     if (emit) sink_(current_);
 
+    // Bouts fought while this was open were fighting in this match if it was
+    // one, and are dropped with it; otherwise they were the open world's.
+    ReleaseHeldBouts(emit);
+
     open_ = false;
     current_ = Session{};
+}
+
+void Segmenter::TrackBout(const LogLine& line, uint64_t byteOffset, uint64_t lineEnd) {
+    // An arena is all bout lines and none of them is a bout, and neither is the
+    // end of one.
+    if (matchOver_ || (open_ && current_.type == SessionType::Arena)) return;
+    if (!IsBoutAction(line.event)) return;
+
+    SplitFields(line.payload, fields_);
+    if (fields_.size() < 8) return;
+    // SPELL_AURA_APPLIED: ..., spellId, name, school, BUFF|DEBUFF.
+    if (line.event == "SPELL_AURA_APPLIED"
+        && (fields_.size() < 12 || fields_[11] != "DEBUFF")) {
+        return;
+    }
+
+    const uint32_t srcFlags = UnitFlags(fields_[2]);
+    const uint32_t dstFlags = UnitFlags(fields_[6]);
+
+    // One side is the recording player's - themselves or their pet - and the
+    // other is not.
+    bool mineActs;
+    std::string_view other;
+    uint32_t otherFlags;
+    if ((srcFlags & kFlagMine) && !(dstFlags & kFlagMine)) {
+        mineActs = true;  other = fields_[4]; otherFlags = dstFlags;
+    } else if ((dstFlags & kFlagMine) && !(srcFlags & kFlagMine)) {
+        mineActs = false; other = fields_[0]; otherFlags = srcFlags;
+    } else {
+        return;
+    }
+
+    SessionType kind;
+    if (IsOpposingPlayer(otherFlags))  kind = SessionType::World;
+    else if (IsPvPDummy(other))        kind = SessionType::Dummy;
+    else return;
+
+    // A tick is the fight's while the fight lasts, but it is the tail of an
+    // earlier action, not anyone acting: it cannot open a bout, and it does not
+    // hold one open. See the header note.
+    const bool periodic = line.event.rfind("SPELL_PERIODIC_", 0) == 0;
+    if (!boutOpen_ && periodic) return;
+
+    if (!boutOpen_) {
+        bout_ = Session{};
+        bout_.type        = kind;
+        bout_.startTime   = line.time;
+        bout_.startOffset = byteOffset;
+        bout_.instanceId  = instanceId_;
+        bout_.mapName     = instanceName_;
+        bout_.uiMapId     = lastUiMap_;
+        boutActions_ = 0;
+        boutMine_    = false;
+        boutAttacked_ = false;
+        boutWho_.clear();
+        boutOpen_ = true;
+    } else if (kind == SessionType::World) {
+        // A player joining a fight at a dummy makes it a fight with a player,
+        // which is what the recorder will have called it too.
+        bout_.type = SessionType::World;
+    }
+
+    ++boutActions_;
+    if (mineActs) boutMine_ = true;
+    if (!mineActs && !periodic && (otherFlags & kFlagHostile) && kind == SessionType::World) {
+        boutAttacked_ = true;
+    }
+    if (!periodic) boutLastDirect_ = line.time;
+    if (kind == SessionType::World) boutWho_.emplace(other);
+    bout_.endTime   = line.time;
+    bout_.endOffset = lineEnd;
+}
+
+void Segmenter::CloseBout(Termination why) {
+    if (!boutOpen_) return;
+    boutOpen_ = false;
+    // A fight is one the recorder will have taken for one too, or the two never
+    // meet and the addon's session waits for a log that does not come:
+    //   * any blow of the player's own at a dummy - a single one is still a pull;
+    //   * kBoutMinActions lines with a player the player acted on as well; a
+    //     neutral one's damage over time alone is a battleground's leftovers;
+    //   * as many direct attacks from a hostile player, answered or not - a
+    //     player killed without striking back was in a fight all the same.
+    const bool dummy = bout_.type == SessionType::Dummy;
+    const bool fought = boutMine_ && (dummy || boutActions_ >= kBoutMinActions);
+    const bool attacked = boutAttacked_ && boutActions_ >= kBoutMinActions;
+    if (!fought && !attacked) return;
+
+    bout_.termination = why;
+    bout_.participants.assign(boutWho_.begin(), boutWho_.end());
+    if (open_ && current_.type == SessionType::Battleground) {
+        heldBouts_.push_back(bout_);
+    } else {
+        sink_(bout_);
+    }
+}
+
+void Segmenter::ReleaseHeldBouts(bool discard) {
+    if (!discard) {
+        for (const auto& bout : heldBouts_) sink_(bout);
+    }
+    heldBouts_.clear();
 }
 
 void Segmenter::HandleArenaStart(const LogLine& line, uint64_t byteOffset) {
@@ -134,6 +291,11 @@ void Segmenter::HandleArenaStart(const LogLine& line, uint64_t byteOffset) {
     if (!ParseArenaMatchStart(line.payload, start)) return;
 
     const bool isShuffle = start.bracket.find("Solo Shuffle") != std::string::npos;
+
+    // Whatever was taken for a bout since the instance was entered was the arena
+    // being set up - the gates are about to open.
+    CloseBout(Termination::Quiet);
+    ReleaseHeldBouts(true);
 
     if (open_ && current_.type == SessionType::Arena) {
         // Solo Shuffle: this start ends the previous round. The round's byte
@@ -182,7 +344,9 @@ void Segmenter::HandleZoneChange(const LogLine& line, uint64_t byteOffset) {
 
     // Leaving the previous instance ends whatever was open there. This is the
     // only terminator battlegrounds ever get, and the one that catches an arena
-    // abandoned in progress.
+    // abandoned in progress. A bout first, so that one fought inside a
+    // provisional battleground is held when the battleground decides.
+    CloseBout(Termination::LeftInstance);
     if (open_) {
         CloseSession(Termination::LeftInstance, line.time, byteOffset);
     }
@@ -191,6 +355,7 @@ void Segmenter::HandleZoneChange(const LogLine& line, uint64_t byteOffset) {
     instanceName_    = zone.name;
     isPvE_           = false;
     lobbyRoundCount_ = 0;
+    matchOver_       = false;
 
     // Zero is the old world - Silvermoon, Eversong, everything on the original
     // two continents - and nothing there is a match. It is kept as a shortcut
@@ -209,10 +374,18 @@ void Segmenter::HandleZoneChange(const LogLine& line, uint64_t byteOffset) {
 void Segmenter::Feed(const LogLine& line, uint64_t byteOffset, uint64_t byteLength) {
     const uint64_t lineEnd = byteOffset + byteLength;
 
+    // Any line at all can show a bout has gone quiet: the time it carries is
+    // past the point where someone would have had to act again for the fight to
+    // go on.
+    if (boutOpen_ && line.time - boutLastDirect_ > kBoutQuietMs) {
+        CloseBout(Termination::Quiet);
+    }
+
     switch (line.kind) {
     case Structural::CombatLogVersion:
         // Logging restarted. Anything open is truncated at this point: the gap
         // before this marker is unrecorded, so the session cannot continue.
+        CloseBout(Termination::LoggingReset);
         CloseSession(Termination::LoggingReset, line.time, byteOffset);
         instanceId_      = 0;
         isPvE_           = false;
@@ -225,7 +398,9 @@ void Segmenter::Feed(const LogLine& line, uint64_t byteOffset, uint64_t byteLeng
 
     case Structural::MapChange: {
         MapChange map;
-        if (open_ && ParseMapChange(line.payload, map)) {
+        if (!ParseMapChange(line.payload, map)) return;
+        lastUiMap_ = map.uiMapId;
+        if (open_) {
             current_.uiMapId = map.uiMapId;
             // MAP_CHANGE names the map; ZONE_CHANGE names the sub-zone and lags
             // behind the instance id, so it can report the city you just left
@@ -258,6 +433,7 @@ void Segmenter::Feed(const LogLine& line, uint64_t byteOffset, uint64_t byteLeng
         }
         CloseSession(Termination::CleanEnd, line.time, lineEnd);
         lobbyRoundCount_ = 0;
+        matchOver_ = true;
         return;
     }
 
@@ -281,6 +457,7 @@ void Segmenter::Feed(const LogLine& line, uint64_t byteOffset, uint64_t byteLeng
         current_.endTime   = line.time;
         current_.endOffset = lineEnd;
     }
+    TrackBout(line, byteOffset, lineEnd);
 }
 
 void Segmenter::Inspect(const LogLine& line) {
@@ -340,8 +517,9 @@ void Segmenter::Inspect(const LogLine& line) {
 }
 
 void Segmenter::Finish() {
-    if (!open_) return;
-    CloseSession(Termination::EndOfData, current_.endTime, current_.endOffset);
+    CloseBout(Termination::Quiet);
+    if (open_) CloseSession(Termination::EndOfData, current_.endTime, current_.endOffset);
+    ReleaseHeldBouts(false);
 }
 
 } // namespace cs

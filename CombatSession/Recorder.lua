@@ -21,6 +21,11 @@ ns.Recorder = Recorder
 -- The match currently being observed, or nil outside a PvP instance.
 local current = nil
 
+-- Outside a match: the fight being watched, and a finished one waiting for the
+-- meter to settle. See "Bouts"; declared here because logging consults them.
+local bout = nil
+local pending = nil
+
 -- How long a match interrupted by the UI shutting down stays adoptable.
 --
 -- A reload is indistinguishable from a logout at the moment it happens - both
@@ -148,6 +153,33 @@ local function PlainString(value)
         if s == "" then return nil end
         return s
     end)
+end
+
+-- What kind of match this is, asked again whenever the client has more to say.
+--
+-- It used to be asked once, on entering the instance, and on this client that is
+-- too early to get an answer: all 200 stored match records said unrated and
+-- "not an arena", including rated 2v2s whose own scoreboard showed the rating
+-- moving by 13. So it is asked again when the match goes live, at every state
+-- change and at completion, and a yes is kept - nothing that was rated stops
+-- being rated. The scoreboard settles it at the end: a rating that moved is a
+-- rated match whatever the flags said.
+local function RefreshKind(roster)
+    if not current then return end
+    if IsRatedMatch() then current.isRated = true end
+    if Global("IsActiveBattlefieldArena") then current.isArena = true end
+    if Global("IsArenaSkirmish") then current.isSkirmish = true end
+    if PvPFlag("IsSoloShuffle") then current.isSoloShuffle = true end
+    if PvPFlag("IsRatedSoloShuffle") then current.isRatedSoloShuffle = true end
+    if PvPFlag("IsSoloRBG") then current.isSoloRBG = true end
+    if PvPFlag("IsInBrawl") then current.isBrawl = true end
+
+    for _, row in ipairs(roster or {}) do
+        local change = PlainNumber(row.ratingChange)
+        if change and change ~= 0 then current.isRated = true break end
+    end
+
+    if current.isRated and ns.Live then ns.Live:SetRated(current) end
 end
 
 --------------------------------------------------------------------------------
@@ -500,20 +532,23 @@ local function OwnsLogging()
     return ns:AutoLogEnabled()
 end
 
-local function StopLoggingSoon()
+local function StopLoggingSoon(seconds)
     if not OwnsLogging() then return end
 
     loggingEpoch = loggingEpoch + 1
     local epoch = loggingEpoch
 
-    C_Timer.After(LOGGING_TAIL_SECONDS, function()
+    C_Timer.After(seconds or LOGGING_TAIL_SECONDS, function()
         if epoch ~= loggingEpoch then return end   -- re-entered; leave it running
+        -- A fight under way keeps it running; its end starts the tail again.
+        if bout or pending then return end
         -- Re-read rather than captured: auto logging may have been switched off
         -- during the tail, and that already stopped the log.
         if OwnsLogging() and LoggingCombat() then
             LoggingCombat(false)
             ns:Debug("combat logging disabled")
         end
+        if ns.db then ns.db.boutLogging = nil end
     end)
 end
 
@@ -639,6 +674,11 @@ local function BeginMatch(instanceName, instanceID, instanceType)
     -- when logging is already running, or a timer queued on the way out of the
     -- last match would switch it off partway through this one.
     loggingEpoch = loggingEpoch + 1
+    -- A log a bout started is the match's now, and stops with it.
+    ns.db.boutLogging = nil
+    -- A fight waiting to be read cannot be any longer: the match goes into the
+    -- same meter.
+    pending = nil
 
     -- Advanced logging is forced here rather than only when logging is being
     -- switched on: a log that is already running without the advanced block is
@@ -699,6 +739,9 @@ local function CompleteMatch(attempt)
     -- After the roster, which is what fills in names on a client whose column
     -- query comes back empty.
     current.statColumns = SafeCall(ReadStatColumns)
+    -- The last chance to learn what kind of match it was, with the scoreboard to
+    -- settle it.
+    RefreshKind(roster)
     current.complete = true
 
     -- One last read before the aura goes and the group breaks up: completion is
@@ -757,6 +800,202 @@ local function FinalizeMatch(interrupted)
 end
 
 --------------------------------------------------------------------------------
+-- Bouts
+--
+-- Outside arenas and battlegrounds, a fight at a PvP training dummy, a duel and
+-- a fight with players in the open world are each recorded as a bout: one
+-- combat, from the moment it starts until it drops. The viewer lists
+-- consecutive bouts of one kind as a single session.
+--
+-- What kind of fight it is comes from what the player has targeted - nothing
+-- else here can say, with the combat log closed to addons. A player who can be
+-- attacked makes it a fight with players, which wins over a dummy; a PvP
+-- training dummy, by creature id, makes it a dummy bout; anything else is PvE
+-- and is not recorded. The application cuts the same fights out of the log by
+-- its own reading, and the two are joined on time.
+--
+-- With auto logging on, logging is started for a bout and stopped a minute after
+-- the last one, so a run of pulls lands in one file. It is started on targeting
+-- an opponent out of combat as well, since a log started by the first blow has
+-- already missed it.
+--------------------------------------------------------------------------------
+
+-- PvP training dummies, by creature id: 243211 and 243212 in Silvermoon City,
+-- 255824 and 255825 in Quel'Thalas, 219250 in Khaz Algar. The same five the
+-- application looks for.
+local PVP_DUMMIES = {
+    [243211] = true, [243212] = true, [255824] = true, [255825] = true, [219250] = true,
+}
+
+-- How long logging runs on after a bout, in seconds.
+local BOUT_TAIL_SECONDS = 60
+
+-- For the meter's baseline, which must not be refreshed under a bout that has
+-- not been read yet.
+function ns:BoutPending()
+    return bout ~= nil or pending ~= nil
+end
+
+local function CreatureId(guid)
+    local id = guid and guid:match("^Creature%-%d+%-%d+%-%d+%-%d+%-(%d+)%-")
+    return id and tonumber(id)
+end
+
+-- "world" for a player that can be attacked, "dummy" for a PvP training dummy,
+-- nil for anything else or for a unit whose answers are withheld.
+local function KindOf(unit)
+    local kind
+    pcall(function()
+        if not UnitExists(unit) then return end
+        if UnitIsPlayer(unit) then
+            if UnitCanAttack("player", unit) then kind = "world" end
+            return
+        end
+        local id = CreatureId(PlainString(UnitGUID(unit)))
+        if id and PVP_DUMMIES[id] then kind = "dummy" end
+    end)
+    return kind
+end
+
+-- Somewhere a bout can be fought: not a match, and not a dungeon or raid.
+local function BoutGround()
+    if current then return false end
+    local _, instanceType = InstanceInfo()
+    return not (IsPvPInstance(instanceType) or instanceType == "party" or instanceType == "raid")
+end
+
+-- Logging this addon started for bouts is marked in the saved file, so that after
+-- a reload - which keeps the client logging but forgets the timer that would have
+-- stopped it - the tail can be given back to this log and to no other.
+local function StartBoutLogging()
+    if not OwnsLogging() then return end
+    -- Cancels a stop still pending from the bout before.
+    loggingEpoch = loggingEpoch + 1
+    ns:EnsureAdvancedLogging()
+    if not LoggingCombat() and pcall(LoggingCombat, true) then
+        ns.db.boutLogging = true
+        ns:Debug("combat logging enabled for a bout")
+    end
+end
+
+-- Whether a log of the bout is being written, decided when it is first known to
+-- be one, as a match decides it at the gates.
+local function Classify(unit)
+    if not bout then return end
+    local kind = KindOf(unit)
+    if not kind then return end
+    if kind == "world" or not bout.kind then
+        local first = (bout.kind == nil)
+        bout.kind = (bout.kind == "world") and "world" or kind
+        if first then
+            StartBoutLogging()
+            bout.logged = LoggingCombat() and true or false
+        end
+    end
+end
+
+local function OnCombatStart()
+    if not BoutGround() then
+        -- A fight somewhere bouts are not - a dungeon pulled straight after one -
+        -- would only be mixed into it. The log still has the bout.
+        pending = nil
+        return
+    end
+
+    -- Back in combat before the last fight could be read: the meter cannot tell
+    -- the two apart - they may share a session - so they are one bout to it, the
+    -- first carried on. The log still cuts them apart.
+    if pending then
+        bout, pending = pending, nil
+        bout.merged = true
+        Classify("target")
+        return
+    end
+
+    local name, _, instanceID = InstanceInfo()
+    bout = {
+        startedAt = ns:Now(),
+        -- What the meter held before the first blow, frozen now: the bout is
+        -- whatever it gains from here.
+        base      = ns.Live and ns.Live:Baseline() or nil,
+        map       = instanceID,
+        mapName   = PlainString(GetRealZoneText and GetRealZoneText()) or name,
+        character = UnitName("player"),
+        characterGuid = UnitGUID("player"),
+        faction   = Global("UnitFactionGroup", "player"),
+    }
+    Classify("target")
+    Classify("focus")
+    Classify("mouseover")
+end
+
+local function OnTargetChanged()
+    if bout then
+        Classify("target")
+    elseif BoutGround() and not InCombatLockdown() and KindOf("target") then
+        -- Out of combat: an opponent picked out is a fight about to start, and
+        -- the log has to be running before its first blow. If none comes, the
+        -- tail turns it off again.
+        StartBoutLogging()
+        StopLoggingSoon(BOUT_TAIL_SECONDS)
+    end
+end
+
+-- How often a finished fight looks for the meter to have settled, and how many
+-- times before it is read anyway - fifteen seconds. Details! polls the same way:
+-- the restriction lifts with the combat flag, the figures a moment later.
+local SETTLE_TICK = 0.3
+local SETTLE_TRIES = 50
+
+-- Reads a finished fight from the meter once it has settled, and takes the next
+-- baseline from it. Every fight outside a match comes through here, bout or not:
+-- a fight that was not a bout still moved the meter, and the next bout must not
+-- be charged with it. A fight that starts while this one waits takes it over -
+-- see OnCombatStart - and this chain stops.
+local function CaptureBout(finished, tries)
+    if pending ~= finished then return end
+    if current or not ns.Live then
+        pending = nil
+        return
+    end
+    if InCombatLockdown() then return end   -- OnCombatStart has it now
+
+    if not ns.Live:Settled() and tries < SETTLE_TRIES then
+        C_Timer.After(SETTLE_TICK, function() CaptureBout(finished, tries + 1) end)
+        return
+    end
+    pending = nil
+
+    if finished.kind then
+        local record, detail = ns.Live:Bout(finished)
+        StopLoggingSoon(BOUT_TAIL_SECONDS)
+        -- What became of it, not only that it happened: this is the one place a
+        -- bout the meter had nothing for can be explained after the fact.
+        Trace("BOUT", ("%s %ds %s %s%s"):format(finished.kind,
+            finished.endedAt - finished.startedAt, record and "stored" or "EMPTY",
+            detail or "", (tries >= SETTLE_TRIES) and " unsettled" or ""))
+    end
+    -- Tried again for a while if the meter is still withholding anything, since
+    -- a stale baseline would charge this fight to the next one.
+    ns.Live:RefreshBaselineSoon()
+end
+
+local function OnCombatEnd()
+    local finished = bout
+    bout = nil
+    if not finished then
+        -- A fight that began before a reload has no bout behind it, but it still
+        -- moved the meter.
+        if ns.Live and BoutGround() then ns.Live:RefreshBaselineSoon() end
+        return
+    end
+    finished.endedAt = ns:Now()
+    pending = finished
+    -- A frame later: the restriction lifts during the event, not before it.
+    C_Timer.After(0, function() CaptureBout(finished, 0) end)
+end
+
+--------------------------------------------------------------------------------
 -- Round tracking
 --------------------------------------------------------------------------------
 
@@ -770,6 +1009,7 @@ local function OnMatchStateChanged()
     lastState = state
 
     if not current then return end
+    RefreshKind()
 
     -- PostRound marks the end of a Solo Shuffle / Blitz round. Recorded as a
     -- boundary regardless of format so the app can segment per round.
@@ -828,6 +1068,7 @@ local function FinalizeSoon()
         local _, instanceType, instanceID = InstanceInfo()
         if IsPvPInstance(instanceType) and instanceID == current.map then
             Trace("STAYED", "transient zone reading ignored")
+            if ns.Live then ns.Live:Stayed() end
             return
         end
         FinalizeMatch()
@@ -840,11 +1081,19 @@ local function OnZoneChanged()
     if current and IsPvPInstance(instanceType) and instanceID == current.map then
         -- Still in the same match. Cancels any departure awaiting confirmation.
         leaveEpoch = leaveEpoch + 1
+        if ns.Live then ns.Live:Stayed() end
     elseif IsPvPInstance(instanceType) then
         -- A different PvP instance is a real transition, not a glitch.
-        if current then FinalizeMatch() end
+        if current then
+            if ns.Live then ns.Live:Left() end
+            FinalizeMatch()
+        end
         BeginMatch(name, instanceID, instanceType)
     elseif current then
+        -- The live session stops taking segments now, not when the departure is
+        -- confirmed: anything fought in the next ten seconds is outside, and the
+        -- confirmation used to let it in.
+        if ns.Live then ns.Live:Left() end
         FinalizeSoon()
     end
 
@@ -853,12 +1102,27 @@ local function OnZoneChanged()
     OnUiMapMaybeChanged()
 end
 
+-- A reload keeps the client logging but loses the timer that was going to stop
+-- it, so a reload during a bout's tail left logging on for the rest of the
+-- evening. A log this addon started for bouts gets its tail back, in the open
+-- world; any other log - a raid's, started by another addon or by hand - is not
+-- this addon's to stop.
+local function OnWorldEntered()
+    if not ns.db.boutLogging then return end
+    if not LoggingCombat() then
+        ns.db.boutLogging = nil
+    elseif not current and OwnsLogging() and BoutGround() then
+        StopLoggingSoon(BOUT_TAIL_SECONDS)
+    end
+end
+
 function Recorder:Init()
     ns:RegisterEvent("PLAYER_ENTERING_WORLD",   OnZoneChanged)
+    ns:RegisterEvent("PLAYER_ENTERING_WORLD",   OnWorldEntered)
     ns:RegisterEvent("ZONE_CHANGED_NEW_AREA",   OnZoneChanged)
     ns:RegisterEvent("PVP_MATCH_COMPLETE",      function() CompleteMatch() end)
     ns:RegisterEvent("PVP_MATCH_STATE_CHANGED", OnMatchStateChanged)
-    ns:RegisterEvent("PVP_MATCH_ACTIVE",        function() Trace("ACTIVE") end)
+    ns:RegisterEvent("PVP_MATCH_ACTIVE",        function() Trace("ACTIVE"); RefreshKind() end)
 
     -- Sub-map transitions inside an instance, to establish whether a single
     -- battleground can span more than one uiMapID.
@@ -869,11 +1133,19 @@ function Recorder:Init()
     -- marked: a reload fires this too, and the match is not over.
     ns:RegisterEvent("PLAYER_LOGOUT",           function() FinalizeMatch(true) end)
 
+    -- Bouts outside matches.
+    ns:RegisterEvent("PLAYER_REGEN_DISABLED",   OnCombatStart)
+    ns:RegisterEvent("PLAYER_REGEN_ENABLED",    OnCombatEnd)
+    ns:RegisterEvent("PLAYER_TARGET_CHANGED",   OnTargetChanged)
+
     if ns.Live then
         ns.Live:Init()
         -- A reload mid-match leaves a session open with its figures but no
         -- baseline; this picks it back up rather than starting a second one.
         ns.Live:Restore()
+        -- The first baseline for bouts is taken on entering the world, not here:
+        -- at load the meter's list can still be empty, and a bout measured from
+        -- an empty baseline is charged with everything already in the session.
     end
 end
 

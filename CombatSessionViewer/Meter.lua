@@ -165,6 +165,7 @@ end
 local function Build()
     view.key, view.entry, view.label = nil, nil, nil
     view.rows, view.max = {}, 0
+    view.failed = nil
     view.version = view.version + 1
 
     local api = ns:API()
@@ -180,7 +181,19 @@ local function Build()
     view.key, view.entry = entry.key, entry
     view.label = ns.ShortName(entry.mapName or "")
 
-    local players = api:Roster(entry, cache, api:GetMatch(entry))
+    -- Contained: this runs on every live reading, and a session Roster cannot
+    -- read emptied the list and stopped the layout that follows - which is why
+    -- the window would not peek. Reported once per session rather than once per
+    -- reading, since readings come with every fight.
+    local ok, players = pcall(api.Roster, api, entry, cache, api:GetMatch(entry))
+    if not ok then
+        view.failed = true
+        if view.failedFor ~= entry.key then
+            view.failedFor = entry.key
+            geterrorhandler()(players)
+        end
+        return
+    end
     for _, player in ipairs(players) do
         local unit  = player.unit
         local value = (unit and unit.cols and unit.cols[col]) or 0
@@ -490,6 +503,9 @@ local function LayoutEmpty()
 
     if not view.key then
         list.empty:SetText("|cff888888Nothing recorded yet.|r")
+    elseif view.failed then
+        -- A fault, and said to be one: the details went to the error handler.
+        list.empty:SetText("|cffff6666This session could not be read.|r")
     else
         -- The session is there and this measure is empty in it, which is an
         -- answer rather than a fault: nobody has dispelled anything yet.
