@@ -22,7 +22,7 @@ Nothing is uploaded anywhere. Everything stays on your machine.
 ## Download
 
 **[Download the latest release](https://github.com/iamdak/CombatSession/releases/latest)**
-(Windows, 64-bit)
+(Windows, 64-bit -- Linux *ALPHA*)
 
 macOS is supported in the source but there is no prebuilt binary — see
 [Building](#building).
